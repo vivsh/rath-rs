@@ -1,0 +1,9 @@
+[package]
+name = "rath-rs"
+version = "0.1.0"
+edition = "2021"
+description = "rath-rs: unified AI provider abstractions (placeholder crate)"
+license = "MIT"
+repository = "https://github.com/vivsh/rath-rs"
+
+[dependencies]
