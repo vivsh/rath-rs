@@ -31,10 +31,12 @@ instead.
 
 ## Model URLs
 
-Rath uses one model URL format across capabilities:
+Rath uses one model locator format across capabilities. The path is always the
+provider-native model id or endpoint slug; custom HTTP endpoints are configured
+with `base_url`.
 
 ```text
-provider[+transport]://[host][/path/]model[?params]
+provider:///provider-native-model-id[?params]
 ```
 
 Examples:
@@ -48,8 +50,8 @@ openai:///tts-1
 fal:///fal-ai/flux/schnell
 fal:///fal-ai/wan/v2.2-a14b/text-to-video
 gemini:///gemini-2.5-flash
-ollama://localhost:11434/qwen3:8b
-openai+https://openrouter.ai/api/v1/gpt-4o
+ollama:///qwen3:8b?base_url=http://localhost:11434
+openai:///gpt-4o?base_url=https://api.example.com/v1
 ```
 
 Use `rath::core::ModelUrl` for parsed URLs. `rath::llm::LlmUrl` remains as a
@@ -61,6 +63,10 @@ OpenRouter model slugs keep their provider prefix in the URL path, for example
 Fal model slugs also keep the full path, for example
 `fal:///fal-ai/flux/schnell`. Rath uses Fal's REST API; set `FAL_KEY` or pass
 `?api_key_env=YOUR_ENV_VAR`.
+
+Model locators are not provider HTTP URLs. `openai:///gpt-4o` means "use the
+OpenAI adapter with model `gpt-4o`"; `base_url` is the only place for a custom
+provider endpoint.
 
 Capability options parse the same URL format and dispatch to the provider
 implementation that supports that capability.

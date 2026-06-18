@@ -679,10 +679,10 @@ mod tests {
         assert!(url.base_url.is_none());
     }
 
-    /// `ModelUrl::parse` extracts host and model from an ollama URL.
+    /// `ModelUrl::parse` extracts model and custom base_url from an ollama locator.
     #[test]
     fn parse_ollama_url() {
-        let url = ModelUrl::parse("ollama://localhost:11434/qwen3:8b").unwrap();
+        let url = ModelUrl::parse("ollama:///qwen3:8b?base_url=http://localhost:11434").unwrap();
         assert_eq!(url.provider, Provider::Ollama);
         assert_eq!(url.model, "qwen3:8b");
         assert_eq!(url.base_url.as_deref(), Some("http://localhost:11434"));

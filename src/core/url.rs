@@ -62,19 +62,17 @@ pub enum CacheControl {
 
 /// Parsed model URL.
 ///
-/// Format: `provider[+transport]://[authority][/prefix/]model[?params]`
+/// Format: `provider:///provider-native-model-id[?params]`
 ///
 /// - `provider`: `gemini`, `openai`, `openrouter`, `fal`, `anthropic`, `claude`, or `ollama`
-/// - `transport`: `http` or `https` (defaults: `https` for cloud, `http` for ollama)
-/// - Non-empty authority + path prefix → `base_url`; empty authority → `None`
-/// - Last non-empty path segment → `model`
-/// - Whitelisted query params: `temperature`, `thinking`, `api_key_env`
+/// - URL path: provider-native model id or endpoint slug
+/// - Whitelisted query params: `temperature`, `thinking`, `api_key_env`, `cache`, `base_url`
 ///
-/// Rejected: fragments, inline credentials, unknown/duplicate query params.
+/// Rejected: fragments, inline credentials, non-empty authority, unknown/duplicate query params.
 #[derive(Debug, Clone)]
 pub struct ModelUrl {
     pub provider: Provider,
-    /// Last path segment of the URL (model name).
+    /// Provider-native model id or endpoint slug.
     pub model: String,
     /// API key resolved from `api_key_env` at parse time, or `None`.
     pub api_key: Option<String>,
@@ -115,14 +113,14 @@ impl ModelUrl {
             ));
         }
 
-        let (provider, transport) = parse_provider_scheme(scheme_part, s)?;
+        let provider = parse_provider_scheme(scheme_part, s)?;
 
         let (path_authority, query_str) = match rest.split_once('?') {
             Some((p, q)) => (p, Some(q)),
             None => (rest, None),
         };
 
-        let (host, port, segments) = parse_authority_path(path_authority, s)?;
+        let segments = parse_model_path(path_authority, s)?;
 
         if segments.is_empty() {
             return Err(RathError::InvalidUrl(format!(
@@ -130,31 +128,9 @@ impl ModelUrl {
             )));
         }
 
-        let model = if matches!(provider, Provider::OpenRouter | Provider::Fal) && host.is_empty() {
-            segments.join("/")
-        } else {
-            segments.last().unwrap().clone()
-        };
+        let model = segments.join("/");
 
-        let base_url = if !host.is_empty() {
-            let authority = match port {
-                Some(p) => format!("{host}:{p}"),
-                None => host.clone(),
-            };
-            let prefix_parts = &segments[..segments.len() - 1];
-            if prefix_parts.is_empty() {
-                Some(format!("{transport}://{authority}"))
-            } else {
-                Some(format!(
-                    "{transport}://{authority}/{}",
-                    prefix_parts.join("/")
-                ))
-            }
-        } else {
-            None
-        };
-
-        let (temperature, thinking, api_key, cache) = parse_query_str(query_str, s)?;
+        let (temperature, thinking, api_key, cache, base_url) = parse_query_str(query_str, s)?;
 
         Ok(ModelUrl {
             provider,
@@ -194,22 +170,20 @@ impl ModelUrl {
     }
 }
 
-fn parse_provider_scheme(
-    scheme: &str,
-    original: &str,
-) -> Result<(Provider, &'static str), RathError> {
-    let (provider_name, explicit_transport) = match scheme.split_once('+') {
-        Some((name, transport)) => (name, Some(transport)),
-        None => (scheme, None),
-    };
+fn parse_provider_scheme(scheme: &str, original: &str) -> Result<Provider, RathError> {
+    if scheme.contains('+') {
+        return Err(RathError::InvalidUrl(format!(
+            "custom transports are not supported in '{original}'; use provider:///model?base_url=https://host/path"
+        )));
+    }
 
-    let (provider, default_transport): (Provider, &'static str) = match provider_name {
-        "gemini" => (Provider::Gemini, "https"),
-        "openai" => (Provider::OpenAi, "https"),
-        "openrouter" => (Provider::OpenRouter, "https"),
-        "fal" => (Provider::Fal, "https"),
-        "anthropic" | "claude" => (Provider::Anthropic, "https"),
-        "ollama" => (Provider::Ollama, "http"),
+    let provider = match scheme {
+        "gemini" => Provider::Gemini,
+        "openai" => Provider::OpenAi,
+        "openrouter" => Provider::OpenRouter,
+        "fal" => Provider::Fal,
+        "anthropic" | "claude" => Provider::Anthropic,
+        "ollama" => Provider::Ollama,
         other => {
             return Err(RathError::InvalidUrl(format!(
                 "unknown provider '{other}' in '{original}'; expected gemini, openai, openrouter, fal, anthropic, claude, or ollama"
@@ -217,76 +191,28 @@ fn parse_provider_scheme(
         }
     };
 
-    let transport = match explicit_transport {
-        Some("https") => "https",
-        Some("http") => "http",
-        Some(other) => {
-            return Err(RathError::InvalidUrl(format!(
-                "unknown transport '{other}' in '{original}'; expected http or https"
-            )));
-        }
-        None => default_transport,
-    };
-
-    Ok((provider, transport))
+    Ok(provider)
 }
 
-fn parse_authority_path(
-    path_authority: &str,
-    original: &str,
-) -> Result<(String, Option<u16>, Vec<String>), RathError> {
+fn parse_model_path(path_authority: &str, original: &str) -> Result<Vec<String>, RathError> {
     if path_authority.starts_with('/') {
         let segments: Vec<String> = path_authority
             .split('/')
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
-        return Ok((String::new(), None, segments));
+        return Ok(segments);
     }
 
-    let (authority, rest_path) = match path_authority.split_once('/') {
-        Some((auth, path)) => (auth, path),
-        None => (path_authority, ""),
-    };
-
-    if authority.is_empty() {
+    if path_authority.is_empty() {
         return Err(RathError::InvalidUrl(format!(
             "empty authority in '{original}'; use e.g. gemini:///model for no custom endpoint"
         )));
     }
 
-    let (host, port) = parse_host_port(authority, original)?;
-
-    let segments: Vec<String> = rest_path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-
-    Ok((host, port, segments))
-}
-
-fn parse_host_port(authority: &str, original: &str) -> Result<(String, Option<u16>), RathError> {
-    match authority.rsplit_once(':') {
-        Some((host, port_str)) => match port_str.parse::<u16>() {
-            Ok(port) => Ok((host.to_string(), Some(port))),
-            Err(_) => {
-                // Colon not followed by a port number — treat whole string as host
-                // (handles hostnames with no port)
-                if port_str
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
-                {
-                    Ok((authority.to_string(), None))
-                } else {
-                    Err(RathError::InvalidUrl(format!(
-                        "invalid port in authority of '{original}'"
-                    )))
-                }
-            }
-        },
-        None => Ok((authority.to_string(), None)),
-    }
+    Err(RathError::InvalidUrl(format!(
+        "non-empty authority is not supported in '{original}'; put the provider-native model id after /// and use base_url for custom endpoints"
+    )))
 }
 
 type ParsedQuery = (
@@ -294,17 +220,19 @@ type ParsedQuery = (
     Option<ThinkingLevel>,
     Option<String>,
     Option<CacheControl>,
+    Option<String>,
 );
 
 fn parse_query_str(query_str: Option<&str>, original: &str) -> Result<ParsedQuery, RathError> {
     let Some(query) = query_str else {
-        return Ok((None, None, None, None));
+        return Ok((None, None, None, None, None));
     };
 
     let mut temperature: Option<f32> = None;
     let mut thinking: Option<ThinkingLevel> = None;
     let mut api_key: Option<String> = None;
     let mut cache: Option<CacheControl> = None;
+    let mut base_url: Option<String> = None;
     let mut seen: HashSet<String> = HashSet::new();
 
     for pair in query.split('&').filter(|p| !p.is_empty()) {
@@ -367,15 +295,28 @@ fn parse_query_str(query_str: Option<&str>, original: &str) -> Result<ParsedQuer
                     }
                 });
             }
+            "base_url" => {
+                if !(value.starts_with("https://") || value.starts_with("http://")) {
+                    return Err(RathError::InvalidUrl(format!(
+                        "base_url must start with http:// or https:// in '{original}'"
+                    )));
+                }
+                if value.contains('#') {
+                    return Err(RathError::InvalidUrl(format!(
+                        "base_url must not contain a fragment in '{original}'"
+                    )));
+                }
+                base_url = Some(value.trim_end_matches('/').to_string());
+            }
             other => {
                 return Err(RathError::InvalidUrl(format!(
-                    "unknown query parameter '{other}' in '{original}'; supported: temperature, thinking, api_key_env, cache"
+                    "unknown query parameter '{other}' in '{original}'; supported: temperature, thinking, api_key_env, cache, base_url"
                 )));
             }
         }
     }
 
-    Ok((temperature, thinking, api_key, cache))
+    Ok((temperature, thinking, api_key, cache, base_url))
 }
 
 #[cfg(test)]
@@ -394,26 +335,24 @@ mod tests {
         assert!(url.thinking.is_none());
     }
 
-    /// Parses an ollama URL with host and port; base_url is reconstructed.
+    /// Custom endpoints use base_url instead of authority.
     #[test]
-    fn parse_ollama_with_host() {
-        let url = ModelUrl::parse("ollama://localhost:11434/qwen3:8b").unwrap();
+    fn parse_ollama_with_base_url() {
+        let url = ModelUrl::parse("ollama:///qwen3:8b?base_url=http://localhost:11434").unwrap();
         assert_eq!(url.provider, Provider::Ollama);
         assert_eq!(url.model, "qwen3:8b");
         assert_eq!(url.base_url.as_deref(), Some("http://localhost:11434"));
         assert!(url.api_key.is_none());
     }
 
-    /// Path prefix is included in base_url; model is the last segment.
+    /// Slash-containing model identifiers are preserved for every provider.
     #[test]
-    fn parse_openai_with_path_prefix() {
-        let url = ModelUrl::parse("openai+https://openrouter.ai/api/v1/gpt-4o").unwrap();
+    fn parse_openai_preserves_slash_model_id() {
+        let url =
+            ModelUrl::parse("openai:///models/gpt-4o?base_url=https://api.example.com/v1").unwrap();
         assert_eq!(url.provider, Provider::OpenAi);
-        assert_eq!(url.model, "gpt-4o");
-        assert_eq!(
-            url.base_url.as_deref(),
-            Some("https://openrouter.ai/api/v1")
-        );
+        assert_eq!(url.model, "models/gpt-4o");
+        assert_eq!(url.base_url.as_deref(), Some("https://api.example.com/v1"));
     }
 
     #[test]
@@ -458,11 +397,22 @@ mod tests {
         assert_eq!(b.provider, Provider::Anthropic);
     }
 
-    /// Explicit +https transport overrides the default for ollama.
+    /// Explicit custom transport syntax is rejected; use base_url instead.
     #[test]
-    fn parse_explicit_transport() {
-        let url = ModelUrl::parse("ollama+https://remote.host/llama3").unwrap();
-        assert_eq!(url.base_url.as_deref(), Some("https://remote.host"));
+    fn reject_explicit_transport() {
+        assert!(matches!(
+            ModelUrl::parse("ollama+https:///llama3"),
+            Err(RathError::InvalidUrl(_))
+        ));
+    }
+
+    /// Non-empty authority is rejected to avoid host/path/model ambiguity.
+    #[test]
+    fn reject_non_empty_authority() {
+        assert!(matches!(
+            ModelUrl::parse("ollama://localhost:11434/qwen3:8b"),
+            Err(RathError::InvalidUrl(_))
+        ));
     }
 
     /// Inline credentials are rejected.
@@ -483,11 +433,18 @@ mod tests {
         ));
     }
 
+    /// base_url is supported for custom provider endpoints.
+    #[test]
+    fn parse_base_url_query_param() {
+        let url = ModelUrl::parse("openai:///gpt-4o?base_url=https://api.example.com/v1/").unwrap();
+        assert_eq!(url.base_url.as_deref(), Some("https://api.example.com/v1"));
+    }
+
     /// Unknown query parameters are rejected.
     #[test]
     fn reject_unknown_query_param() {
         assert!(matches!(
-            ModelUrl::parse("openai:///gpt-4o?base_url=https://example.com"),
+            ModelUrl::parse("openai:///gpt-4o?unknown=value"),
             Err(RathError::InvalidUrl(_))
         ));
     }
