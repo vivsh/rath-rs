@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use crate::embeddings::{EmbedRequest, EmbedResponse, EmbeddingClient, EmbeddingOptions};
 
 use crate::llm::{
-    Attachment, LlmClient, LlmError, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl,
-    Provider, Role, ThinkingLevel, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+    Attachment, LlmClient, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl, Provider,
+    RathError, Role, ThinkingLevel, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
     configured_base_url, decode_output_text, extract_exit_tool_call, inject_exit_tool,
     optional_api_key, parse_json_output, validate_tools,
 };
@@ -31,21 +31,24 @@ impl OllamaClient {
         &self,
         endpoint: &str,
         payload: &T,
-    ) -> Result<Value, LlmError> {
+    ) -> Result<Value, RathError> {
         with_bearer_auth(self.http.post(endpoint), self.api_key.as_deref())
             .json(payload)
             .send()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .error_for_status()
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .json()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))
+            .map_err(|e| RathError::Provider(e.to_string()))
     }
 }
 
-pub fn new_client(url: &ModelUrl, mut options: LlmOptions) -> Result<Box<dyn LlmClient>, LlmError> {
+pub fn new_client(
+    url: &ModelUrl,
+    mut options: LlmOptions,
+) -> Result<Box<dyn LlmClient>, RathError> {
     let exit_tool_name = if url.needs_exit_tool()
         && !options.output_type_name.is_empty()
         && !options.tools.is_empty()
@@ -70,7 +73,7 @@ pub fn new_client(url: &ModelUrl, mut options: LlmOptions) -> Result<Box<dyn Llm
 pub fn new_embedding_client(
     url: &ModelUrl,
     _options: EmbeddingOptions,
-) -> Result<Box<dyn EmbeddingClient>, LlmError> {
+) -> Result<Box<dyn EmbeddingClient>, RathError> {
     Ok(Box::new(OllamaClient {
         http: HttpClient::new(),
         api_key: optional_api_key(url, "OLLAMA_API_KEY"),
@@ -92,7 +95,7 @@ impl LlmClient for OllamaClient {
         &self.options
     }
 
-    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, LlmError> {
+    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
         validate_history(messages)?;
         validate_tools(Provider::Ollama, &self.options.tools)?;
 
@@ -121,13 +124,13 @@ impl LlmClient for OllamaClient {
 
 #[async_trait]
 impl EmbeddingClient for OllamaClient {
-    async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, LlmError> {
+    async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, RathError> {
         let endpoint = embed_endpoint(&self.base_url);
         let payload = json!({ "model": self.model, "input": request.input });
         let response = self.post_json(&endpoint, &payload).await?;
         let values: Vec<f32> = response["embeddings"][0]
             .as_array()
-            .ok_or_else(|| LlmError::Llm("embeddings missing in response".into()))?
+            .ok_or_else(|| RathError::Provider("embeddings missing in response".into()))?
             .iter()
             .map(|v| v.as_f64().unwrap_or(0.0) as f32)
             .collect();
@@ -153,15 +156,15 @@ fn with_bearer_auth(
     }
 }
 
-fn validate_history(messages: &[Message]) -> Result<(), LlmError> {
+fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     if messages.is_empty() {
-        return Err(LlmError::Validation("messages must not be empty".into()));
+        return Err(RathError::Validation("messages must not be empty".into()));
     }
     if matches!(
         messages.last().map(|m| &m.role),
         Some(Role::AssistantToolCalls { .. })
     ) {
-        return Err(LlmError::Validation(
+        return Err(RathError::Validation(
             "history ends with assistant tool calls without tool results".into(),
         ));
     }
@@ -362,7 +365,7 @@ fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
-fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, LlmError> {
+fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, RathError> {
     let usage = response.get("usage").map(usage_from_value);
     let provider_model = response
         .get("model")
@@ -376,7 +379,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"))
-        .ok_or(LlmError::EmptyResponse)?;
+        .ok_or(RathError::EmptyResponse)?;
 
     let calls = collect_tool_calls(message)?;
     if !calls.is_empty() {
@@ -398,7 +401,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
     let text = message
         .get("content")
         .and_then(Value::as_str)
-        .ok_or(LlmError::EmptyResponse)?;
+        .ok_or(RathError::EmptyResponse)?;
     let text = strip_thinking(text);
     Ok(LlmResponse::new(
         Provider::Ollama,
@@ -409,7 +412,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
     .with_raw_metadata(metadata))
 }
 
-fn decode_ollama_output(text: &str, wants_json_output: bool) -> Result<Value, LlmError> {
+fn decode_ollama_output(text: &str, wants_json_output: bool) -> Result<Value, RathError> {
     if !wants_json_output {
         return decode_output_text(text, false);
     }
@@ -578,7 +581,7 @@ fn strip_markdown_key(key: &str) -> &str {
     key
 }
 
-fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, LlmError> {
+fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, RathError> {
     if let Some(items) = message.get("tool_calls").and_then(Value::as_array) {
         return parse_json_tool_calls(items);
     }
@@ -588,25 +591,27 @@ fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, LlmError> {
     Ok(Vec::new())
 }
 
-fn parse_json_tool_calls(items: &[Value]) -> Result<Vec<ToolCall>, LlmError> {
+fn parse_json_tool_calls(items: &[Value]) -> Result<Vec<ToolCall>, RathError> {
     let mut calls = Vec::with_capacity(items.len());
     for item in items {
         let id = item
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| LlmError::Validation("Ollama tool call missing id".into()))?;
+            .ok_or_else(|| RathError::Validation("Ollama tool call missing id".into()))?;
         let function = item
             .get("function")
-            .ok_or_else(|| LlmError::Validation("Ollama tool call missing function".into()))?;
+            .ok_or_else(|| RathError::Validation("Ollama tool call missing function".into()))?;
         let name = function
             .get("name")
             .and_then(Value::as_str)
-            .ok_or_else(|| LlmError::Validation("Ollama tool call missing function name".into()))?;
+            .ok_or_else(|| {
+                RathError::Validation("Ollama tool call missing function name".into())
+            })?;
         let raw_args = function
             .get("arguments")
             .and_then(Value::as_str)
             .unwrap_or("{}");
-        let args = serde_json::from_str(raw_args).map_err(|e| LlmError::Deserialize {
+        let args = serde_json::from_str(raw_args).map_err(|e| RathError::Deserialize {
             source: e,
             raw: raw_args.to_string(),
         })?;
@@ -623,7 +628,7 @@ fn parse_json_tool_calls(items: &[Value]) -> Result<Vec<ToolCall>, LlmError> {
 /// Parses tool calls from content text when the model emits them in the
 /// `<function=NAME><parameter=KEY>VALUE</parameter></function>` format
 /// instead of the standard `tool_calls` JSON field.
-fn parse_content_tool_calls(content: &str) -> Result<Vec<ToolCall>, LlmError> {
+fn parse_content_tool_calls(content: &str) -> Result<Vec<ToolCall>, RathError> {
     let mut calls = Vec::new();
     let mut remaining = content;
     while let Some(tag_start) = remaining.find("<function=") {

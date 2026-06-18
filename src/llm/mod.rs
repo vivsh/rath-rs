@@ -222,13 +222,11 @@ impl LlmResponse {
     }
 }
 
-pub type LlmError = RathError;
-
-pub(crate) fn required_api_key(url: &ModelUrl, default_env: &str) -> Result<String, LlmError> {
+pub(crate) fn required_api_key(url: &ModelUrl, default_env: &str) -> Result<String, RathError> {
     url.api_key
         .clone()
         .or_else(|| std::env::var(default_env).ok())
-        .ok_or_else(|| LlmError::Llm(format!("{default_env} is not set")))
+        .ok_or_else(|| RathError::Provider(format!("{default_env} is not set")))
 }
 
 pub(crate) fn optional_api_key(url: &ModelUrl, default_env: &str) -> Option<String> {
@@ -383,7 +381,7 @@ impl LlmOptions {
     }
 
     /// Builds a provider client for the given model URL.
-    pub fn create(mut self, llm_url: &str) -> Result<Box<dyn LlmClient>, LlmError> {
+    pub fn create(mut self, llm_url: &str) -> Result<Box<dyn LlmClient>, RathError> {
         let url = ModelUrl::parse(llm_url)?;
         if url.temperature.is_some() {
             self.temperature = url.temperature;
@@ -399,20 +397,23 @@ impl LlmOptions {
 }
 
 #[allow(dead_code)]
-pub(crate) fn validate_tools(provider: Provider, tools: &[ToolDefinition]) -> Result<(), LlmError> {
+pub(crate) fn validate_tools(
+    provider: Provider,
+    tools: &[ToolDefinition],
+) -> Result<(), RathError> {
     let mut seen = std::collections::HashSet::new();
     for tool in tools {
         if tool.name.trim().is_empty() {
-            return Err(LlmError::Validation("tool name must not be empty".into()));
+            return Err(RathError::Validation("tool name must not be empty".into()));
         }
         if !seen.insert(tool.name.as_str()) {
-            return Err(LlmError::Validation(format!(
+            return Err(RathError::Validation(format!(
                 "duplicate tool name '{}'",
                 tool.name
             )));
         }
         if !tool.parameters.is_object() {
-            return Err(LlmError::UnsupportedCapability {
+            return Err(RathError::UnsupportedCapability {
                 provider,
                 capability: format!("tool '{}' has a non-object JSON schema", tool.name),
             });
@@ -456,17 +457,17 @@ pub(crate) fn extract_exit_tool_call(calls: &[ToolCall], name: &str) -> Option<V
 }
 
 #[allow(dead_code)]
-pub(crate) fn parse_json_output(text: &str) -> Result<Value, LlmError> {
+pub(crate) fn parse_json_output(text: &str) -> Result<Value, RathError> {
     serde_json::from_str(text).map_err(|e| {
         tracing::error!(model_output = %text, parse_error = %e, "LLM output deserialization failed");
-        LlmError::Deserialize {
+        RathError::Deserialize {
             source: e,
             raw: text.to_string(),
         }
     })
 }
 
-pub(crate) fn decode_output_text(text: &str, wants_json_output: bool) -> Result<Value, LlmError> {
+pub(crate) fn decode_output_text(text: &str, wants_json_output: bool) -> Result<Value, RathError> {
     if wants_json_output {
         parse_json_output(text)
     } else {
@@ -546,7 +547,7 @@ pub trait LlmClient: Send + Sync {
         }
     }
 
-    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, LlmError>;
+    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError>;
 }
 
 /// Creates a [`LlmClient`] from a model URL and call-time options.
@@ -555,7 +556,8 @@ pub trait LlmClient: Send + Sync {
 /// [`crate::flows`] pipeline. The default implementation delegates to
 /// [`LlmOptions::create`].
 pub trait LlmClientFactory: Send + Sync + 'static {
-    fn create(&self, model_url: &str, options: LlmOptions) -> Result<Box<dyn LlmClient>, LlmError>;
+    fn create(&self, model_url: &str, options: LlmOptions)
+    -> Result<Box<dyn LlmClient>, RathError>;
 
     /// Wraps this factory with `layer`.
     /// The most recently added layer becomes the outermost wrapper.
@@ -579,19 +581,14 @@ pub trait LlmClientFactoryLayer<F> {
 pub struct DefaultLlmClientFactory;
 
 impl LlmClientFactory for DefaultLlmClientFactory {
-    fn create(&self, model_url: &str, options: LlmOptions) -> Result<Box<dyn LlmClient>, LlmError> {
+    fn create(
+        &self,
+        model_url: &str,
+        options: LlmOptions,
+    ) -> Result<Box<dyn LlmClient>, RathError> {
         options.create(model_url)
     }
 }
-
-pub use DefaultLlmClientFactory as DefaultClientFactory;
-pub use LlmClient as Client;
-pub use LlmClientFactory as ClientFactory;
-pub use LlmClientFactoryLayer as ClientFactoryLayer;
-pub use LlmError as ClientError;
-pub use LlmOptions as ClientOptions;
-pub use LlmOutput as ClientOutput;
-pub use LlmResponse as ClientResponse;
 
 #[cfg(test)]
 mod tests {
@@ -630,7 +627,7 @@ mod tests {
             OPTS.get_or_init(LlmOptions::default)
         }
 
-        async fn execute(&self, _messages: &[Message]) -> Result<LlmResponse, LlmError> {
+        async fn execute(&self, _messages: &[Message]) -> Result<LlmResponse, RathError> {
             Ok(LlmResponse::new(
                 Provider::OpenAi,
                 LlmOutput::Output(serde_json::json!({ "ok": true })),
@@ -643,7 +640,7 @@ mod tests {
             &self,
             _model_url: &str,
             _options: LlmOptions,
-        ) -> Result<Box<dyn LlmClient>, LlmError> {
+        ) -> Result<Box<dyn LlmClient>, RathError> {
             Ok(Box::new(DummyClient::new()))
         }
     }
@@ -653,7 +650,7 @@ mod tests {
             &self,
             model_url: &str,
             options: LlmOptions,
-        ) -> Result<Box<dyn LlmClient>, LlmError> {
+        ) -> Result<Box<dyn LlmClient>, RathError> {
             self.inner.create(model_url, options)
         }
     }
@@ -717,7 +714,7 @@ mod tests {
         }];
         assert!(matches!(
             validate_tools(Provider::OpenAi, &non_object),
-            Err(LlmError::UnsupportedCapability { .. })
+            Err(RathError::UnsupportedCapability { .. })
         ));
 
         let duplicate = vec![
@@ -734,7 +731,7 @@ mod tests {
         ];
         assert!(matches!(
             validate_tools(Provider::OpenAi, &duplicate),
-            Err(LlmError::Validation(_))
+            Err(RathError::Validation(_))
         ));
     }
 
@@ -743,7 +740,7 @@ mod tests {
     fn parse_unknown_scheme_errors() {
         assert!(matches!(
             ModelUrl::parse("unknown:///model"),
-            Err(LlmError::InvalidUrl(_))
+            Err(RathError::InvalidUrl(_))
         ));
     }
 
@@ -752,7 +749,7 @@ mod tests {
     fn parse_missing_api_key_env_errors() {
         assert!(matches!(
             ModelUrl::parse("openai:///gpt-4o?api_key_env=__PRAVAH_MISSING_ENV__"),
-            Err(LlmError::InvalidUrl(_))
+            Err(RathError::InvalidUrl(_))
         ));
     }
 
@@ -761,7 +758,7 @@ mod tests {
     fn parse_missing_scheme_errors() {
         assert!(matches!(
             ModelUrl::parse("gemini-2.5-flash-lite"),
-            Err(LlmError::InvalidUrl(_))
+            Err(RathError::InvalidUrl(_))
         ));
     }
 

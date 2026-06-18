@@ -3,8 +3,8 @@ use reqwest::Client as HttpClient;
 use serde_json::{Value, json};
 
 use crate::llm::{
-    Attachment, CacheControl, LlmClient, LlmError, LlmOptions, LlmOutput, LlmResponse, Message,
-    ModelUrl, Provider, Role, ThinkingLevel, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+    Attachment, CacheControl, LlmClient, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl,
+    Provider, RathError, Role, ThinkingLevel, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
     configured_base_url, decode_output_text, required_api_key, validate_tools,
 };
 
@@ -19,7 +19,7 @@ struct AnthropicClient {
     url: ModelUrl,
 }
 
-pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, LlmError> {
+pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, RathError> {
     let api_key = required_api_key(url, "ANTHROPIC_API_KEY")?;
     Ok(Box::new(AnthropicClient {
         http: HttpClient::new(),
@@ -41,12 +41,12 @@ impl LlmClient for AnthropicClient {
         &self.options
     }
 
-    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, LlmError> {
+    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
         validate_history(messages)?;
         validate_tools(Provider::Anthropic, &self.options.tools)?;
 
         if matches!(&self.options.thinking, Some(t) if *t != ThinkingLevel::Off) {
-            return Err(LlmError::UnsupportedCapability {
+            return Err(RathError::UnsupportedCapability {
                 provider: Provider::Anthropic,
                 capability: "thinking is not exposed by the Anthropic adapter yet".into(),
             });
@@ -73,7 +73,7 @@ async fn send_messages_request(
     endpoint: String,
     api_key: &str,
     payload: &Value,
-) -> Result<Value, LlmError> {
+) -> Result<Value, RathError> {
     let response = http
         .post(endpoint)
         .header("x-api-key", api_key)
@@ -81,21 +81,21 @@ async fn send_messages_request(
         .json(payload)
         .send()
         .await
-        .map_err(|e| LlmError::Llm(e.to_string()))?;
+        .map_err(|e| RathError::Provider(e.to_string()))?;
 
     let status = response.status();
     let body = response
         .text()
         .await
-        .map_err(|e| LlmError::Llm(e.to_string()))?;
+        .map_err(|e| RathError::Provider(e.to_string()))?;
     if !status.is_success() {
-        return Err(LlmError::Llm(format_anthropic_http_error(
+        return Err(RathError::Provider(format_anthropic_http_error(
             status.as_u16(),
             &body,
         )));
     }
 
-    serde_json::from_str(&body).map_err(|e| LlmError::Deserialize {
+    serde_json::from_str(&body).map_err(|e| RathError::Deserialize {
         source: e,
         raw: body,
     })
@@ -131,15 +131,15 @@ fn format_anthropic_http_error(status: u16, body: &str) -> String {
     }
 }
 
-fn validate_history(messages: &[Message]) -> Result<(), LlmError> {
+fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     if messages.is_empty() {
-        return Err(LlmError::Validation("messages must not be empty".into()));
+        return Err(RathError::Validation("messages must not be empty".into()));
     }
     if matches!(
         messages.last().map(|m| &m.role),
         Some(Role::AssistantToolCalls { .. })
     ) {
-        return Err(LlmError::Validation(
+        return Err(RathError::Validation(
             "history ends with assistant tool calls without tool results".into(),
         ));
     }
@@ -310,7 +310,7 @@ fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
-fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, LlmError> {
+fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, RathError> {
     let usage = response.get("usage").map(usage_from_value);
     let provider_model = response
         .get("model")
@@ -334,7 +334,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         .with_provider_model(provider_model)
         .with_raw_metadata(metadata));
     }
-    let text = text.ok_or(LlmError::EmptyResponse)?;
+    let text = text.ok_or(RathError::EmptyResponse)?;
     Ok(LlmResponse::new(
         Provider::Anthropic,
         LlmOutput::Output(decode_output_text(&text, wants_json_output)?),

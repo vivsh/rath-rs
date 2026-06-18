@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::llm::LlmError;
+use crate::core::RathError;
 
 /// Options used when constructing a text-to-speech client.
 #[derive(Debug, Clone, Default)]
@@ -12,7 +12,7 @@ pub struct TtsOptions {
 
 impl TtsOptions {
     /// Builds a provider client for the given model URL.
-    pub fn create(self, model_url: &str) -> Result<Box<dyn TtsClient>, LlmError> {
+    pub fn create(self, model_url: &str) -> Result<Box<dyn TtsClient>, RathError> {
         let url = crate::core::ModelUrl::parse(model_url)?;
         crate::providers::create_tts_client(&url, self)
     }
@@ -39,5 +39,5 @@ pub struct TtsResponse {
 /// Provider-agnostic text-to-speech client.
 #[async_trait]
 pub trait TtsClient: Send + Sync {
-    async fn synthesize_speech(&self, request: &TtsRequest) -> Result<TtsResponse, LlmError>;
+    async fn synthesize_speech(&self, request: &TtsRequest) -> Result<TtsResponse, RathError>;
 }

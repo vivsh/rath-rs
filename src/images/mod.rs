@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::llm::LlmError;
+use crate::core::RathError;
 
 /// Options used when constructing an image client.
 #[derive(Debug, Clone, Default)]
@@ -12,7 +12,7 @@ pub struct ImageOptions {
 
 impl ImageOptions {
     /// Builds a provider client for the given model URL.
-    pub fn create(self, model_url: &str) -> Result<Box<dyn ImageClient>, LlmError> {
+    pub fn create(self, model_url: &str) -> Result<Box<dyn ImageClient>, RathError> {
         let url = crate::core::ModelUrl::parse(model_url)?;
         crate::providers::create_image_client(&url, self)
     }
@@ -45,5 +45,5 @@ pub struct ImageResponse {
 /// Provider-agnostic image client.
 #[async_trait]
 pub trait ImageClient: Send + Sync {
-    async fn generate_image(&self, request: &ImageRequest) -> Result<ImageResponse, LlmError>;
+    async fn generate_image(&self, request: &ImageRequest) -> Result<ImageResponse, RathError>;
 }

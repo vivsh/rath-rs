@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::llm::LlmError;
+use crate::core::RathError;
 
 /// Options used when constructing an embedding client.
 #[derive(Debug, Clone, Default)]
@@ -12,7 +12,7 @@ pub struct EmbeddingOptions {
 
 impl EmbeddingOptions {
     /// Builds a provider client for the given model URL.
-    pub fn create(self, model_url: &str) -> Result<Box<dyn EmbeddingClient>, LlmError> {
+    pub fn create(self, model_url: &str) -> Result<Box<dyn EmbeddingClient>, RathError> {
         let url = crate::core::ModelUrl::parse(model_url)?;
         crate::providers::create_embedding_client(&url, self)
     }
@@ -57,5 +57,5 @@ pub struct EmbedResponse {
 /// Provider-agnostic embedding client.
 #[async_trait]
 pub trait EmbeddingClient: Send + Sync {
-    async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, LlmError>;
+    async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, RathError>;
 }

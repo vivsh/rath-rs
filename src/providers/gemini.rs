@@ -13,8 +13,8 @@ use crate::embeddings::{
 
 use crate::llm::schema;
 use crate::llm::{
-    Attachment, LlmClient, LlmError, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl,
-    Provider, Role, ThinkingLevel, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+    Attachment, LlmClient, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl, Provider,
+    RathError, Role, ThinkingLevel, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
     decode_output_text, extract_exit_tool_call, inject_exit_tool, validate_tools,
 };
 
@@ -29,9 +29,9 @@ fn format_error_chain(e: &dyn std::error::Error) -> String {
     msg
 }
 
-fn build_client(url: &ModelUrl) -> Result<Gemini, LlmError> {
+fn build_client(url: &ModelUrl) -> Result<Gemini, RathError> {
     if url.base_url.is_some() {
-        return Err(LlmError::UnsupportedCapability {
+        return Err(RathError::UnsupportedCapability {
             provider: Provider::Gemini,
             capability: "custom endpoint".into(),
         });
@@ -40,7 +40,7 @@ fn build_client(url: &ModelUrl) -> Result<Gemini, LlmError> {
         key.clone()
     } else {
         std::env::var("GEMINI_API_KEY")
-            .map_err(|_| LlmError::Llm("GEMINI_API_KEY is not set".into()))?
+            .map_err(|_| RathError::Provider("GEMINI_API_KEY is not set".into()))?
     };
     let model_id = if url.model.starts_with("models/") {
         url.model.clone()
@@ -48,7 +48,7 @@ fn build_client(url: &ModelUrl) -> Result<Gemini, LlmError> {
         format!("models/{}", url.model)
     };
     let model = GeminiModel::Custom(model_id);
-    Gemini::with_model(&api_key, model).map_err(|e| LlmError::Llm(format_error_chain(&e)))
+    Gemini::with_model(&api_key, model).map_err(|e| RathError::Provider(format_error_chain(&e)))
 }
 
 struct GeminiClient {
@@ -134,7 +134,7 @@ fn user_to_message(message: &Message) -> GeminiMessage {
     }
 }
 
-fn build_tools_spec(tools: &[ToolDefinition]) -> Result<Option<GeminiTool>, LlmError> {
+fn build_tools_spec(tools: &[ToolDefinition]) -> Result<Option<GeminiTool>, RathError> {
     if tools.is_empty() {
         return Ok(None);
     }
@@ -227,21 +227,21 @@ fn resolve_call_name<'a>(history: &'a [Message], call_id: &'a str) -> &'a str {
 }
 
 /// Converts a `ToolDefinition` into a Gemini function declaration.
-fn build_fn_decl(tool: &ToolDefinition) -> Result<FunctionDeclaration, LlmError> {
+fn build_fn_decl(tool: &ToolDefinition) -> Result<FunctionDeclaration, RathError> {
     let sanitized = schema::sanitize_strict(tool.parameters.clone());
     let json = serde_json::json!({
         "name": tool.name,
         "description": tool.description,
         "parameters": sanitized,
     });
-    serde_json::from_value(json).map_err(LlmError::Serialize)
+    serde_json::from_value(json).map_err(RathError::Serialize)
 }
 
 /// Maps the raw Gemini response into a [`LlmOutput`].
 fn map_response(
     response: GenerationResponse,
     wants_json_output: bool,
-) -> Result<LlmResponse, LlmError> {
+) -> Result<LlmResponse, RathError> {
     let usage = response.usage_metadata.as_ref().map(|usage| TokenUsage {
         input: usage.prompt_token_count.map(|v| v as u32),
         output: usage.candidates_token_count.map(|v| v as u32),
@@ -277,7 +277,7 @@ fn map_response(
     }
     let text = response.text();
     if text.is_empty() {
-        return Err(LlmError::EmptyResponse);
+        return Err(RathError::EmptyResponse);
     }
     Ok(LlmResponse::new(
         Provider::Gemini,
@@ -309,7 +309,7 @@ impl GeminiClient {
         tools_enabled: bool,
         wants_json_output: bool,
         response_schema: Option<Value>,
-    ) -> Result<GenerationResponse, LlmError> {
+    ) -> Result<GenerationResponse, RathError> {
         let client = &self.client;
         let thinking_budget: i32 = match &self.options.thinking {
             None | Some(ThinkingLevel::Off) => 0,
@@ -346,7 +346,7 @@ impl GeminiClient {
         builder
             .execute()
             .await
-            .map_err(|e| LlmError::Llm(format_error_chain(&e)))
+            .map_err(|e| RathError::Provider(format_error_chain(&e)))
     }
 }
 
@@ -360,15 +360,15 @@ impl LlmClient for GeminiClient {
         &self.options
     }
 
-    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, LlmError> {
+    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
         if messages.is_empty() {
-            return Err(LlmError::Validation("messages must not be empty".into()));
+            return Err(RathError::Validation("messages must not be empty".into()));
         }
         if matches!(
             messages.last().map(|m| &m.role),
             Some(Role::AssistantToolCalls { .. })
         ) {
-            return Err(LlmError::Validation(
+            return Err(RathError::Validation(
                 "history ends with assistant tool calls without tool results".into(),
             ));
         }
@@ -404,7 +404,7 @@ impl LlmClient for GeminiClient {
 
 #[async_trait]
 impl EmbeddingClient for GeminiClient {
-    async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, LlmError> {
+    async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, RathError> {
         let mut builder = self.client.embed_content().with_text(&request.input);
         if let Some(task_type) = &request.task_type {
             let gemini_task = match task_type {
@@ -428,7 +428,7 @@ impl EmbeddingClient for GeminiClient {
         let response = builder
             .execute()
             .await
-            .map_err(|e| LlmError::Llm(format_error_chain(&e)))?;
+            .map_err(|e| RathError::Provider(format_error_chain(&e)))?;
         Ok(EmbedResponse {
             values: response.embedding.values,
         })
@@ -437,7 +437,10 @@ impl EmbeddingClient for GeminiClient {
 
 /// Creates a Gemini client.
 /// Fails when the API key cannot be resolved.
-pub fn new_client(url: &ModelUrl, mut options: LlmOptions) -> Result<Box<dyn LlmClient>, LlmError> {
+pub fn new_client(
+    url: &ModelUrl,
+    mut options: LlmOptions,
+) -> Result<Box<dyn LlmClient>, RathError> {
     let client = build_client(url)?;
     let exit_tool_name = if url.needs_exit_tool()
         && !options.output_type_name.is_empty()
@@ -460,7 +463,7 @@ pub fn new_client(url: &ModelUrl, mut options: LlmOptions) -> Result<Box<dyn Llm
 pub fn new_embedding_client(
     url: &ModelUrl,
     _options: EmbeddingOptions,
-) -> Result<Box<dyn EmbeddingClient>, LlmError> {
+) -> Result<Box<dyn EmbeddingClient>, RathError> {
     Ok(Box::new(GeminiClient {
         client: build_client(url)?,
         options: LlmOptions::default(),

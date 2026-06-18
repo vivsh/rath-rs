@@ -1,18 +1,22 @@
 use async_trait::async_trait;
 use serde_json::{Map, Value};
+use std::time::Duration;
 
-use crate::core::ModelUrl;
+use crate::core::RathError;
+use crate::core::{ModelUrl, Provider};
 use crate::images::{ImageClient, ImageData, ImageOptions, ImageRequest, ImageResponse};
-use crate::llm::LlmError;
-use crate::video::{VideoClient, VideoData, VideoOptions, VideoRequest, VideoResponse};
+use crate::video::{
+    VideoClient, VideoData, VideoJob, VideoJobStatus, VideoOptions, VideoRequest, VideoResponse,
+};
 
 const DEFAULT_BASE_URL: &str = "https://fal.run";
+const DEFAULT_QUEUE_BASE_URL: &str = "https://queue.fal.run";
 const DEFAULT_API_KEY_ENV: &str = "FAL_KEY";
 
 pub(crate) fn new_image_client(
     url: &ModelUrl,
     options: ImageOptions,
-) -> Result<Box<dyn ImageClient>, LlmError> {
+) -> Result<Box<dyn ImageClient>, RathError> {
     Ok(Box::new(FalClient::new(
         url,
         options.provider_config,
@@ -23,20 +27,20 @@ pub(crate) fn new_image_client(
 pub(crate) fn new_video_client(
     url: &ModelUrl,
     options: VideoOptions,
-) -> Result<Box<dyn VideoClient>, LlmError> {
-    Ok(Box::new(FalClient::new(
-        url,
-        options.provider_config,
-        "video",
-    )?))
+) -> Result<Box<dyn VideoClient>, RathError> {
+    let mut client = FalClient::new(url, options.provider_config, "video")?;
+    client.poll_interval = options.poll_interval;
+    Ok(Box::new(client))
 }
 
 struct FalClient {
     http: reqwest::Client,
     api_key: String,
     endpoint: String,
+    queue_base_url: String,
     model: String,
     provider_config: Option<Value>,
+    poll_interval: Duration,
 }
 
 impl FalClient {
@@ -44,11 +48,11 @@ impl FalClient {
         url: &ModelUrl,
         provider_config: Option<Value>,
         capability: &str,
-    ) -> Result<Self, LlmError> {
+    ) -> Result<Self, RathError> {
         let api_key = match &url.api_key {
             Some(key) => key.clone(),
             None => std::env::var(DEFAULT_API_KEY_ENV).map_err(|_| {
-                LlmError::Validation(format!(
+                RathError::Validation(format!(
                     "set {DEFAULT_API_KEY_ENV} or pass api_key_env for Fal {capability} calls"
                 ))
             })?,
@@ -58,44 +62,69 @@ impl FalClient {
             .clone()
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let endpoint = build_endpoint(&base_url, &url.model);
+        let queue_base_url = queue_base_url(&base_url);
         Ok(Self {
             http: reqwest::Client::new(),
             api_key,
             endpoint,
+            queue_base_url,
             model: url.model.clone(),
             provider_config,
+            poll_interval: Duration::from_secs(5),
         })
     }
 
-    async fn post(&self, payload: Value) -> Result<Value, LlmError> {
+    async fn post(&self, endpoint: &str, payload: Value) -> Result<Value, RathError> {
         let response = self
             .http
-            .post(&self.endpoint)
+            .post(endpoint)
             .header("Authorization", format!("Key {}", self.api_key))
             .json(&payload)
             .send()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?;
+            .map_err(|e| RathError::Provider(e.to_string()))?;
 
         let status = response.status();
         let body = response
             .text()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?;
+            .map_err(|e| RathError::Provider(e.to_string()))?;
         if !status.is_success() {
-            return Err(LlmError::Llm(format!(
+            return Err(RathError::Provider(format!(
                 "Fal request failed with status {status}: {body}"
             )));
         }
-        serde_json::from_str(&body).map_err(|source| LlmError::Deserialize { source, raw: body })
+        serde_json::from_str(&body).map_err(|source| RathError::Deserialize { source, raw: body })
+    }
+
+    async fn get(&self, endpoint: &str) -> Result<Value, RathError> {
+        let response = self
+            .http
+            .get(endpoint)
+            .header("Authorization", format!("Key {}", self.api_key))
+            .send()
+            .await
+            .map_err(|e| RathError::Provider(e.to_string()))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| RathError::Provider(e.to_string()))?;
+        if !status.is_success() {
+            return Err(RathError::Provider(format!(
+                "Fal request failed with status {status}: {body}"
+            )));
+        }
+        serde_json::from_str(&body).map_err(|source| RathError::Deserialize { source, raw: body })
     }
 }
 
 #[async_trait]
 impl ImageClient for FalClient {
-    async fn generate_image(&self, request: &ImageRequest) -> Result<ImageResponse, LlmError> {
+    async fn generate_image(&self, request: &ImageRequest) -> Result<ImageResponse, RathError> {
         let payload = image_payload(&self.model, &self.provider_config, request);
-        let raw = self.post(Value::Object(payload)).await?;
+        let raw = self.post(&self.endpoint, Value::Object(payload)).await?;
         Ok(ImageResponse {
             images: extract_images(&raw),
             raw_metadata: Some(raw),
@@ -105,13 +134,29 @@ impl ImageClient for FalClient {
 
 #[async_trait]
 impl VideoClient for FalClient {
-    async fn generate_video(&self, request: &VideoRequest) -> Result<VideoResponse, LlmError> {
+    async fn submit_video(&self, request: &VideoRequest) -> Result<VideoJob, RathError> {
         let payload = video_payload(&self.provider_config, request);
-        let raw = self.post(Value::Object(payload)).await?;
-        Ok(VideoResponse {
-            videos: extract_videos(&raw),
-            raw_metadata: Some(raw),
-        })
+        let endpoint = build_endpoint(&self.queue_base_url, &self.model);
+        let raw = self.post(&endpoint, Value::Object(payload)).await?;
+        video_job_from_submit(&self.model, raw)
+    }
+
+    async fn get_video(&self, job_id: &str) -> Result<VideoJobStatus, RathError> {
+        let endpoint = build_status_endpoint(&self.queue_base_url, &self.model, job_id);
+        let raw = self.get(&endpoint).await?;
+        video_status_from_status(&self.queue_base_url, &self.model, job_id, raw, self).await
+    }
+
+    async fn wait_video(&self, job_id: &str) -> Result<VideoResponse, RathError> {
+        loop {
+            match self.get_video(job_id).await? {
+                VideoJobStatus::Queued { .. } | VideoJobStatus::Running { .. } => {
+                    tokio::time::sleep(self.poll_interval).await;
+                }
+                VideoJobStatus::Succeeded { response } => return Ok(response),
+                VideoJobStatus::Failed { message, .. } => return Err(RathError::Provider(message)),
+            }
+        }
     }
 }
 
@@ -120,6 +165,32 @@ fn build_endpoint(base_url: &str, model: &str) -> String {
         "{}/{}",
         base_url.trim_end_matches('/'),
         model.trim_start_matches('/')
+    )
+}
+
+fn queue_base_url(base_url: &str) -> String {
+    match base_url.trim_end_matches('/') {
+        DEFAULT_BASE_URL => DEFAULT_QUEUE_BASE_URL.to_string(),
+        DEFAULT_QUEUE_BASE_URL => DEFAULT_QUEUE_BASE_URL.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn build_status_endpoint(queue_base_url: &str, model: &str, request_id: &str) -> String {
+    format!(
+        "{}/{}/requests/{}/status",
+        queue_base_url.trim_end_matches('/'),
+        model.trim_start_matches('/'),
+        request_id
+    )
+}
+
+fn build_response_endpoint(queue_base_url: &str, model: &str, request_id: &str) -> String {
+    format!(
+        "{}/{}/requests/{}/response",
+        queue_base_url.trim_end_matches('/'),
+        model.trim_start_matches('/'),
+        request_id
     )
 }
 
@@ -221,6 +292,99 @@ fn extract_videos(raw: &Value) -> Vec<VideoData> {
     videos
 }
 
+fn video_job_from_submit(model: &str, raw: Value) -> Result<VideoJob, RathError> {
+    let id = raw
+        .get("request_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RathError::Provider("Fal queue submit response missing request_id".into()))?
+        .to_string();
+    Ok(VideoJob {
+        id,
+        provider: Provider::Fal,
+        provider_model: Some(model.to_string()),
+        status_url: raw
+            .get("status_url")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        response_url: raw
+            .get("response_url")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        cancel_url: raw
+            .get("cancel_url")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        raw_metadata: Some(raw),
+    })
+}
+
+async fn video_status_from_status(
+    queue_base_url: &str,
+    model: &str,
+    job_id: &str,
+    raw: Value,
+    client: &FalClient,
+) -> Result<VideoJobStatus, RathError> {
+    let status = raw
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("UNKNOWN");
+    match status {
+        "IN_QUEUE" => Ok(VideoJobStatus::Queued {
+            queue_position: raw.get("queue_position").and_then(Value::as_u64),
+            raw_metadata: Some(raw),
+        }),
+        "IN_PROGRESS" => Ok(VideoJobStatus::Running {
+            raw_metadata: Some(raw),
+        }),
+        "COMPLETED" => {
+            if let Some(error) = raw.get("error").and_then(Value::as_str) {
+                return Ok(VideoJobStatus::Failed {
+                    message: error.to_string(),
+                    raw_metadata: Some(raw),
+                });
+            }
+            let endpoint = raw
+                .get("response_url")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| build_response_endpoint(queue_base_url, model, job_id));
+            let response_raw = client.get(&endpoint).await?;
+            Ok(VideoJobStatus::Succeeded {
+                response: VideoResponse {
+                    videos: extract_videos(&response_raw),
+                    raw_metadata: Some(response_raw),
+                },
+            })
+        }
+        other => Ok(VideoJobStatus::Failed {
+            message: format!("Fal video job returned unknown status '{other}'"),
+            raw_metadata: Some(raw),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn video_status_from_pending(raw: Value) -> VideoJobStatus {
+    let status = raw
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("UNKNOWN");
+    match status {
+        "IN_QUEUE" => VideoJobStatus::Queued {
+            queue_position: raw.get("queue_position").and_then(Value::as_u64),
+            raw_metadata: Some(raw),
+        },
+        "IN_PROGRESS" => VideoJobStatus::Running {
+            raw_metadata: Some(raw),
+        },
+        other => VideoJobStatus::Failed {
+            message: format!("Fal video job returned unknown status '{other}'"),
+            raw_metadata: Some(raw),
+        },
+    }
+}
+
 fn extract_video(value: &Value) -> Option<VideoData> {
     let url = value.get("url").and_then(Value::as_str);
     if let Some(url) = url {
@@ -255,6 +419,19 @@ mod tests {
             build_endpoint("https://fal.run", "fal-ai/flux/schnell"),
             "https://fal.run/fal-ai/flux/schnell"
         );
+        assert_eq!(
+            build_endpoint("https://queue.fal.run", "fal-ai/wan/text-to-video"),
+            "https://queue.fal.run/fal-ai/wan/text-to-video"
+        );
+        assert_eq!(
+            build_status_endpoint(
+                "https://queue.fal.run",
+                "fal-ai/wan/text-to-video",
+                "abc123"
+            ),
+            "https://queue.fal.run/fal-ai/wan/text-to-video/requests/abc123/status"
+        );
+        assert_eq!(queue_base_url("https://fal.run"), "https://queue.fal.run");
     }
 
     #[test]
@@ -298,5 +475,40 @@ mod tests {
         assert!(
             matches!(&videos[0], VideoData::Url { url } if url == "https://example.com/out.mp4")
         );
+    }
+
+    #[test]
+    fn maps_queue_submit_to_video_job() {
+        let raw = json!({
+            "request_id": "abc123",
+            "status_url": "https://queue.fal.run/fal-ai/wan/requests/abc123/status",
+            "response_url": "https://queue.fal.run/fal-ai/wan/requests/abc123/response",
+            "cancel_url": "https://queue.fal.run/fal-ai/wan/requests/abc123/cancel"
+        });
+        let job = video_job_from_submit("fal-ai/wan", raw).unwrap();
+        assert_eq!(job.id, "abc123");
+        assert_eq!(job.provider, Provider::Fal);
+        assert_eq!(job.provider_model.as_deref(), Some("fal-ai/wan"));
+        assert!(job.status_url.as_deref().unwrap().ends_with("/status"));
+        assert!(job.response_url.as_deref().unwrap().ends_with("/response"));
+        assert!(job.cancel_url.as_deref().unwrap().ends_with("/cancel"));
+    }
+
+    #[test]
+    fn maps_pending_statuses() {
+        let queued = video_status_from_pending(json!({
+            "status": "IN_QUEUE",
+            "queue_position": 7
+        }));
+        assert!(matches!(
+            queued,
+            VideoJobStatus::Queued {
+                queue_position: Some(7),
+                ..
+            }
+        ));
+
+        let running = video_status_from_pending(json!({"status": "IN_PROGRESS"}));
+        assert!(matches!(running, VideoJobStatus::Running { .. }));
     }
 }

@@ -17,7 +17,7 @@ pub enum RathError {
     },
     /// The provider returned an HTTP or API error.
     #[error("provider call failed: {0}")]
-    Llm(String),
+    Provider(String),
     /// The provider returned an empty response body.
     #[error("provider returned an empty response")]
     EmptyResponse,

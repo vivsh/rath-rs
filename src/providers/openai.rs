@@ -8,8 +8,8 @@ use crate::audio::tts::{TtsClient, TtsOptions, TtsRequest, TtsResponse};
 use crate::embeddings::{EmbedRequest, EmbedResponse, EmbeddingClient, EmbeddingOptions};
 
 use crate::llm::{
-    Attachment, LlmClient, LlmError, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl,
-    Provider, Role, TokenUsage, ToolCall, ToolChoice, ToolDefinition, configured_base_url,
+    Attachment, LlmClient, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl, Provider,
+    RathError, Role, TokenUsage, ToolCall, ToolChoice, ToolDefinition, configured_base_url,
     decode_output_text, required_api_key, validate_tools,
 };
 
@@ -25,14 +25,14 @@ struct OpenAiClient {
     provider_config: Option<Value>,
 }
 
-pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, LlmError> {
+pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, RathError> {
     Ok(Box::new(build_client(url, options, None)?))
 }
 
 pub fn new_embedding_client(
     url: &ModelUrl,
     options: EmbeddingOptions,
-) -> Result<Box<dyn EmbeddingClient>, LlmError> {
+) -> Result<Box<dyn EmbeddingClient>, RathError> {
     Ok(Box::new(build_client(
         url,
         LlmOptions::default(),
@@ -40,7 +40,10 @@ pub fn new_embedding_client(
     )?))
 }
 
-pub fn new_tts_client(url: &ModelUrl, options: TtsOptions) -> Result<Box<dyn TtsClient>, LlmError> {
+pub fn new_tts_client(
+    url: &ModelUrl,
+    options: TtsOptions,
+) -> Result<Box<dyn TtsClient>, RathError> {
     Ok(Box::new(build_client(
         url,
         LlmOptions::default(),
@@ -48,7 +51,10 @@ pub fn new_tts_client(url: &ModelUrl, options: TtsOptions) -> Result<Box<dyn Tts
     )?))
 }
 
-pub fn new_stt_client(url: &ModelUrl, options: SttOptions) -> Result<Box<dyn SttClient>, LlmError> {
+pub fn new_stt_client(
+    url: &ModelUrl,
+    options: SttOptions,
+) -> Result<Box<dyn SttClient>, RathError> {
     Ok(Box::new(build_client(
         url,
         LlmOptions::default(),
@@ -60,7 +66,7 @@ fn build_client(
     url: &ModelUrl,
     options: LlmOptions,
     provider_config: Option<Value>,
-) -> Result<OpenAiClient, LlmError> {
+) -> Result<OpenAiClient, RathError> {
     let api_key = required_api_key(url, "OPENAI_API_KEY")?;
     Ok(OpenAiClient {
         http: HttpClient::new(),
@@ -83,7 +89,7 @@ impl LlmClient for OpenAiClient {
         &self.options
     }
 
-    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, LlmError> {
+    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
         validate_history(messages)?;
         validate_tools(Provider::OpenAi, &self.options.tools)?;
 
@@ -99,12 +105,12 @@ impl LlmClient for OpenAiClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .error_for_status()
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .json()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?;
+            .map_err(|e| RathError::Provider(e.to_string()))?;
 
         map_response(response, wants_json_output)
     }
@@ -112,7 +118,7 @@ impl LlmClient for OpenAiClient {
 
 #[async_trait]
 impl EmbeddingClient for OpenAiClient {
-    async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, LlmError> {
+    async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, RathError> {
         let payload = json!({
             "model": self.model,
             "input": request.input,
@@ -125,15 +131,15 @@ impl EmbeddingClient for OpenAiClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .error_for_status()
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .json()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?;
+            .map_err(|e| RathError::Provider(e.to_string()))?;
         let values: Vec<f32> = response["data"][0]["embedding"]
             .as_array()
-            .ok_or_else(|| LlmError::Llm("embedding missing in response".into()))?
+            .ok_or_else(|| RathError::Provider("embedding missing in response".into()))?
             .iter()
             .map(|v| v.as_f64().unwrap_or(0.0) as f32)
             .collect();
@@ -143,7 +149,7 @@ impl EmbeddingClient for OpenAiClient {
 
 #[async_trait]
 impl TtsClient for OpenAiClient {
-    async fn synthesize_speech(&self, request: &TtsRequest) -> Result<TtsResponse, LlmError> {
+    async fn synthesize_speech(&self, request: &TtsRequest) -> Result<TtsResponse, RathError> {
         let mut payload = json_object_from(&self.provider_config);
         merge_json_object(&mut payload, &request.provider_config);
         payload.insert(
@@ -165,9 +171,9 @@ impl TtsClient for OpenAiClient {
             .json(&Value::Object(payload))
             .send()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .error_for_status()
-            .map_err(|e| LlmError::Llm(e.to_string()))?;
+            .map_err(|e| RathError::Provider(e.to_string()))?;
         let mime_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -177,7 +183,7 @@ impl TtsClient for OpenAiClient {
         let data = response
             .bytes()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .to_vec();
         Ok(TtsResponse {
             mime_type,
@@ -189,12 +195,12 @@ impl TtsClient for OpenAiClient {
 
 #[async_trait]
 impl SttClient for OpenAiClient {
-    async fn transcribe_audio(&self, request: &SttRequest) -> Result<SttResponse, LlmError> {
+    async fn transcribe_audio(&self, request: &SttRequest) -> Result<SttResponse, RathError> {
         let model = request.model.clone().unwrap_or_else(|| self.model.clone());
         let file = Part::bytes(request.data.clone())
             .file_name("audio")
             .mime_str(&request.mime_type)
-            .map_err(|e| LlmError::Validation(e.to_string()))?;
+            .map_err(|e| RathError::Validation(e.to_string()))?;
         let form = Form::new().text("model", model).part("file", file);
         let form = add_form_fields(form, &self.provider_config);
         let form = add_form_fields(form, &request.provider_config);
@@ -206,16 +212,16 @@ impl SttClient for OpenAiClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .error_for_status()
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .json()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?;
+            .map_err(|e| RathError::Provider(e.to_string()))?;
         let text = response
             .get("text")
             .and_then(Value::as_str)
-            .ok_or_else(|| LlmError::Llm("transcription text missing in response".into()))?
+            .ok_or_else(|| RathError::Provider("transcription text missing in response".into()))?
             .to_string();
         Ok(SttResponse {
             text,
@@ -268,15 +274,15 @@ fn add_form_fields(mut form: Form, value: &Option<Value>) -> Form {
     form
 }
 
-fn validate_history(messages: &[Message]) -> Result<(), LlmError> {
+fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     if messages.is_empty() {
-        return Err(LlmError::Validation("messages must not be empty".into()));
+        return Err(RathError::Validation("messages must not be empty".into()));
     }
     if matches!(
         messages.last().map(|m| &m.role),
         Some(Role::AssistantToolCalls { .. })
     ) {
-        return Err(LlmError::Validation(
+        return Err(RathError::Validation(
             "history ends with assistant tool calls without tool results".into(),
         ));
     }
@@ -426,7 +432,7 @@ fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
-fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, LlmError> {
+fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, RathError> {
     let usage = response.get("usage").map(usage_from_value);
     let provider_model = response
         .get("model")
@@ -451,7 +457,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         .with_raw_metadata(metadata));
     }
 
-    let text = collect_text(&response).ok_or(LlmError::EmptyResponse)?;
+    let text = collect_text(&response).ok_or(RathError::EmptyResponse)?;
     Ok(LlmResponse::new(
         Provider::OpenAi,
         LlmOutput::Output(decode_output_text(&text, wants_json_output)?),
@@ -461,7 +467,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
     .with_raw_metadata(metadata))
 }
 
-fn collect_tool_calls(response: &Value) -> Result<Vec<ToolCall>, LlmError> {
+fn collect_tool_calls(response: &Value) -> Result<Vec<ToolCall>, RathError> {
     let mut calls = Vec::new();
     if let Some(output) = response.get("output").and_then(Value::as_array) {
         for item in output {
@@ -473,17 +479,17 @@ fn collect_tool_calls(response: &Value) -> Result<Vec<ToolCall>, LlmError> {
                 .or_else(|| item.get("id"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    LlmError::Validation("OpenAI function call missing call_id".into())
+                    RathError::Validation("OpenAI function call missing call_id".into())
                 })?;
             let name = item
                 .get("name")
                 .and_then(Value::as_str)
-                .ok_or_else(|| LlmError::Validation("OpenAI function call missing name".into()))?;
+                .ok_or_else(|| RathError::Validation("OpenAI function call missing name".into()))?;
             let raw_args = item
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            let args = serde_json::from_str(raw_args).map_err(|e| LlmError::Deserialize {
+            let args = serde_json::from_str(raw_args).map_err(|e| RathError::Deserialize {
                 source: e,
                 raw: raw_args.to_string(),
             })?;

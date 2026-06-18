@@ -3,8 +3,8 @@ use reqwest::Client as HttpClient;
 use serde_json::{Value, json};
 
 use crate::llm::{
-    Attachment, LlmClient, LlmError, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl,
-    Provider, Role, TokenUsage, ToolCall, ToolChoice, ToolDefinition, configured_base_url,
+    Attachment, LlmClient, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl, Provider,
+    RathError, Role, TokenUsage, ToolCall, ToolChoice, ToolDefinition, configured_base_url,
     decode_output_text, required_api_key, validate_tools,
 };
 
@@ -19,7 +19,7 @@ struct OpenRouterClient {
     url: ModelUrl,
 }
 
-pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, LlmError> {
+pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, RathError> {
     let api_key = required_api_key(url, "OPENROUTER_API_KEY")?;
     Ok(Box::new(OpenRouterClient {
         http: HttpClient::new(),
@@ -41,7 +41,7 @@ impl LlmClient for OpenRouterClient {
         &self.options
     }
 
-    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, LlmError> {
+    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
         validate_history(messages)?;
         validate_tools(Provider::OpenRouter, &self.options.tools)?;
 
@@ -57,12 +57,12 @@ impl LlmClient for OpenRouterClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .error_for_status()
-            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .map_err(|e| RathError::Provider(e.to_string()))?
             .json()
             .await
-            .map_err(|e| LlmError::Llm(e.to_string()))?;
+            .map_err(|e| RathError::Provider(e.to_string()))?;
 
         map_response(response, wants_json_output)
     }
@@ -72,15 +72,15 @@ fn chat_completions_endpoint(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }
 
-fn validate_history(messages: &[Message]) -> Result<(), LlmError> {
+fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     if messages.is_empty() {
-        return Err(LlmError::Validation("messages must not be empty".into()));
+        return Err(RathError::Validation("messages must not be empty".into()));
     }
     if matches!(
         messages.last().map(|m| &m.role),
         Some(Role::AssistantToolCalls { .. })
     ) {
-        return Err(LlmError::Validation(
+        return Err(RathError::Validation(
             "history ends with assistant tool calls without tool results".into(),
         ));
     }
@@ -236,7 +236,7 @@ fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
-fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, LlmError> {
+fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, RathError> {
     let usage = response.get("usage").map(usage_from_value);
     let provider_model = response
         .get("model")
@@ -251,7 +251,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"))
-        .ok_or(LlmError::EmptyResponse)?;
+        .ok_or(RathError::EmptyResponse)?;
 
     let calls = collect_tool_calls(message)?;
     if !calls.is_empty() {
@@ -273,7 +273,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
     let text = message
         .get("content")
         .and_then(Value::as_str)
-        .ok_or(LlmError::EmptyResponse)?;
+        .ok_or(RathError::EmptyResponse)?;
     Ok(LlmResponse::new(
         Provider::OpenRouter,
         LlmOutput::Output(decode_output_text(text, wants_json_output)?),
@@ -283,7 +283,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
     .with_raw_metadata(metadata))
 }
 
-fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, LlmError> {
+fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, RathError> {
     let mut calls = Vec::new();
     for call in message
         .get("tool_calls")
@@ -294,21 +294,21 @@ fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, LlmError> {
         let id = call
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| LlmError::Validation("OpenRouter tool call missing id".into()))?;
+            .ok_or_else(|| RathError::Validation("OpenRouter tool call missing id".into()))?;
         let function = call
             .get("function")
-            .ok_or_else(|| LlmError::Validation("OpenRouter tool call missing function".into()))?;
+            .ok_or_else(|| RathError::Validation("OpenRouter tool call missing function".into()))?;
         let name = function
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                LlmError::Validation("OpenRouter tool call missing function name".into())
+                RathError::Validation("OpenRouter tool call missing function name".into())
             })?;
         let raw_args = function
             .get("arguments")
             .and_then(Value::as_str)
             .unwrap_or("{}");
-        let args = serde_json::from_str(raw_args).map_err(|e| LlmError::Deserialize {
+        let args = serde_json::from_str(raw_args).map_err(|e| RathError::Deserialize {
             source: e,
             raw: raw_args.to_string(),
         })?;

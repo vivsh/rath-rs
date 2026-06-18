@@ -19,7 +19,7 @@ provider SDKs/APIs.
 - `rath::llm`: text-generation clients, messages, tools, structured output, and provider adapters
 - `rath::embeddings`: embedding request/response types and `EmbeddingClient`
 - `rath::images`: image request/response types and `ImageClient`
-- `rath::video`: video request/response types and `VideoClient`
+- `rath::video`: async video job request/response types and `VideoClient`
 - `rath::audio`: text-to-speech and speech-to-text traits and types
 
 Internally, provider adapters live under
@@ -59,8 +59,7 @@ OpenRouter model slugs keep their provider prefix in the URL path, for example
 `openrouter:///anthropic/claude-sonnet-4.5`.
 
 Fal model slugs also keep the full path, for example
-`fal:///fal-ai/flux/schnell`. Rath uses Fal's REST API; set `FAL_KEY` or pass
-`?api_key_env=YOUR_ENV_VAR`.
+`fal:///fal-ai/flux/schnell`.
 
 Model locators are not provider HTTP URLs. `openai:///gpt-4o` means "use the
 OpenAI adapter with model `gpt-4o`"; `base_url` is the only place for a custom
@@ -68,6 +67,29 @@ provider endpoint.
 
 Capability options parse the same URL format and dispatch to the provider
 implementation that supports that capability.
+
+## Credentials
+
+Rath reads provider API keys from environment variables. The default variables
+are:
+
+- `OPENAI_API_KEY` for OpenAI
+- `OPENROUTER_API_KEY` for OpenRouter
+- `ANTHROPIC_API_KEY` for Anthropic
+- `GEMINI_API_KEY` for Gemini
+- `FAL_KEY` for Fal
+- `OLLAMA_API_KEY` for Ollama only when the Ollama server requires auth
+
+Use `api_key_env` in the model locator to point Rath at a different environment
+variable:
+
+```text
+openai:///gpt-4o?api_key_env=MY_OPENAI_KEY
+fal:///fal-ai/flux/schnell?api_key_env=MY_FAL_KEY
+```
+
+`api_key_env` is resolved when the model locator is parsed. Rath does not accept
+inline credentials in model locators; keep secrets in environment variables.
 
 ## Embedding Usage
 
@@ -107,16 +129,20 @@ println!("{} image(s)", response.images.len());
 ## Video Usage
 
 ```rust
-use rath::video::{VideoOptions, VideoRequest};
+use rath::video::{VideoJobStatus, VideoOptions, VideoRequest};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let client = VideoOptions::default().create("fal:///fal-ai/wan/v2.2-a14b/text-to-video")?;
-let response = client.generate_video(&VideoRequest {
+let job = client.submit_video(&VideoRequest {
     prompt: "A slow cinematic push-in on a brass astrolabe".to_string(),
     ..VideoRequest::default()
 }).await?;
 
-println!("{} video(s)", response.videos.len());
+match client.get_video(&job.id).await? {
+    VideoJobStatus::Succeeded { response } => println!("{} video(s)", response.videos.len()),
+    VideoJobStatus::Failed { message, .. } => println!("video failed: {message}"),
+    VideoJobStatus::Queued { .. } | VideoJobStatus::Running { .. } => println!("still rendering"),
+}
 # Ok(())
 # }
 ```
@@ -143,15 +169,15 @@ println!("{} bytes of {}", response.data.len(), response.mime_type);
 ## LLM Usage
 
 ```rust
-use rath::llm::{ClientOptions, ClientOutput, Message};
+use rath::llm::{LlmOptions, LlmOutput, Message};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let client = ClientOptions::default().create("openai:///gpt-4o")?;
+let client = LlmOptions::default().create("openai:///gpt-4o")?;
 let response = client.execute(&[Message::user("Write one sentence about Rust.")]).await?;
 
 match response.output {
-    ClientOutput::Output(value) => println!("{value}"),
-    ClientOutput::ToolCalls { .. } => println!("model requested tools"),
+    LlmOutput::Output(value) => println!("{value}"),
+    LlmOutput::ToolCalls { .. } => println!("model requested tools"),
 }
 # Ok(())
 # }

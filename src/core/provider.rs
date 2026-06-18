@@ -1,5 +1,5 @@
 /// Supported provider backends.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Provider {
     /// Google Gemini.
     Gemini,

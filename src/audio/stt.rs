@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::llm::LlmError;
+use crate::core::RathError;
 
 /// Options used when constructing a speech-to-text client.
 #[derive(Debug, Clone, Default)]
@@ -12,7 +12,7 @@ pub struct SttOptions {
 
 impl SttOptions {
     /// Builds a provider client for the given model URL.
-    pub fn create(self, model_url: &str) -> Result<Box<dyn SttClient>, LlmError> {
+    pub fn create(self, model_url: &str) -> Result<Box<dyn SttClient>, RathError> {
         let url = crate::core::ModelUrl::parse(model_url)?;
         crate::providers::create_stt_client(&url, self)
     }
@@ -37,5 +37,5 @@ pub struct SttResponse {
 /// Provider-agnostic speech-to-text client.
 #[async_trait]
 pub trait SttClient: Send + Sync {
-    async fn transcribe_audio(&self, request: &SttRequest) -> Result<SttResponse, LlmError>;
+    async fn transcribe_audio(&self, request: &SttRequest) -> Result<SttResponse, RathError>;
 }
