@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use reqwest::Client as HttpClient;
+use reqwest::multipart::{Form, Part};
 use serde_json::{Value, json};
 
-use crate::embeddings::{EmbedRequest, EmbedResponse, EmbeddingClient};
+use crate::audio::stt::{SttClient, SttOptions, SttRequest, SttResponse};
+use crate::audio::tts::{TtsClient, TtsOptions, TtsRequest, TtsResponse};
+use crate::embeddings::{EmbedRequest, EmbedResponse, EmbeddingClient, EmbeddingOptions};
 
 use crate::llm::{
     Attachment, LlmClient, LlmError, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl,
@@ -19,18 +22,55 @@ struct OpenAiClient {
     model: String,
     options: LlmOptions,
     url: ModelUrl,
+    provider_config: Option<Value>,
 }
 
 pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, LlmError> {
+    Ok(Box::new(build_client(url, options, None)?))
+}
+
+pub fn new_embedding_client(
+    url: &ModelUrl,
+    options: EmbeddingOptions,
+) -> Result<Box<dyn EmbeddingClient>, LlmError> {
+    Ok(Box::new(build_client(
+        url,
+        LlmOptions::default(),
+        options.provider_config,
+    )?))
+}
+
+pub fn new_tts_client(url: &ModelUrl, options: TtsOptions) -> Result<Box<dyn TtsClient>, LlmError> {
+    Ok(Box::new(build_client(
+        url,
+        LlmOptions::default(),
+        options.provider_config,
+    )?))
+}
+
+pub fn new_stt_client(url: &ModelUrl, options: SttOptions) -> Result<Box<dyn SttClient>, LlmError> {
+    Ok(Box::new(build_client(
+        url,
+        LlmOptions::default(),
+        options.provider_config,
+    )?))
+}
+
+fn build_client(
+    url: &ModelUrl,
+    options: LlmOptions,
+    provider_config: Option<Value>,
+) -> Result<OpenAiClient, LlmError> {
     let api_key = required_api_key(url, "OPENAI_API_KEY")?;
-    Ok(Box::new(OpenAiClient {
+    Ok(OpenAiClient {
         http: HttpClient::new(),
         api_key,
         base_url: configured_base_url(url, DEFAULT_BASE_URL),
         model: url.model.clone(),
         options,
         url: url.clone(),
-    }))
+        provider_config,
+    })
 }
 
 #[async_trait]
@@ -101,12 +141,131 @@ impl EmbeddingClient for OpenAiClient {
     }
 }
 
+#[async_trait]
+impl TtsClient for OpenAiClient {
+    async fn synthesize_speech(&self, request: &TtsRequest) -> Result<TtsResponse, LlmError> {
+        let mut payload = json_object_from(&self.provider_config);
+        merge_json_object(&mut payload, &request.provider_config);
+        payload.insert(
+            "model".to_string(),
+            Value::String(request.model.clone().unwrap_or_else(|| self.model.clone())),
+        );
+        payload.insert("input".to_string(), Value::String(request.input.clone()));
+        if let Some(voice) = &request.voice {
+            payload.insert("voice".to_string(), Value::String(voice.clone()));
+        }
+        if let Some(format) = &request.format {
+            payload.insert("response_format".to_string(), Value::String(format.clone()));
+        }
+
+        let response = self
+            .http
+            .post(speech_endpoint(&self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&Value::Object(payload))
+            .send()
+            .await
+            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| LlmError::Llm(e.to_string()))?;
+        let mime_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("audio/mpeg")
+            .to_string();
+        let data = response
+            .bytes()
+            .await
+            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .to_vec();
+        Ok(TtsResponse {
+            mime_type,
+            data,
+            raw_metadata: None,
+        })
+    }
+}
+
+#[async_trait]
+impl SttClient for OpenAiClient {
+    async fn transcribe_audio(&self, request: &SttRequest) -> Result<SttResponse, LlmError> {
+        let model = request.model.clone().unwrap_or_else(|| self.model.clone());
+        let file = Part::bytes(request.data.clone())
+            .file_name("audio")
+            .mime_str(&request.mime_type)
+            .map_err(|e| LlmError::Validation(e.to_string()))?;
+        let form = Form::new().text("model", model).part("file", file);
+        let form = add_form_fields(form, &self.provider_config);
+        let form = add_form_fields(form, &request.provider_config);
+
+        let response: Value = self
+            .http
+            .post(transcriptions_endpoint(&self.base_url))
+            .bearer_auth(&self.api_key)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| LlmError::Llm(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| LlmError::Llm(e.to_string()))?;
+        let text = response
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| LlmError::Llm("transcription text missing in response".into()))?
+            .to_string();
+        Ok(SttResponse {
+            text,
+            raw_metadata: Some(response),
+        })
+    }
+}
+
 fn responses_endpoint(base_url: &str) -> String {
     format!("{}/responses", base_url.trim_end_matches('/'))
 }
 
 fn embeddings_endpoint(base_url: &str) -> String {
     format!("{}/embeddings", base_url.trim_end_matches('/'))
+}
+
+fn speech_endpoint(base_url: &str) -> String {
+    format!("{}/audio/speech", base_url.trim_end_matches('/'))
+}
+
+fn transcriptions_endpoint(base_url: &str) -> String {
+    format!("{}/audio/transcriptions", base_url.trim_end_matches('/'))
+}
+
+fn json_object_from(value: &Option<Value>) -> serde_json::Map<String, Value> {
+    match value {
+        Some(Value::Object(map)) => map.clone(),
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn merge_json_object(payload: &mut serde_json::Map<String, Value>, value: &Option<Value>) {
+    if let Some(Value::Object(map)) = value {
+        for (key, value) in map {
+            payload.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn add_form_fields(mut form: Form, value: &Option<Value>) -> Form {
+    if let Some(Value::Object(map)) = value {
+        for (key, value) in map {
+            let field_value = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string());
+            form = form.text(key.clone(), field_value);
+        }
+    }
+    form
 }
 
 fn validate_history(messages: &[Message]) -> Result<(), LlmError> {

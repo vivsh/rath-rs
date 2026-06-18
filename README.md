@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/rath-rs)](https://crates.io/crates/rath-rs)
 [![docs.rs](https://img.shields.io/docsrs/rath-rs)](https://docs.rs/rath-rs)
-[![License](https://img.shields.io/crates/l/rath-rs)](LICENSE-MIT)
+[![License](https://img.shields.io/crates/l/rath-rs)](LICENSE)
 
 _Rath_ (रथ, _ruth-uh_) means "chariot" in Sanskrit.
 
@@ -10,10 +10,8 @@ Rath is a provider-agnostic Rust API layer for AI applications. It exposes
 capability-focused modules for LLM calls, embeddings, image APIs, video APIs,
 and audio APIs while keeping provider adapters behind stable traits.
 
-The public API is organized by capability. Provider-specific implementations are
-kept in a private `providers` module so one provider file can share auth,
-transport, payload mapping, and response parsing across the capabilities it
-supports.
+Rath is not another AI provider SDK. It is a stable capability layer over
+provider SDKs/APIs.
 
 ## Modules
 
@@ -21,8 +19,6 @@ supports.
 - `rath::llm`: text-generation clients, messages, tools, structured output, and provider adapters
 - `rath::embeddings`: embedding request/response types and `EmbeddingClient`
 - `rath::images`: image request/response types and `ImageClient`
-- `rath::video`: video request/response types and `VideoClient`
-- `rath::audio`: text-to-speech and speech-to-text traits and types
 
 Internally, provider adapters live under
 `providers/{openai,openrouter,gemini,anthropic,ollama,fal}.rs`. That module is not
@@ -71,6 +67,23 @@ provider endpoint.
 Capability options parse the same URL format and dispatch to the provider
 implementation that supports that capability.
 
+## Embedding Usage
+
+```rust
+use rath::embeddings::{EmbedRequest, EmbeddingOptions};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let client = EmbeddingOptions::default().create("openai:///text-embedding-3-small")?;
+let response = client.embed(&EmbedRequest {
+    input: "Rust workflows with provider-agnostic AI clients".to_string(),
+    ..EmbedRequest::default()
+}).await?;
+
+println!("{} dimensions", response.values.len());
+# Ok(())
+# }
+```
+
 ## Image Usage
 
 ```rust
@@ -102,6 +115,25 @@ let response = client.generate_video(&VideoRequest {
 }).await?;
 
 println!("{} video(s)", response.videos.len());
+# Ok(())
+# }
+```
+
+## Audio Usage
+
+```rust
+use rath::audio::tts::{TtsOptions, TtsRequest};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let client = TtsOptions::default().create("openai:///tts-1")?;
+let response = client.synthesize_speech(&TtsRequest {
+    input: "Rath is a stable capability layer for AI applications.".to_string(),
+    voice: Some("alloy".to_string()),
+    format: Some("mp3".to_string()),
+    ..TtsRequest::default()
+}).await?;
+
+println!("{} bytes of {}", response.data.len(), response.mime_type);
 # Ok(())
 # }
 ```

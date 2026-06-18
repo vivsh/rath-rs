@@ -5,7 +5,7 @@ use reqwest::Client as HttpClient;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::embeddings::{EmbedRequest, EmbedResponse, EmbeddingClient};
+use crate::embeddings::{EmbedRequest, EmbedResponse, EmbeddingClient, EmbeddingOptions};
 
 use crate::llm::{
     Attachment, LlmClient, LlmError, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl,
@@ -64,6 +64,21 @@ pub fn new_client(url: &ModelUrl, mut options: LlmOptions) -> Result<Box<dyn Llm
         options,
         url: url.clone(),
         exit_tool_name,
+    }))
+}
+
+pub fn new_embedding_client(
+    url: &ModelUrl,
+    _options: EmbeddingOptions,
+) -> Result<Box<dyn EmbeddingClient>, LlmError> {
+    Ok(Box::new(OllamaClient {
+        http: HttpClient::new(),
+        api_key: optional_api_key(url, "OLLAMA_API_KEY"),
+        base_url: configured_base_url(url, DEFAULT_BASE_URL),
+        model: url.model.clone(),
+        options: LlmOptions::default(),
+        url: url.clone(),
+        exit_tool_name: None,
     }))
 }
 

@@ -1,7 +1,22 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::llm::LlmError;
+
+/// Options used when constructing a speech-to-text client.
+#[derive(Debug, Clone, Default)]
+pub struct SttOptions {
+    pub provider_config: Option<Value>,
+}
+
+impl SttOptions {
+    /// Builds a provider client for the given model URL.
+    pub fn create(self, model_url: &str) -> Result<Box<dyn SttClient>, LlmError> {
+        let url = crate::core::ModelUrl::parse(model_url)?;
+        crate::providers::create_stt_client(&url, self)
+    }
+}
 
 /// Speech-to-text request.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,7 +7,9 @@ use gemini_rust::{
 };
 use serde_json::Value;
 
-use crate::embeddings::{EmbedRequest, EmbedResponse, EmbedTaskType, EmbeddingClient};
+use crate::embeddings::{
+    EmbedRequest, EmbedResponse, EmbedTaskType, EmbeddingClient, EmbeddingOptions,
+};
 
 use crate::llm::schema;
 use crate::llm::{
@@ -452,6 +454,18 @@ pub fn new_client(url: &ModelUrl, mut options: LlmOptions) -> Result<Box<dyn Llm
         options,
         url: url.clone(),
         exit_tool_name,
+    }))
+}
+
+pub fn new_embedding_client(
+    url: &ModelUrl,
+    _options: EmbeddingOptions,
+) -> Result<Box<dyn EmbeddingClient>, LlmError> {
+    Ok(Box::new(GeminiClient {
+        client: build_client(url)?,
+        options: LlmOptions::default(),
+        url: url.clone(),
+        exit_tool_name: None,
     }))
 }
 
