@@ -1,8 +1,15 @@
-//! rath-rs
+//! Provider-agnostic AI APIs for Rust.
 //!
-//! Minimal placeholder crate so the repository can be published to crates.io.
+//! Rath exposes capability-focused modules for LLM calls, embeddings, images,
+//! video, and audio. Provider-specific adapters are selected through model URLs and
+//! kept behind stable capability traits.
 
-/// Returns a placeholder string identifying this crate.
-pub fn identify() -> &'static str {
-    "rath-rs placeholder"
-}
+pub mod audio;
+pub mod core;
+pub mod embeddings;
+pub mod images;
+pub mod llm;
+mod providers;
+pub mod video;
+
+pub use core::{ModelUrl, Provider, RathError, TokenUsage};
