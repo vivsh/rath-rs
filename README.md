@@ -19,6 +19,8 @@ provider SDKs/APIs.
 - `rath::llm`: text-generation clients, messages, tools, structured output, and provider adapters
 - `rath::embeddings`: embedding request/response types and `EmbeddingClient`
 - `rath::images`: image request/response types and `ImageClient`
+- `rath::video`: video request/response types and `VideoClient`
+- `rath::audio`: text-to-speech and speech-to-text traits and types
 
 Internally, provider adapters live under
 `providers/{openai,openrouter,gemini,anthropic,ollama,fal}.rs`. That module is not
