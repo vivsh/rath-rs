@@ -201,7 +201,8 @@ Use `provider_config` for provider-specific request knobs that Rath does not
 model directly. Common options such as temperature, thinking, tools, schemas,
 system prompt, and cache should still use Rath's typed fields.
 
-For example, Gemini safety settings can be provided with `safetySettings`:
+For example, Gemini safety settings can be provided with conservative
+`safetySettings`:
 
 ```rust
 use serde_json::json;
@@ -213,11 +214,11 @@ let client = LlmOptions::default()
         "safetySettings": [
             {
                 "category": "HARM_CATEGORY_HATE_SPEECH",
-                "threshold": "BLOCK_NONE"
+                "threshold": "BLOCK_LOW_AND_ABOVE"
             },
             {
                 "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                "threshold": "BLOCK_NONE"
+                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
             }
         ]
     }))
@@ -226,7 +227,7 @@ let client = LlmOptions::default()
 # }
 ```
 
-## Exit Tool Quirk
+## Structured Output Strategy
 
 Rath uses native structured output where providers support it cleanly. For
 Ollama, and Gemini models before `gemini-3.1`, Rath may convert structured
