@@ -26,7 +26,8 @@ struct OpenAiClient {
 }
 
 pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, RathError> {
-    Ok(Box::new(build_client(url, options, None)?))
+    let provider_config = options.provider_config.clone();
+    Ok(Box::new(build_client(url, options, provider_config)?))
 }
 
 pub fn new_embedding_client(

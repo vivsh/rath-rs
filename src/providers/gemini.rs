@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use gemini_rust::{
     Blob, Content, FileData as GeminiFileData, FunctionCall as GeminiFunctionCall,
     FunctionCallingMode, FunctionDeclaration, FunctionResponse as GeminiFunctionResponse, Gemini,
-    GenerationResponse, Message as GeminiMessage, Part, Role as GeminiRole, TaskType,
-    Tool as GeminiTool, client::Model as GeminiModel,
+    GenerationResponse, Message as GeminiMessage, Part, Role as GeminiRole, SafetySetting,
+    TaskType, Tool as GeminiTool, client::Model as GeminiModel,
 };
 use serde_json::Value;
 
@@ -302,6 +302,35 @@ fn response_schema(options: &LlmOptions) -> Option<Value> {
         .map(|value| schema::sanitize_strict(value.clone()))
 }
 
+fn gemini_safety_settings_from_provider_config(
+    provider_config: &Option<Value>,
+) -> Result<Option<Vec<SafetySetting>>, RathError> {
+    let Some(config) = provider_config else {
+        return Ok(None);
+    };
+    let Value::Object(map) = config else {
+        return Err(RathError::Validation(
+            "Gemini provider_config must be a JSON object".into(),
+        ));
+    };
+
+    if let Some(key) = map.keys().find(|key| key.as_str() != "safetySettings") {
+        return Err(RathError::Validation(format!(
+            "unsupported Gemini provider_config key '{key}'"
+        )));
+    }
+
+    map.get("safetySettings")
+        .map(|value| {
+            serde_json::from_value::<Vec<SafetySetting>>(value.clone()).map_err(|e| {
+                RathError::Validation(format!(
+                    "invalid Gemini provider_config.safetySettings: {e}"
+                ))
+            })
+        })
+        .transpose()
+}
+
 impl GeminiClient {
     async fn call_api(
         &self,
@@ -326,6 +355,11 @@ impl GeminiClient {
         }
         if let Some(p) = self.options.effective_preamble() {
             builder = builder.with_system_prompt(p);
+        }
+        if let Some(safety_settings) =
+            gemini_safety_settings_from_provider_config(&self.options.provider_config)?
+        {
+            builder = builder.with_safety_settings(safety_settings);
         }
         builder = builder.with_messages(messages);
         if tools_enabled && let Some(tool_spec) = build_tools_spec(&self.options.tools)? {
@@ -672,5 +706,45 @@ mod tests {
             LlmOptions::default().with_input_schema(json!({ "type": "object" }));
         assert!(!wants_json_output(&with_input_schema));
         assert!(response_schema(&with_input_schema).is_none());
+    }
+
+    #[test]
+    fn provider_config_parses_safety_settings() {
+        let config = Some(json!({
+            "safetySettings": [
+                {
+                    "category": "HARM_CATEGORY_HATE_SPEECH",
+                    "threshold": "BLOCK_NONE"
+                },
+                {
+                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "threshold": "BLOCK_ONLY_HIGH"
+                }
+            ]
+        }));
+
+        let settings = gemini_safety_settings_from_provider_config(&config)
+            .expect("safety settings should parse")
+            .expect("safety settings should be present");
+
+        assert_eq!(settings.len(), 2);
+    }
+
+    #[test]
+    fn provider_config_rejects_malformed_safety_settings() {
+        let config = Some(json!({
+            "safetySettings": [
+                {
+                    "category": "not-a-category",
+                    "threshold": "BLOCK_NONE"
+                }
+            ]
+        }));
+
+        let error = gemini_safety_settings_from_provider_config(&config)
+            .expect_err("invalid safety settings should fail before request execution");
+
+        assert!(matches!(error, RathError::Validation(_)));
+        assert!(error.to_string().contains("provider_config.safetySettings"));
     }
 }

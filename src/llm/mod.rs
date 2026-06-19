@@ -284,6 +284,8 @@ pub struct LlmOptions {
     pub response_format: ResponseFormat,
     /// Sampling temperature.
     pub temperature: Option<f32>,
+    /// Provider-specific request configuration for knobs Rath does not model.
+    pub provider_config: Option<Value>,
     /// Prompt caching policy. `None` means no explicit cache control.
     /// Currently only used by Anthropic; other providers cache automatically.
     pub cache: Option<CacheControl>,
@@ -377,6 +379,18 @@ impl LlmOptions {
     /// Sets the sampling temperature from an `Option`.
     pub fn with_temperature_opt(mut self, temperature: Option<f32>) -> Self {
         self.temperature = temperature;
+        self
+    }
+
+    /// Sets provider-specific request configuration.
+    pub fn with_provider_config(mut self, provider_config: Value) -> Self {
+        self.provider_config = Some(provider_config);
+        self
+    }
+
+    /// Sets provider-specific request configuration from an `Option`.
+    pub fn with_provider_config_opt(mut self, provider_config: Option<Value>) -> Self {
+        self.provider_config = provider_config;
         self
     }
 
@@ -811,6 +825,21 @@ mod tests {
                 .with_output_schema(serde_json::json!({ "type": "object" }))
                 .wants_json_output()
         );
+    }
+
+    #[test]
+    fn provider_config_builder_stores_config() {
+        let config = serde_json::json!({
+            "safetySettings": [
+                {
+                    "category": "HARM_CATEGORY_HATE_SPEECH",
+                    "threshold": "BLOCK_NONE"
+                }
+            ]
+        });
+        let options = LlmOptions::default().with_provider_config(config.clone());
+
+        assert_eq!(options.provider_config, Some(config));
     }
 
     #[test]

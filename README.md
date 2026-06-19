@@ -80,16 +80,28 @@ are:
 - `FAL_KEY` for Fal
 - `OLLAMA_API_KEY` for Ollama only when the Ollama server requires auth
 
-Use `api_key_env` in the model locator to point Rath at a different environment
-variable:
+Set the relevant variable before creating a client:
+
+```sh
+export OPENAI_API_KEY="..."
+export FAL_KEY="..."
+```
+
+Provider clients read their default environment variable when the client is
+created. To use a different variable, pass its name with `api_key_env` in the
+model locator:
 
 ```text
 openai:///gpt-4o?api_key_env=MY_OPENAI_KEY
 fal:///fal-ai/flux/schnell?api_key_env=MY_FAL_KEY
 ```
 
-`api_key_env` is resolved when the model locator is parsed. Rath does not accept
-inline credentials in model locators; keep secrets in environment variables.
+When `api_key_env` is present, `ModelUrl::parse` reads that environment variable
+immediately and stores the resolved key on the parsed model locator. When it is
+not present, Rath falls back to the provider default variable listed above.
+Missing required keys return an error before making a provider request. Rath does
+not accept raw API keys in constructors or inline credentials in model locators;
+keep secrets in environment variables.
 
 ## Embedding Usage
 
@@ -182,6 +194,46 @@ match response.output {
 # Ok(())
 # }
 ```
+
+## LLM Provider Config
+
+Use `provider_config` for provider-specific request knobs that Rath does not
+model directly. Common options such as temperature, thinking, tools, schemas,
+system prompt, and cache should still use Rath's typed fields.
+
+For example, Gemini safety settings can be provided with `safetySettings`:
+
+```rust
+use serde_json::json;
+use rath::llm::LlmOptions;
+
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+let client = LlmOptions::default()
+    .with_provider_config(json!({
+        "safetySettings": [
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_NONE"
+            }
+        ]
+    }))
+    .create("gemini:///gemini-2.5-flash")?;
+# Ok(())
+# }
+```
+
+## Exit Tool Quirk
+
+Rath uses native structured output where providers support it cleanly. For
+Ollama, and Gemini models before `gemini-3.1`, Rath may convert structured
+output into a required synthetic tool call. This is internal to Rath: callers
+still receive `LlmOutput::Output(...)` when the exit tool is called successfully.
+
+Use `LlmClient::uses_exit_tool()` to check whether a client uses this strategy.
 
 ## License
 
