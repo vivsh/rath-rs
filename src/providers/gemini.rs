@@ -1,3 +1,6 @@
+mod measurement;
+mod request;
+
 use async_trait::async_trait;
 use gemini_rust::{
     Blob, Content, FileData as GeminiFileData, FunctionCall as GeminiFunctionCall,
@@ -29,6 +32,7 @@ fn format_error_chain(e: &dyn std::error::Error) -> String {
     msg
 }
 
+/// Constructs the provider client with resolved credentials and endpoint settings.
 fn build_client(url: &ModelUrl) -> Result<Gemini, RathError> {
     if url.base_url.is_some() {
         return Err(RathError::UnsupportedCapability {
@@ -76,7 +80,18 @@ fn build_gemini_messages(history: &[Message]) -> Vec<GeminiMessage> {
                 i += 1;
             }
             Role::AssistantToolCalls { calls } => {
-                msgs.push(tool_calls_to_message(calls));
+                let mut message = tool_calls_to_message(calls);
+                if !history[i].content.is_empty() {
+                    message.content.parts.get_or_insert_default().insert(
+                        0,
+                        Part::Text {
+                            text: history[i].content.clone(),
+                            thought: None,
+                            thought_signature: None,
+                        },
+                    );
+                }
+                msgs.push(message);
                 i += 1;
             }
             Role::Tool { .. } => {
@@ -89,6 +104,7 @@ fn build_gemini_messages(history: &[Message]) -> Vec<GeminiMessage> {
     msgs
 }
 
+/// Translates supported attachments into Gemini parts; unmaterialized files are omitted.
 fn gemini_part_from_attachment(att: &Attachment) -> Option<Part> {
     match att {
         Attachment::Inline { mime_type, data } => Some(Part::InlineData {
@@ -108,6 +124,7 @@ fn gemini_part_from_attachment(att: &Attachment) -> Option<Part> {
     }
 }
 
+/// Preserves user text and supported attachments in a Gemini content message.
 fn user_to_message(message: &Message) -> GeminiMessage {
     if message.attachments.is_empty() {
         return GeminiMessage::user(message.content.clone());
@@ -134,6 +151,7 @@ fn user_to_message(message: &Message) -> GeminiMessage {
     }
 }
 
+/// Converts enabled function definitions to the Gemini tool schema or returns an error.
 fn build_tools_spec(tools: &[ToolDefinition]) -> Result<Option<GeminiTool>, RathError> {
     if tools.is_empty() {
         return Ok(None);
@@ -242,6 +260,7 @@ fn map_response(
     response: GenerationResponse,
     wants_json_output: bool,
 ) -> Result<LlmResponse, RathError> {
+    check_generation_limit(&response)?;
     let usage = response.usage_metadata.as_ref().map(|usage| TokenUsage {
         input: usage.prompt_token_count.map(|v| v as u32),
         output: usage.candidates_token_count.map(|v| v as u32),
@@ -302,6 +321,7 @@ fn response_schema(options: &LlmOptions) -> Option<Value> {
         .map(|value| schema::sanitize_strict(value.clone()))
 }
 
+/// Validates and decodes the Gemini safety settings supported by this adapter.
 fn gemini_safety_settings_from_provider_config(
     provider_config: &Option<Value>,
 ) -> Result<Option<Vec<SafetySetting>>, RathError> {
@@ -331,59 +351,6 @@ fn gemini_safety_settings_from_provider_config(
         .transpose()
 }
 
-impl GeminiClient {
-    async fn call_api(
-        &self,
-        messages: Vec<GeminiMessage>,
-        tools_enabled: bool,
-        wants_json_output: bool,
-        response_schema: Option<Value>,
-    ) -> Result<GenerationResponse, RathError> {
-        let client = &self.client;
-        let thinking_budget: i32 = match &self.options.thinking {
-            None | Some(ThinkingLevel::Off) => 0,
-            Some(ThinkingLevel::Low) => 512,
-            Some(ThinkingLevel::Medium) => 4096,
-            Some(ThinkingLevel::High) => 16384,
-            Some(ThinkingLevel::XHigh) => i32::MAX,
-        };
-        let mut builder = client
-            .generate_content()
-            .with_thinking_budget(thinking_budget);
-        if let Some(t) = self.options.temperature {
-            builder = builder.with_temperature(t);
-        }
-        if let Some(p) = self.options.effective_preamble() {
-            builder = builder.with_system_prompt(p);
-        }
-        if let Some(safety_settings) =
-            gemini_safety_settings_from_provider_config(&self.options.provider_config)?
-        {
-            builder = builder.with_safety_settings(safety_settings);
-        }
-        builder = builder.with_messages(messages);
-        if tools_enabled && let Some(tool_spec) = build_tools_spec(&self.options.tools)? {
-            let mode = match self.options.tool_choice {
-                ToolChoice::Required => FunctionCallingMode::Any,
-                _ => FunctionCallingMode::Auto,
-            };
-            builder = builder
-                .with_tool(tool_spec)
-                .with_function_calling_mode(mode);
-        }
-        if wants_json_output {
-            builder = builder.with_response_mime_type("application/json");
-            if let Some(schema) = response_schema {
-                builder = builder.with_response_schema(schema);
-            }
-        }
-        builder
-            .execute()
-            .await
-            .map_err(|e| RathError::Provider(format_error_chain(&e)))
-    }
-}
-
 #[async_trait]
 impl LlmClient for GeminiClient {
     fn model_url(&self) -> &ModelUrl {
@@ -394,33 +361,37 @@ impl LlmClient for GeminiClient {
         &self.options
     }
 
-    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
-        if messages.is_empty() {
-            return Err(RathError::Validation("messages must not be empty".into()));
-        }
-        if matches!(
-            messages.last().map(|m| &m.role),
-            Some(Role::AssistantToolCalls { .. })
-        ) {
-            return Err(RathError::Validation(
-                "history ends with assistant tool calls without tool results".into(),
-            ));
-        }
-        let tools_enabled =
-            !self.options.tools.is_empty() && self.options.tool_choice != ToolChoice::Disabled;
-        validate_tools(Provider::Gemini, &self.options.tools)?;
-        let wants_json_output = wants_json_output(&self.options);
-        let response_schema = response_schema(&self.options);
-        let gemini_messages = build_gemini_messages(messages);
-        let result = self
-            .call_api(
-                gemini_messages,
-                tools_enabled,
-                wants_json_output,
-                response_schema,
-            )
+    fn estimate_tokens(&self, messages: &[Message]) -> Result<crate::llm::TokenCount, RathError> {
+        self.estimate_request(&self.options, messages, false)
+    }
+
+    async fn count_tokens(
+        &self,
+        messages: &[Message],
+    ) -> Result<crate::llm::TokenCount, RathError> {
+        self.count_request(&self.options, messages, false).await
+    }
+
+    fn estimate_content_tokens(&self, content: &str) -> Result<crate::llm::TokenCount, RathError> {
+        self.estimate_request(&LlmOptions::default(), &[Message::user(content)], true)
+    }
+
+    async fn count_content_tokens(
+        &self,
+        content: &str,
+    ) -> Result<crate::llm::TokenCount, RathError> {
+        self.count_request(&LlmOptions::default(), &[Message::user(content)], true)
             .await
-            .and_then(|r| map_response(r, wants_json_output))?;
+    }
+
+    /// Dispatches a validated request and rejects token-limited output before interpreting it.
+    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
+        let wants_json_output = wants_json_output(&self.options);
+        let response = request::build_request(&self.client, &self.options, messages, false)?
+            .execute()
+            .await
+            .map_err(|e| RathError::Provider(format_error_chain(&e)))?;
+        let result = map_response(response, wants_json_output)?;
 
         if let Some(ref name) = self.exit_tool_name
             && let LlmOutput::ToolCalls { calls, .. } = &result.output
@@ -438,6 +409,7 @@ impl LlmClient for GeminiClient {
 
 #[async_trait]
 impl EmbeddingClient for GeminiClient {
+    /// Sends the embedding request to the configured provider and normalizes its result.
     async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, RathError> {
         let mut builder = self.client.embed_content().with_text(&request.input);
         if let Some(task_type) = &request.task_type {
@@ -475,6 +447,7 @@ pub fn new_client(
     url: &ModelUrl,
     mut options: LlmOptions,
 ) -> Result<Box<dyn LlmClient>, RathError> {
+    crate::llm::counting::validate_options(Provider::Gemini, &options)?;
     let client = build_client(url)?;
     let exit_tool_name = if url.needs_exit_tool()
         && !options.output_type_name.is_empty()
@@ -494,6 +467,7 @@ pub fn new_client(
     }))
 }
 
+/// Creates the provider embedding client or returns a configuration error.
 pub fn new_embedding_client(
     url: &ModelUrl,
     _options: EmbeddingOptions,
@@ -507,244 +481,10 @@ pub fn new_embedding_client(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
+#[path = "gemini/tests/mod.rs"]
+mod tests;
 
-    fn make_call(id: &str, name: &str) -> ToolCall {
-        ToolCall {
-            id: id.into(),
-            name: name.into(),
-            args: json!({}),
-            thought_signatures: None,
-        }
-    }
-
-    /// A single user turn produces one provider message.
-    #[test]
-    fn build_messages_user_only() {
-        let history = vec![Message::user(r#"{"text":"hi"}"#)];
-        let msgs = build_gemini_messages(&history);
-        assert_eq!(msgs.len(), 1);
-    }
-
-    /// User attachments are converted into Gemini inline or file parts.
-    #[test]
-    fn build_messages_user_with_attachment_adds_inline_part() {
-        let history = vec![Message {
-            role: Role::User,
-            content: "describe this".into(),
-            attachments: vec![Attachment::Inline {
-                mime_type: "image/png".into(),
-                data: "aGVsbG8=".into(),
-            }],
-            usage: None,
-        }];
-        let msgs = build_gemini_messages(&history);
-        let parts = msgs[0]
-            .content
-            .parts
-            .as_ref()
-            .expect("user message parts should be present");
-        assert!(matches!(parts.first(), Some(Part::InlineData { .. })));
-        assert!(matches!(
-            parts.last(),
-            Some(Part::Text { text, .. }) if text == "describe this"
-        ));
-    }
-
-    /// Preambles are not duplicated into history messages.
-    #[test]
-    fn build_messages_preamble_is_separate() {
-        let history = vec![Message::user(r#"{"text":"hi"}"#)];
-        let msgs = build_gemini_messages(&history);
-        assert_eq!(msgs.len(), 1);
-    }
-
-    /// History order is preserved.
-    #[test]
-    fn build_messages_history_in_order() {
-        let history = vec![
-            Message::user("prev question"),
-            Message::assistant("prev answer"),
-            Message::user("next question"),
-        ];
-        let msgs = build_gemini_messages(&history);
-        assert_eq!(msgs.len(), 3);
-        let debug = format!("{msgs:?}");
-        assert!(debug.contains("prev question"));
-        assert!(debug.contains("prev answer"));
-    }
-
-    /// Tool responses are grouped into a function-response message.
-    #[test]
-    fn build_messages_tool_role_included() {
-        let history = vec![
-            Message {
-                role: Role::AssistantToolCalls {
-                    calls: vec![make_call("call-42", "read_file")],
-                },
-                content: String::new(),
-                attachments: Vec::new(),
-                usage: None,
-            },
-            Message {
-                role: Role::Tool {
-                    call_id: "call-42".into(),
-                },
-                content: r#"{"temp":22}"#.into(),
-                attachments: Vec::new(),
-                usage: None,
-            },
-        ];
-        let msgs = build_gemini_messages(&history);
-        assert_eq!(msgs.len(), 2);
-        let debug = format!("{msgs:?}");
-        assert!(debug.contains("read_file"));
-    }
-
-    /// Tool results keep the exchange length aligned with history.
-    #[test]
-    fn build_messages_continue_after_tool_result() {
-        let history = vec![
-            Message::user(r#"{"goal":"ship","known_context":[]}"#),
-            Message {
-                role: Role::AssistantToolCalls {
-                    calls: vec![make_call("c1", "project_outline")],
-                },
-                content: String::new(),
-                attachments: Vec::new(),
-                usage: None,
-            },
-            Message {
-                role: Role::Tool {
-                    call_id: "c1".into(),
-                },
-                content: r#"{"files":[]}"}"#.into(),
-                attachments: Vec::new(),
-                usage: None,
-            },
-        ];
-        let msgs = build_gemini_messages(&history);
-        assert_eq!(msgs.len(), 3);
-    }
-
-    /// Tool responses remain structured when a reminder user turn follows them.
-    #[test]
-    fn build_messages_keeps_tool_response_and_reminder_separate() {
-        let history = vec![
-            Message {
-                role: Role::AssistantToolCalls {
-                    calls: vec![make_call("c1", "project_outline")],
-                },
-                content: String::new(),
-                attachments: Vec::new(),
-                usage: None,
-            },
-            Message {
-                role: Role::Tool {
-                    call_id: "c1".into(),
-                },
-                content: r#"{"result":"ok"}"#.into(),
-                attachments: Vec::new(),
-                usage: None,
-            },
-            Message::user(
-                "<system-reminder><critical>call final_answer</critical></system-reminder>",
-            ),
-        ];
-
-        let msgs = build_gemini_messages(&history);
-
-        assert_eq!(msgs.len(), 3);
-        assert!(matches!(msgs[1].role, GeminiRole::User));
-        assert!(matches!(msgs[2].role, GeminiRole::User));
-
-        let tool_parts = msgs[1]
-            .content
-            .parts
-            .as_ref()
-            .expect("tool response parts should be present");
-        assert!(matches!(
-            tool_parts.first(),
-            Some(Part::FunctionResponse { .. })
-        ));
-
-        let tool_debug = format!("{:?}", tool_parts[0]);
-        assert!(tool_debug.contains("result"));
-        assert!(!tool_debug.contains("system-reminder"));
-
-        let reminder_debug = format!("{:?}", msgs[2]);
-        assert!(reminder_debug.contains("system-reminder"));
-        assert!(!reminder_debug.contains("result\":\"ok"));
-    }
-
-    /// Explicit JSON response mode enables Gemini JSON output and response schema handling.
-    #[test]
-    fn response_mode_uses_explicit_json_setting() {
-        let no_schema = LlmOptions::default();
-        assert!(!wants_json_output(&no_schema));
-        assert!(response_schema(&no_schema).is_none());
-
-        let with_schema = LlmOptions::default()
-            .with_response_format(crate::llm::ResponseFormat::Json)
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "answer": { "type": "string" }
-                },
-                "required": ["answer"]
-            }));
-        assert!(wants_json_output(&with_schema));
-        assert!(response_schema(&with_schema).is_some());
-    }
-
-    /// Input schema hints do not change Gemini response mode on their own.
-    #[test]
-    fn input_schema_alone_does_not_enable_json_output() {
-        let with_input_schema =
-            LlmOptions::default().with_input_schema(json!({ "type": "object" }));
-        assert!(!wants_json_output(&with_input_schema));
-        assert!(response_schema(&with_input_schema).is_none());
-    }
-
-    #[test]
-    fn provider_config_parses_safety_settings() {
-        let config = Some(json!({
-            "safetySettings": [
-                {
-                    "category": "HARM_CATEGORY_HATE_SPEECH",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                    "threshold": "BLOCK_ONLY_HIGH"
-                }
-            ]
-        }));
-
-        let settings = gemini_safety_settings_from_provider_config(&config)
-            .expect("safety settings should parse")
-            .expect("safety settings should be present");
-
-        assert_eq!(settings.len(), 2);
-    }
-
-    #[test]
-    fn provider_config_rejects_malformed_safety_settings() {
-        let config = Some(json!({
-            "safetySettings": [
-                {
-                    "category": "not-a-category",
-                    "threshold": "BLOCK_NONE"
-                }
-            ]
-        }));
-
-        let error = gemini_safety_settings_from_provider_config(&config)
-            .expect_err("invalid safety settings should fail before request execution");
-
-        assert!(matches!(error, RathError::Validation(_)));
-        assert!(error.to_string().contains("provider_config.safetySettings"));
-    }
+fn check_generation_limit(response: &GenerationResponse) -> Result<(), RathError> {
+    let raw = serde_json::to_value(response).map_err(RathError::Serialize)?;
+    crate::llm::counting::check_output_limit(Provider::Gemini, &raw)
 }

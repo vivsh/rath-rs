@@ -3,8 +3,18 @@ use thiserror::Error;
 use super::Provider;
 
 /// Errors returned by Rath provider calls.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum RathError {
+    /// Local tokenizer initialization, arithmetic, or count decoding failed.
+    #[error("token counting failed: {message}")]
+    TokenCounting { message: String },
+    /// Generation stopped at the provider token limit. Partial content is not success.
+    /// The response is available explicitly, but omitted from Display and Debug.
+    #[error("provider '{provider:?}' reached the output token limit")]
+    OutputLimitReached {
+        provider: Provider,
+        response: serde_json::Value,
+    },
     /// Request payload could not be serialized.
     #[error("failed to serialize input: {0}")]
     Serialize(#[source] serde_json::Error),
@@ -40,3 +50,20 @@ pub enum RathError {
     #[error("{0}")]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
+
+// Keep partial provider output out of ordinary diagnostic formatting.
+impl std::fmt::Debug for RathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutputLimitReached { provider, .. } => f
+                .debug_struct("OutputLimitReached")
+                .field("provider", provider)
+                .finish_non_exhaustive(),
+            other => std::fmt::Display::fmt(other, f),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "error/tests/mod.rs"]
+mod tests;

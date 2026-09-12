@@ -1,3 +1,5 @@
+mod measurement;
+
 use std::borrow::Cow;
 
 use async_trait::async_trait;
@@ -27,6 +29,7 @@ struct OllamaClient {
 }
 
 impl OllamaClient {
+    /// Sends JSON to the configured endpoint with optional bearer authentication.
     async fn post_json<T: Serialize + ?Sized>(
         &self,
         endpoint: &str,
@@ -45,10 +48,12 @@ impl OllamaClient {
     }
 }
 
+/// Creates an LLM client after validating output caps and resolving credentials.
 pub fn new_client(
     url: &ModelUrl,
     mut options: LlmOptions,
 ) -> Result<Box<dyn LlmClient>, RathError> {
+    crate::llm::counting::validate_options(Provider::Ollama, &options)?;
     let exit_tool_name = if url.needs_exit_tool()
         && !options.output_type_name.is_empty()
         && !options.tools.is_empty()
@@ -70,6 +75,7 @@ pub fn new_client(
     }))
 }
 
+/// Creates the provider embedding client or returns a configuration error.
 pub fn new_embedding_client(
     url: &ModelUrl,
     _options: EmbeddingOptions,
@@ -95,7 +101,17 @@ impl LlmClient for OllamaClient {
         &self.options
     }
 
+    fn estimate_tokens(&self, messages: &[Message]) -> Result<crate::llm::TokenCount, RathError> {
+        self.estimate_request(&self.options, messages)
+    }
+
+    fn estimate_content_tokens(&self, content: &str) -> Result<crate::llm::TokenCount, RathError> {
+        self.estimate_request(&LlmOptions::default(), &[Message::user(content)])
+    }
+
+    /// Dispatches a validated request and rejects token-limited output before interpreting it.
     async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
+        crate::llm::counting::validate_options(Provider::Ollama, &self.options)?;
         validate_history(messages)?;
         validate_tools(Provider::Ollama, &self.options.tools)?;
 
@@ -124,6 +140,7 @@ impl LlmClient for OllamaClient {
 
 #[async_trait]
 impl EmbeddingClient for OllamaClient {
+    /// Sends the embedding request to the configured provider and normalizes its result.
     async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, RathError> {
         let endpoint = embed_endpoint(&self.base_url);
         let payload = json!({ "model": self.model, "input": request.input });
@@ -156,6 +173,7 @@ fn with_bearer_auth(
     }
 }
 
+/// Rejects empty history and a final assistant tool call without subsequent results.
 fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     if messages.is_empty() {
         return Err(RathError::Validation("messages must not be empty".into()));
@@ -171,6 +189,7 @@ fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     Ok(())
 }
 
+/// Constructs provider wire input, including enabled tools, schemas and generation settings.
 fn build_payload(
     model: &str,
     options: &LlmOptions,
@@ -199,6 +218,9 @@ fn build_payload(
         "stream": false,
     });
 
+    if let Some(cap) = options.max_output_tokens {
+        payload["max_tokens"] = json!(cap);
+    }
     if let Some(t) = options.temperature {
         payload["temperature"] = json!(t);
     }
@@ -216,6 +238,7 @@ fn build_payload(
     payload
 }
 
+/// Serializes retained history and adapter instructions into provider messages.
 fn build_messages(
     history: &[Message],
     preamble: Option<&str>,
@@ -242,19 +265,7 @@ fn build_messages(
             Role::User => out.push(build_user_message(msg, &mut first_user, model, thinking)),
             Role::Assistant => out.push(json!({ "role": "assistant", "content": msg.content })),
             Role::AssistantToolCalls { calls } => {
-                let tool_calls: Vec<Value> = calls
-                    .iter()
-                    .map(|call| {
-                        json!({
-                            "id": call.id,
-                            "type": "function",
-                            "function": {
-                                "name": call.name,
-                                "arguments": call.args.to_string(),
-                            }
-                        })
-                    })
-                    .collect();
+                let tool_calls = build_call_history(calls);
                 out.push(json!({
                     "role": "assistant",
                     "content": msg.content,
@@ -274,6 +285,24 @@ fn build_messages(
     out
 }
 
+/// Serializes retained assistant tool calls into the compatible wire format.
+fn build_call_history(calls: &[ToolCall]) -> Vec<Value> {
+    calls
+        .iter()
+        .map(|call| {
+            json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": call.args.to_string(),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Combines persona and schema instructions without inventing absent content.
 fn combined_system_message(preamble: Option<&str>, schema_hint: Option<&Value>) -> Option<String> {
     match (preamble, schema_hint) {
         (Some(preamble), Some(schema)) => Some(format!(
@@ -287,6 +316,7 @@ fn combined_system_message(preamble: Option<&str>, schema_hint: Option<&Value>) 
     }
 }
 
+/// Serializes user text and supported attachments in provider content format.
 fn build_user_message(
     message: &Message,
     first_user: &mut bool,
@@ -326,6 +356,7 @@ fn user_content(message: &Message, first_user: &mut bool, model: &str, thinking:
     }
 }
 
+/// Serializes supported images and omits unsupported attachment forms.
 fn ollama_image_part(att: &Attachment) -> Option<Value> {
     let url = match att {
         Attachment::Inline { mime_type, data } if mime_type.starts_with("image/") => {
@@ -349,6 +380,7 @@ fn ollama_image_part(att: &Attachment) -> Option<Value> {
     }))
 }
 
+/// Serializes enabled tool definitions and their parameter schemas for this provider.
 fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
     tools
         .iter()
@@ -365,7 +397,9 @@ fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
+/// Rejects token-limited output before normalizing content, calls and usage.
 fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, RathError> {
+    crate::llm::counting::check_output_limit(Provider::Ollama, &response)?;
     let usage = response.get("usage").map(usage_from_value);
     let provider_model = response
         .get("model")
@@ -431,6 +465,7 @@ fn strip_thinking(text: &str) -> &str {
     }
 }
 
+/// Removes model-produced JSON markdown wrappers before decoding.
 fn sanitize_json_markdown(text: &str) -> Cow<'_, str> {
     let unfenced = strip_json_code_fence(text).unwrap_or(text);
     let repaired = repair_markdown_wrapped_keys(unfenced);
@@ -445,6 +480,7 @@ fn sanitize_json_markdown(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// Borrows the content inside a recognized JSON code fence when present.
 fn strip_json_code_fence(text: &str) -> Option<&str> {
     let trimmed = text.trim();
     if !trimmed.starts_with("```") {
@@ -457,13 +493,13 @@ fn strip_json_code_fence(text: &str) -> Option<&str> {
     Some(body[..body_end].trim())
 }
 
+/// Repairs markdown-wrapped JSON keys while preserving quoted string contents.
 fn repair_markdown_wrapped_keys(text: &str) -> Cow<'_, str> {
     let mut repaired = String::with_capacity(text.len());
     let mut index = 0;
     let mut in_string = false;
     let mut escaped = false;
     let mut changed = false;
-
     while index < text.len() {
         let rest = &text[index..];
         let Some(ch) = rest.chars().next() else {
@@ -509,6 +545,7 @@ fn repair_markdown_wrapped_keys(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// Finds a markdown-wrapped object key followed by a JSON colon.
 fn markdown_wrapped_key(text: &str) -> Option<(usize, usize, &str)> {
     let marker = if text.starts_with("**") {
         "**"
@@ -535,6 +572,7 @@ fn markdown_wrapped_key(text: &str) -> Option<(usize, usize, &str)> {
     None
 }
 
+/// Writes an escaped JSON key into the local repair buffer.
 fn push_json_key(output: &mut String, key: &str) {
     output.push('"');
     for ch in key.chars() {
@@ -550,6 +588,7 @@ fn push_json_key(output: &mut String, key: &str) {
     output.push('"');
 }
 
+/// Removes recognized markdown key markers before parsing model JSON.
 fn strip_markdown_json_keys(value: Value) -> Value {
     match value {
         Value::Array(items) => {
@@ -591,6 +630,7 @@ fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, RathError> {
     Ok(Vec::new())
 }
 
+/// Parses tool-call JSON when the provider encodes calls inside response content.
 fn parse_json_tool_calls(items: &[Value]) -> Result<Vec<ToolCall>, RathError> {
     let mut calls = Vec::with_capacity(items.len());
     for item in items {
@@ -657,6 +697,7 @@ fn parse_content_tool_calls(content: &str) -> Result<Vec<ToolCall>, RathError> {
     Ok(calls)
 }
 
+/// Decodes function arguments from the model-produced parameter representation.
 fn parse_function_params(text: &str) -> Value {
     let mut map = serde_json::Map::new();
     let mut remaining = text;
@@ -697,317 +738,5 @@ fn token_count(value: &Value, key: &str) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn custom_base_url_builds_ollama_endpoints() {
-        assert_eq!(
-            chat_completions_endpoint("https://ollama-proxy.example/"),
-            "https://ollama-proxy.example/v1/chat/completions"
-        );
-        assert_eq!(
-            embed_endpoint("https://ollama-proxy.example"),
-            "https://ollama-proxy.example/api/embed"
-        );
-    }
-
-    #[test]
-    fn qwen_no_think_is_added_to_first_user_message() {
-        let messages = build_messages(&[Message::user("do it")], None, "qwen3:8b", false, None);
-        assert!(
-            messages[0]["content"]
-                .as_str()
-                .unwrap()
-                .starts_with("/no_think")
-        );
-    }
-
-    /// User attachments are emitted as OpenAI-compatible image_url parts.
-    #[test]
-    fn user_attachments_use_content_parts() {
-        let messages = build_messages(
-            &[Message {
-                role: Role::User,
-                content: "describe this".into(),
-                attachments: vec![Attachment::Inline {
-                    mime_type: "image/png".into(),
-                    data: "aGVsbG8=".into(),
-                }],
-                usage: None,
-            }],
-            None,
-            "qwen3-vl:8b",
-            false,
-            None,
-        );
-        assert_eq!(messages[0]["content"][0]["type"], "image_url");
-        assert_eq!(messages[0]["content"][1]["type"], "text");
-    }
-
-    /// Tool-result attachments are replayed as synthetic user image turns.
-    #[test]
-    fn tool_attachments_become_synthetic_user_images() {
-        let messages = build_messages(
-            &[Message {
-                role: Role::Tool {
-                    call_id: "call-1".into(),
-                },
-                content: "done".into(),
-                attachments: vec![Attachment::Inline {
-                    mime_type: "image/png".into(),
-                    data: "aGVsbG8=".into(),
-                }],
-                usage: None,
-            }],
-            None,
-            "qwen3-vl:8b",
-            false,
-            None,
-        );
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"][0]["type"], "image_url");
-    }
-
-    /// Tool results remain unchanged when a reminder is appended as a later user turn.
-    #[test]
-    fn build_messages_keep_tool_result_and_reminder_separate() {
-        let messages = build_messages(
-            &[
-                Message {
-                    role: Role::AssistantToolCalls {
-                        calls: vec![ToolCall {
-                            id: "call-1".into(),
-                            name: "lookup".into(),
-                            args: json!({"q":"x"}),
-                            thought_signatures: None,
-                        }],
-                    },
-                    content: String::new(),
-                    attachments: Vec::new(),
-                    usage: None,
-                },
-                Message::tool_output("call-1".into(), r#"{"ok":true}"#),
-                Message::user("FINAL TURN: call final_answer"),
-            ],
-            None,
-            "llama3.1",
-            false,
-            None,
-        );
-
-        assert_eq!(messages[1]["role"], "tool");
-        assert_eq!(messages[1]["content"], r#"{"ok":true}"#);
-        assert_eq!(messages[2]["role"], "user");
-        assert_eq!(messages[2]["content"], "FINAL TURN: call final_answer");
-    }
-
-    #[test]
-    fn payload_uses_supplied_model() {
-        let payload = build_payload(
-            "custom-local",
-            &LlmOptions::default(),
-            &[Message::user("hi")],
-            false,
-        );
-        assert_eq!(payload["model"], "custom-local");
-        assert!(payload.get("response_format").is_none());
-    }
-
-    /// Structured-output mode includes the provided output schema.
-    #[test]
-    fn payload_uses_output_schema_when_present() {
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "answer": { "type": "string" }
-            },
-            "required": ["answer"]
-        });
-        let payload = build_payload(
-            "custom-local",
-            &LlmOptions::default()
-                .with_input_schema(json!({ "type": "object" }))
-                .with_output_schema(schema.clone()),
-            &[Message::user("hi")],
-            false,
-        );
-
-        assert_eq!(payload["response_format"]["type"], "json_object");
-        // schema is injected as a system message, not in response_format
-        let system_msgs: Vec<_> = payload["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|m| m["role"] == "system")
-            .collect();
-        assert!(
-            system_msgs
-                .iter()
-                .any(|m| m["content"].as_str().unwrap_or("").contains("answer"))
-        );
-    }
-
-    /// Explicit JSON response mode uses Ollama's json_object response format.
-    #[test]
-    fn payload_with_json_response_and_no_output_schema_uses_json_object_mode() {
-        let payload = build_payload(
-            "custom-local",
-            &LlmOptions::default().with_response_format(crate::llm::ResponseFormat::Json),
-            &[Message::user("hi")],
-            false,
-        );
-        assert_eq!(payload["response_format"]["type"], "json_object");
-    }
-
-    #[test]
-    fn payload_prepends_input_schema_to_system_message() {
-        let payload = build_payload(
-            "custom-local",
-            &LlmOptions::default()
-                .with_preamble("You are helpful.")
-                .with_input_schema(json!({
-                    "type": "object",
-                    "properties": {
-                        "kind": { "type": "string" }
-                    },
-                    "required": ["kind"]
-                })),
-            &[Message::user("hi")],
-            false,
-        );
-
-        let system = payload["messages"][0]["content"]
-            .as_str()
-            .expect("system message should be a string");
-        assert!(system.contains("You are helpful."));
-        assert!(system.contains("The user message is JSON."));
-        assert!(system.contains("\"required\":[\"kind\"]"));
-    }
-
-    #[test]
-    fn schema_and_tools_ollama_sends_both_tools_and_response_format() {
-        let payload = build_payload(
-            "custom-local",
-            &LlmOptions::default()
-                .with_tool_choice(ToolChoice::Required)
-                .with_output_schema(json!({
-                    "type": "object",
-                    "properties": {
-                        "answer": { "type": "string" }
-                    },
-                    "required": ["answer"]
-                }))
-                .with_tools(vec![ToolDefinition {
-                    name: "submit".into(),
-                    description: "Submit the final answer.".into(),
-                    parameters: json!({
-                        "type": "object",
-                        "properties": {
-                            "answer": { "type": "string" }
-                        },
-                        "required": ["answer"]
-                    }),
-                }]),
-            &[Message::user("hi")],
-            true,
-        );
-
-        assert_eq!(
-            payload["response_format"]["type"], "json_object",
-            "response_format should be set alongside tools"
-        );
-        assert_eq!(payload["tool_choice"], "required");
-        assert_eq!(payload["tools"][0]["function"]["name"], "submit");
-    }
-
-    #[test]
-    fn map_response_without_json_mode_returns_string() {
-        let response = json!({
-            "model": "local-model",
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "plain text"
-                }
-            }]
-        });
-        let mapped = map_response(response, false).unwrap();
-        match mapped.output {
-            LlmOutput::Output(Value::String(text)) => assert_eq!(text, "plain text"),
-            _ => panic!("expected string output"),
-        }
-    }
-
-    /// Markdown wrappers around bare JSON keys are repaired before deserialization.
-    #[test]
-    fn map_response_repairs_markdown_wrapped_keys_in_json_mode() {
-        let response = json!({
-            "model": "local-model",
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": r#"{"inferences":[],**progress**:75,"queries":[]}"#
-                }
-            }]
-        });
-
-        let mapped = map_response(response, true).unwrap();
-        match mapped.output {
-            LlmOutput::Output(Value::Object(output)) => {
-                assert_eq!(output.get("progress"), Some(&json!(75)));
-            }
-            _ => panic!("expected JSON object output"),
-        }
-    }
-
-    /// Fenced JSON and markdown-decorated keys are normalized before parsing.
-    #[test]
-    fn sanitize_json_markdown_strips_fences_and_bold_keys() {
-        let sanitized = sanitize_json_markdown("```json\n{\"a\":1, **progress**: 75}\n```");
-        assert_eq!(sanitized.as_ref(), "{\"a\":1, \"progress\": 75}");
-    }
-
-    /// Models that emit tool calls as XML-style text in the content field are parsed correctly.
-    #[test]
-    fn parse_content_tool_calls_extracts_function_and_params() {
-        let content = "<function=file_search>\n<parameter=query>\nforgot password\n</parameter>\n<parameter=globs>\n[\"**/*auth*.js\"]\n</parameter>\n</function>";
-        let calls = parse_content_tool_calls(content).unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "file_search");
-        assert_eq!(calls[0].args["query"], "forgot password");
-        assert_eq!(calls[0].args["globs"][0], "**/*auth*.js");
-    }
-
-    /// Multiple tool calls in content are all extracted.
-    #[test]
-    fn parse_content_tool_calls_handles_multiple_functions() {
-        let content = "<function=search><parameter=q>hello</parameter></function><function=fetch><parameter=url>http://x</parameter></function>";
-        let calls = parse_content_tool_calls(content).unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "search");
-        assert_eq!(calls[1].name, "fetch");
-    }
-
-    /// Content with no function tags yields an empty vec (not an error).
-    #[test]
-    fn parse_content_tool_calls_returns_empty_on_plain_text() {
-        let calls = parse_content_tool_calls("Just a normal response.").unwrap();
-        assert!(calls.is_empty());
-    }
-
-    /// collect_tool_calls falls back to content parsing when tool_calls field is absent.
-    #[test]
-    fn collect_tool_calls_falls_back_to_content_when_no_tool_calls_field() {
-        let message = json!({
-            "role": "assistant",
-            "content": "<function=my_tool><parameter=x>42</parameter></function>"
-        });
-        let calls = collect_tool_calls(&message).unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "my_tool");
-        assert_eq!(calls[0].args["x"], 42);
-    }
-}
+#[path = "ollama/tests/mod.rs"]
+mod tests;

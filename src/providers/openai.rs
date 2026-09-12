@@ -1,3 +1,5 @@
+mod measurement;
+
 use async_trait::async_trait;
 use reqwest::Client as HttpClient;
 use reqwest::multipart::{Form, Part};
@@ -26,6 +28,7 @@ struct OpenAiClient {
 }
 
 pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, RathError> {
+    crate::llm::counting::validate_options(Provider::OpenAi, &options)?;
     let provider_config = options.provider_config.clone();
     Ok(Box::new(build_client(url, options, provider_config)?))
 }
@@ -63,6 +66,7 @@ pub fn new_stt_client(
     )?))
 }
 
+/// Constructs the provider client with resolved credentials and endpoint settings.
 fn build_client(
     url: &ModelUrl,
     options: LlmOptions,
@@ -90,7 +94,32 @@ impl LlmClient for OpenAiClient {
         &self.options
     }
 
+    fn estimate_tokens(&self, messages: &[Message]) -> Result<crate::llm::TokenCount, RathError> {
+        self.estimate_request(&self.options, messages)
+    }
+
+    async fn count_tokens(
+        &self,
+        messages: &[Message],
+    ) -> Result<crate::llm::TokenCount, RathError> {
+        self.count_request(&self.options, messages).await
+    }
+
+    fn estimate_content_tokens(&self, content: &str) -> Result<crate::llm::TokenCount, RathError> {
+        self.estimate_request(&LlmOptions::default(), &[Message::user(content)])
+    }
+
+    async fn count_content_tokens(
+        &self,
+        content: &str,
+    ) -> Result<crate::llm::TokenCount, RathError> {
+        self.count_request(&LlmOptions::default(), &[Message::user(content)])
+            .await
+    }
+
+    /// Dispatches a validated request and rejects token-limited output before interpreting it.
     async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
+        crate::llm::counting::validate_options(Provider::OpenAi, &self.options)?;
         validate_history(messages)?;
         validate_tools(Provider::OpenAi, &self.options.tools)?;
 
@@ -119,6 +148,7 @@ impl LlmClient for OpenAiClient {
 
 #[async_trait]
 impl EmbeddingClient for OpenAiClient {
+    /// Sends the embedding request to the configured provider and normalizes its result.
     async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, RathError> {
         let payload = json!({
             "model": self.model,
@@ -150,6 +180,7 @@ impl EmbeddingClient for OpenAiClient {
 
 #[async_trait]
 impl TtsClient for OpenAiClient {
+    /// Sends speech synthesis input and returns audio bytes or a provider error.
     async fn synthesize_speech(&self, request: &TtsRequest) -> Result<TtsResponse, RathError> {
         let mut payload = json_object_from(&self.provider_config);
         merge_json_object(&mut payload, &request.provider_config);
@@ -196,6 +227,7 @@ impl TtsClient for OpenAiClient {
 
 #[async_trait]
 impl SttClient for OpenAiClient {
+    /// Uploads audio for transcription and normalizes the returned text and metadata.
     async fn transcribe_audio(&self, request: &SttRequest) -> Result<SttResponse, RathError> {
         let model = request.model.clone().unwrap_or_else(|| self.model.clone());
         let file = Part::bytes(request.data.clone())
@@ -262,6 +294,7 @@ fn merge_json_object(payload: &mut serde_json::Map<String, Value>, value: &Optio
     }
 }
 
+/// Adds supported scalar provider fields to the multipart request.
 fn add_form_fields(mut form: Form, value: &Option<Value>) -> Form {
     if let Some(Value::Object(map)) = value {
         for (key, value) in map {
@@ -275,6 +308,7 @@ fn add_form_fields(mut form: Form, value: &Option<Value>) -> Form {
     form
 }
 
+/// Rejects empty history and a final assistant tool call without subsequent results.
 fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     if messages.is_empty() {
         return Err(RathError::Validation("messages must not be empty".into()));
@@ -290,6 +324,7 @@ fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     Ok(())
 }
 
+/// Constructs provider wire input, including enabled tools, schemas and generation settings.
 fn build_payload(
     model: &str,
     options: &LlmOptions,
@@ -301,6 +336,9 @@ fn build_payload(
         "input": build_input(messages),
     });
 
+    if let Some(cap) = options.max_output_tokens {
+        payload["max_output_tokens"] = json!(cap);
+    }
     if let Some(t) = options.temperature {
         payload["temperature"] = json!(t);
     }
@@ -334,6 +372,7 @@ fn build_payload(
     payload
 }
 
+/// Preserves history text, tool exchanges and supported images in Responses API input.
 fn build_input(messages: &[Message]) -> Vec<Value> {
     let mut input = Vec::new();
     for msg in messages {
@@ -342,6 +381,9 @@ fn build_input(messages: &[Message]) -> Vec<Value> {
             Role::User => input.push(build_user_input(msg)),
             Role::Assistant => input.push(json!({ "role": "assistant", "content": msg.content })),
             Role::AssistantToolCalls { calls } => {
+                if !msg.content.is_empty() {
+                    input.push(json!({ "role": "assistant", "content": msg.content }));
+                }
                 for call in calls {
                     input.push(json!({
                         "type": "function_call",
@@ -364,6 +406,7 @@ fn build_input(messages: &[Message]) -> Vec<Value> {
     input
 }
 
+/// Serializes a user message with supported images and text.
 fn build_user_input(msg: &Message) -> Value {
     if msg.attachments.is_empty() {
         return json!({ "role": "user", "content": msg.content });
@@ -380,6 +423,7 @@ fn build_user_input(msg: &Message) -> Value {
     json!({ "role": "user", "content": content })
 }
 
+/// Adds supported tool-produced images as user content after the tool result.
 fn push_tool_attachment_inputs(input: &mut Vec<Value>, attachments: &[Attachment]) {
     for image_url in attachments.iter().filter_map(openai_image_url) {
         input.push(json!({
@@ -401,6 +445,7 @@ fn openai_image_content(att: &Attachment) -> Option<Value> {
     })
 }
 
+/// Resolves supported image data or URLs; unsupported attachment forms are omitted.
 fn openai_image_url(att: &Attachment) -> Option<String> {
     match att {
         Attachment::Inline { mime_type, data } if mime_type.starts_with("image/") => {
@@ -418,6 +463,7 @@ fn openai_image_url(att: &Attachment) -> Option<String> {
     }
 }
 
+/// Serializes enabled tool definitions and their parameter schemas for this provider.
 fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
     tools
         .iter()
@@ -433,7 +479,9 @@ fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
+/// Rejects token-limited output before normalizing content, calls and usage.
 fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, RathError> {
+    crate::llm::counting::check_output_limit(Provider::OpenAi, &response)?;
     let usage = response.get("usage").map(usage_from_value);
     let provider_model = response
         .get("model")
@@ -468,6 +516,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
     .with_raw_metadata(metadata))
 }
 
+/// Parses provider function calls and rejects malformed arguments or missing identifiers.
 fn collect_tool_calls(response: &Value) -> Result<Vec<ToolCall>, RathError> {
     let mut calls = Vec::new();
     if let Some(output) = response.get("output").and_then(Value::as_array) {
@@ -505,6 +554,7 @@ fn collect_tool_calls(response: &Value) -> Result<Vec<ToolCall>, RathError> {
     Ok(calls)
 }
 
+/// Collects text from the Responses API output blocks when present.
 fn collect_text(response: &Value) -> Option<String> {
     if let Some(text) = response.get("output_text").and_then(Value::as_str) {
         return Some(text.to_string());
@@ -529,6 +579,7 @@ fn collect_text(response: &Value) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+/// Extracts provider-reported input/output usage when present.
 fn usage_from_value(value: &Value) -> TokenUsage {
     TokenUsage {
         input: value
@@ -545,217 +596,5 @@ fn usage_from_value(value: &Value) -> TokenUsage {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn custom_base_url_builds_openai_responses_endpoint() {
-        assert_eq!(
-            responses_endpoint("https://openrouter.ai/api/v1/"),
-            "https://openrouter.ai/api/v1/responses"
-        );
-        assert_eq!(
-            embeddings_endpoint("https://openrouter.ai/api/v1"),
-            "https://openrouter.ai/api/v1/embeddings"
-        );
-    }
-
-    #[test]
-    fn responses_payload_uses_schema_and_required_tools() {
-        let options = LlmOptions::default()
-            .with_tool_choice(ToolChoice::Required)
-            .with_tools(vec![ToolDefinition {
-                name: "lookup".into(),
-                description: "Lookup a thing.".into(),
-                parameters: json!({"type":"object","properties":{}}),
-            }]);
-        let payload = build_payload("custom-model", &options, &[Message::user("hi")], true);
-        assert_eq!(payload["model"], "custom-model");
-        assert_eq!(payload["tool_choice"], "required");
-        assert_eq!(payload["tools"][0]["name"], "lookup");
-    }
-
-    #[test]
-    fn responses_payload_appends_input_schema_to_instructions() {
-        let options = LlmOptions::default()
-            .with_preamble("You are helpful.")
-            .with_input_schema(json!({
-                "type": "object",
-                "properties": {
-                    "kind": { "type": "string" }
-                },
-                "required": ["kind"]
-            }));
-
-        let payload = build_payload("custom-model", &options, &[Message::user("hi")], false);
-
-        let instructions = payload["instructions"]
-            .as_str()
-            .expect("instructions should be a string");
-        assert!(instructions.contains("You are helpful."));
-        assert!(instructions.contains("The user message is JSON."));
-        assert!(instructions.contains("\"required\":[\"kind\"]"));
-    }
-
-    #[test]
-    fn payload_without_input_schema_uses_text_mode() {
-        let payload = build_payload(
-            "custom-model",
-            &LlmOptions::default(),
-            &[Message::user("hi")],
-            false,
-        );
-        assert!(payload.get("text").is_none());
-    }
-
-    /// Explicit JSON response mode uses the OpenAI json_object format when no schema is supplied.
-    #[test]
-    fn payload_with_json_response_and_no_output_schema_uses_json_object_mode() {
-        let payload = build_payload(
-            "custom-model",
-            &LlmOptions::default().with_response_format(crate::llm::ResponseFormat::Json),
-            &[Message::user("hi")],
-            false,
-        );
-        assert_eq!(payload["text"]["format"]["type"], "json_object");
-    }
-
-    /// Non-image attachments are ignored on the OpenAI image-only wire path.
-    #[test]
-    fn non_image_user_attachments_are_dropped() {
-        let payload = build_payload(
-            "custom-model",
-            &LlmOptions::default(),
-            &[Message {
-                role: Role::User,
-                content: "describe this".into(),
-                attachments: vec![Attachment::Inline {
-                    mime_type: "application/pdf".into(),
-                    data: "aGVsbG8=".into(),
-                }],
-                usage: None,
-            }],
-            false,
-        );
-
-        assert_eq!(payload["input"][0]["role"], "user");
-        assert_eq!(payload["input"][0]["content"].as_array().unwrap().len(), 1);
-        assert_eq!(payload["input"][0]["content"][0]["type"], "input_text");
-    }
-
-    /// User attachments are encoded as OpenAI `input_image` content items.
-    #[test]
-    fn user_attachments_use_content_array() {
-        let payload = build_payload(
-            "custom-model",
-            &LlmOptions::default(),
-            &[Message {
-                role: Role::User,
-                content: "describe this".into(),
-                attachments: vec![Attachment::Inline {
-                    mime_type: "image/png".into(),
-                    data: "aGVsbG8=".into(),
-                }],
-                usage: None,
-            }],
-            false,
-        );
-
-        assert_eq!(payload["input"][0]["role"], "user");
-        assert_eq!(payload["input"][0]["content"][0]["type"], "input_image");
-        assert_eq!(payload["input"][0]["content"][1]["type"], "input_text");
-    }
-
-    /// Tool outputs remain unchanged when a reminder is appended as a later user turn.
-    #[test]
-    fn build_input_keeps_tool_output_and_reminder_separate() {
-        let input = build_input(&[
-            Message {
-                role: Role::AssistantToolCalls {
-                    calls: vec![ToolCall {
-                        id: "call_1".into(),
-                        name: "lookup".into(),
-                        args: json!({"q":"x"}),
-                        thought_signatures: None,
-                    }],
-                },
-                content: String::new(),
-                attachments: Vec::new(),
-                usage: None,
-            },
-            Message::tool_output("call_1".into(), r#"{"ok":true}"#),
-            Message::user("FINAL TURN: call final_answer"),
-        ]);
-
-        assert_eq!(input[0]["type"], "function_call");
-        assert_eq!(input[1]["type"], "function_call_output");
-        assert_eq!(input[1]["output"], r#"{"ok":true}"#);
-        assert_eq!(input[2]["role"], "user");
-        assert_eq!(input[2]["content"], "FINAL TURN: call final_answer");
-    }
-
-    #[test]
-    fn schema_and_tools_openai_prefers_tools_over_structured_output() {
-        let options = LlmOptions::default()
-            .with_tool_choice(ToolChoice::Required)
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "answer": { "type": "string" }
-                },
-                "required": ["answer"]
-            }))
-            .with_tools(vec![ToolDefinition {
-                name: "submit".into(),
-                description: "Submit the final answer.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "answer": { "type": "string" }
-                    },
-                    "required": ["answer"]
-                }),
-            }]);
-
-        let payload = build_payload("custom-model", &options, &[Message::user("hi")], true);
-
-        assert!(
-            payload.get("text").is_some(),
-            "text format should be set alongside tools"
-        );
-        assert_eq!(payload["tools"][0]["name"], "submit");
-        assert_eq!(payload["tool_choice"], "required");
-    }
-
-    #[test]
-    fn maps_response_usage_and_tool_call() {
-        let response = json!({
-            "id": "resp_1",
-            "model": "gpt-x",
-            "usage": {"input_tokens": 10, "output_tokens": 5},
-            "output": [{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"x\"}"}]
-        });
-        let mapped = map_response(response, false).unwrap();
-        assert_eq!(mapped.usage.unwrap().total(), Some(15));
-        assert_eq!(mapped.provider_model.as_deref(), Some("gpt-x"));
-        match mapped.output {
-            LlmOutput::ToolCalls { calls, .. } => assert_eq!(calls[0].id, "call_1"),
-            _ => panic!("expected tool calls"),
-        }
-    }
-
-    #[test]
-    fn map_response_without_json_mode_returns_string() {
-        let response = json!({
-            "id": "resp_1",
-            "model": "gpt-x",
-            "output_text": "plain text"
-        });
-        let mapped = map_response(response, false).unwrap();
-        match mapped.output {
-            LlmOutput::Output(Value::String(text)) => assert_eq!(text, "plain text"),
-            _ => panic!("expected string output"),
-        }
-    }
-}
+#[path = "openai/tests/mod.rs"]
+mod tests;

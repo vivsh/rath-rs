@@ -239,3 +239,101 @@ Use `LlmClient::uses_exit_tool()` to check whether a client uses this strategy.
 ## License
 
 Licensed under either the MIT License or Apache License 2.0, at your option.
+
+## Request measurement and response limits
+
+All five LLM adapters (Gemini, OpenAI, Anthropic, OpenRouter and Ollama) support
+local text-request estimates and `LlmOptions::with_max_output_tokens`.
+
+```rust,no_run
+use rath::llm::{LlmOptions, Message, RathError};
+
+# async fn example(model_url: &str, retained_messages: &[Message]) -> Result<(), RathError> {
+let client = LlmOptions::default()
+    .with_preamble("Answer using the supplied conversation.")
+    .with_max_output_tokens(1024)
+    .create(model_url)?;
+
+// Includes persona, retained history, current input, schemas and enabled tools.
+let estimate = client.estimate_tokens(retained_messages)?;
+println!("estimated input: {}", estimate.input_tokens);
+
+// Same selected response model; excludes configured persona, history and schemas.
+// Includes minimal one-message request framing: compare directly to a summary budget.
+let summary_size = client.estimate_content_tokens("A standalone summary.")?;
+println!("summary budget usage: {}", summary_size.input_tokens);
+
+// Explicit network request. Unsupported adapters/endpoints return an error.
+let reported = client.count_tokens(retained_messages).await?;
+println!("provider-reported input: {}", reported.input_tokens);
+# Ok(())
+# }
+```
+
+Local estimates support inexpensive monitoring and early compaction. **They do
+not establish that a request fits a model's context window.** Admission requiring
+model-specific counts must explicitly use a provider counting API or a matching
+deployment tokenizer. Rath does not bundle matching deployment tokenizers;
+budgeting for arbitrary local models is best effort.
+
+Estimates use a fixed `cl100k_base` reference vocabulary and ordinary text
+encoding, not a guessed tokenizer based on the model name. The prompt projection
+includes adapter formatting and schema/tool instructions. The allowance is
+`ceil(1.25 * (reference_tokens + 256 + 16 * (wire_messages + tool_definitions)))`.
+This deliberately padded heuristic can overestimate substantially, especially
+for short inputs, and can still underestimate unfamiliar models or workloads.
+It is not a guaranteed upper bound. Media attachments return unsupported locally.
+
+| Adapter | Explicit `count_tokens` / `count_content_tokens` | Generation cap |
+|---|---|---|
+| Gemini | Full `generateContentRequest` through `countTokens` | `maxOutputTokens` |
+| OpenAI | `/responses/input_tokens` | `max_output_tokens` |
+| Anthropic | `/messages/count_tokens` | `max_tokens` |
+| OpenRouter | Unsupported; local estimate available | `max_tokens` |
+| Ollama | Unsupported; local estimate available | `max_tokens` |
+
+Native counting uses the configured endpoint, model and credentials. It never
+falls back to generation or estimation. Provider counts have source
+`TokenCountSource::ProviderReported`; local estimates use `Estimated`. Provider
+counts can differ from actual generation usage and are not labelled exact.
+Unsupported media/source forms are rejected rather than silently omitted.
+
+`count_content_tokens` is the native counterpart to `estimate_content_tokens`.
+Both exclude persona, schemas, tools, history, thinking and output caps, but
+include minimal-request framing. Never measure summary content by subtracting
+two full-request estimates. Use the client for the model that will consume it.
+
+The caller owns admission, context limits, output reservation and compaction.
+`execute` never automatically counts or modifies history. Do not record estimates
+as `TokenUsage`: that type continues to represent generation usage from providers.
+
+Output caps are validated at construction and request preparation. Zero and
+values outside the adapter's representable range fail. Provider-specific model
+maximums are validated by the deployment. A cap includes reasoning tokens where
+the provider includes them, so it does not promise that many visible answer
+tokens. When unset, previous defaults remain, including Anthropic's 4096.
+
+Use the typed cap exclusively. Rath rejects reserved `provider_config` keys
+`max_tokens`, `max_completion_tokens`, `max_output_tokens`, `maxOutputTokens`,
+`num_predict`, `generationConfig.maxOutputTokens`,
+`generation_config.max_output_tokens`, and `options.num_predict`, even when the
+typed field is absent or contains the same value. Schema properties with those
+names are not treated as configuration. Rejected caps are never dropped or retried.
+
+When the provider reports token-limit termination, Rath returns
+`RathError::OutputLimitReached { provider, response }` before parsing JSON or
+exposing tool calls. Partial output is not successful structured output. The raw
+response remains explicitly accessible, while ordinary `Display`, `Debug` and
+tracing of the error omit it. Applications must avoid explicitly logging the
+`response` field if it contains private content.
+
+Existing custom `LlmClient` implementations keep compiling: the new measurement
+methods default to unsupported. Exhaustive `LlmOptions` literals must add
+`max_output_tokens: None` or use `..Default::default()`; exhaustive `RathError`
+matches must handle the new variants. `LlmResponse` and `TokenUsage` are unchanged.
+
+For an offline comparison against sourced documentation examples, run
+`cargo test reports_published_count_comparison -- --nocapture`. Each fixture records
+its model, request projection, published count and source. These illustrative
+examples are not live captures or a representative calibration corpus; their
+error/underestimation report does not establish context safety.

@@ -1,3 +1,5 @@
+mod measurement;
+
 use async_trait::async_trait;
 use reqwest::Client as HttpClient;
 use serde_json::{Value, json};
@@ -19,7 +21,9 @@ struct OpenRouterClient {
     url: ModelUrl,
 }
 
+/// Creates an LLM client after validating output caps and resolving credentials.
 pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, RathError> {
+    crate::llm::counting::validate_options(Provider::OpenRouter, &options)?;
     let api_key = required_api_key(url, "OPENROUTER_API_KEY")?;
     Ok(Box::new(OpenRouterClient {
         http: HttpClient::new(),
@@ -41,7 +45,17 @@ impl LlmClient for OpenRouterClient {
         &self.options
     }
 
+    fn estimate_tokens(&self, messages: &[Message]) -> Result<crate::llm::TokenCount, RathError> {
+        self.estimate_request(&self.options, messages)
+    }
+
+    fn estimate_content_tokens(&self, content: &str) -> Result<crate::llm::TokenCount, RathError> {
+        self.estimate_request(&LlmOptions::default(), &[Message::user(content)])
+    }
+
+    /// Dispatches a validated request and rejects token-limited output before interpreting it.
     async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
+        crate::llm::counting::validate_options(Provider::OpenRouter, &self.options)?;
         validate_history(messages)?;
         validate_tools(Provider::OpenRouter, &self.options.tools)?;
 
@@ -72,6 +86,7 @@ fn chat_completions_endpoint(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }
 
+/// Rejects empty history and a final assistant tool call without subsequent results.
 fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     if messages.is_empty() {
         return Err(RathError::Validation("messages must not be empty".into()));
@@ -87,6 +102,7 @@ fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     Ok(())
 }
 
+/// Constructs provider wire input, including enabled tools, schemas and generation settings.
 fn build_payload(
     model: &str,
     options: &LlmOptions,
@@ -99,6 +115,9 @@ fn build_payload(
         "stream": false,
     });
 
+    if let Some(cap) = options.max_output_tokens {
+        payload["max_tokens"] = json!(cap);
+    }
     if let Some(t) = options.temperature {
         payload["temperature"] = json!(t);
     }
@@ -129,6 +148,7 @@ fn build_payload(
     payload
 }
 
+/// Serializes retained history and adapter instructions into provider messages.
 fn build_messages(history: &[Message], preamble: Option<&str>) -> Vec<Value> {
     let mut out = Vec::with_capacity(history.len() + usize::from(preamble.is_some()));
     if let Some(system) = preamble {
@@ -173,6 +193,7 @@ fn build_messages(history: &[Message], preamble: Option<&str>) -> Vec<Value> {
     out
 }
 
+/// Serializes user text and supported attachments in provider content format.
 fn build_user_message(message: &Message) -> Value {
     if message.attachments.is_empty() {
         return json!({ "role": "user", "content": message.content });
@@ -197,6 +218,7 @@ fn push_tool_attachment_messages(out: &mut Vec<Value>, attachments: &[Attachment
     }
 }
 
+/// Serializes supported image attachments and omits unsupported attachment forms.
 fn openrouter_image_part(att: &Attachment) -> Option<Value> {
     let url = match att {
         Attachment::Inline { mime_type, data } if mime_type.starts_with("image/") => {
@@ -220,6 +242,7 @@ fn openrouter_image_part(att: &Attachment) -> Option<Value> {
     }))
 }
 
+/// Serializes enabled tool definitions and their parameter schemas for this provider.
 fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
     tools
         .iter()
@@ -236,7 +259,9 @@ fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
+/// Rejects token-limited output before normalizing content, calls and usage.
 fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, RathError> {
+    crate::llm::counting::check_output_limit(Provider::OpenRouter, &response)?;
     let usage = response.get("usage").map(usage_from_value);
     let provider_model = response
         .get("model")
@@ -283,6 +308,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
     .with_raw_metadata(metadata))
 }
 
+/// Parses provider function calls and rejects malformed arguments or missing identifiers.
 fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, RathError> {
     let mut calls = Vec::new();
     for call in message
@@ -322,6 +348,7 @@ fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, RathError> {
     Ok(calls)
 }
 
+/// Extracts provider-reported input/output usage when present.
 fn usage_from_value(value: &Value) -> TokenUsage {
     TokenUsage {
         input: value
@@ -336,77 +363,5 @@ fn usage_from_value(value: &Value) -> TokenUsage {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn endpoint_uses_chat_completions() {
-        assert_eq!(
-            chat_completions_endpoint("https://openrouter.ai/api/v1/"),
-            "https://openrouter.ai/api/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn payload_uses_openrouter_model_slug() {
-        let payload = build_payload(
-            "openai/gpt-5.2",
-            &LlmOptions::default(),
-            &[Message::user("hi")],
-            false,
-        );
-        assert_eq!(payload["model"], "openai/gpt-5.2");
-        assert_eq!(payload["messages"][0]["content"], "hi");
-    }
-
-    #[test]
-    fn payload_with_schema_uses_openrouter_json_schema_shape() {
-        let payload = build_payload(
-            "openai/gpt-5.2",
-            &LlmOptions::default().with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "ok": { "type": "boolean" }
-                }
-            })),
-            &[Message::user("hi")],
-            false,
-        );
-        assert_eq!(payload["response_format"]["type"], "json_schema");
-        assert_eq!(
-            payload["response_format"]["json_schema"]["schema"]["type"],
-            "object"
-        );
-    }
-
-    #[test]
-    fn maps_tool_call_response() {
-        let response = json!({
-            "id": "gen-1",
-            "object": "chat.completion",
-            "model": "openai/gpt-5.2",
-            "usage": { "prompt_tokens": 10, "completion_tokens": 4 },
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "checking",
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "lookup",
-                            "arguments": "{\"q\":\"x\"}"
-                        }
-                    }]
-                }
-            }]
-        });
-        let mapped = map_response(response, false).unwrap();
-        assert_eq!(mapped.provider, Provider::OpenRouter);
-        assert_eq!(mapped.usage.unwrap().total(), Some(14));
-        match mapped.output {
-            LlmOutput::ToolCalls { calls, .. } => assert_eq!(calls[0].name, "lookup"),
-            _ => panic!("expected tool calls"),
-        }
-    }
-}
+#[path = "openrouter/tests/mod.rs"]
+mod tests;

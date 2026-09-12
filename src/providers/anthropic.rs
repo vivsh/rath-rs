@@ -1,3 +1,5 @@
+mod measurement;
+
 use async_trait::async_trait;
 use reqwest::Client as HttpClient;
 use serde_json::{Value, json};
@@ -19,7 +21,9 @@ struct AnthropicClient {
     url: ModelUrl,
 }
 
+/// Creates an LLM client after validating output caps and resolving credentials.
 pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, RathError> {
+    crate::llm::counting::validate_options(Provider::Anthropic, &options)?;
     let api_key = required_api_key(url, "ANTHROPIC_API_KEY")?;
     Ok(Box::new(AnthropicClient {
         http: HttpClient::new(),
@@ -41,7 +45,32 @@ impl LlmClient for AnthropicClient {
         &self.options
     }
 
+    fn estimate_tokens(&self, messages: &[Message]) -> Result<crate::llm::TokenCount, RathError> {
+        self.estimate_request(&self.options, messages)
+    }
+
+    fn estimate_content_tokens(&self, content: &str) -> Result<crate::llm::TokenCount, RathError> {
+        self.estimate_request(&LlmOptions::default(), &[Message::user(content)])
+    }
+
+    async fn count_tokens(
+        &self,
+        messages: &[Message],
+    ) -> Result<crate::llm::TokenCount, RathError> {
+        self.count_request(&self.options, messages).await
+    }
+
+    async fn count_content_tokens(
+        &self,
+        content: &str,
+    ) -> Result<crate::llm::TokenCount, RathError> {
+        self.count_request(&LlmOptions::default(), &[Message::user(content)])
+            .await
+    }
+
+    /// Dispatches a validated request and rejects token-limited output before interpreting it.
     async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
+        crate::llm::counting::validate_options(Provider::Anthropic, &self.options)?;
         validate_history(messages)?;
         validate_tools(Provider::Anthropic, &self.options.tools)?;
 
@@ -68,6 +97,7 @@ impl LlmClient for AnthropicClient {
     }
 }
 
+/// Sends a single Anthropic request without retrying or relaxing its output cap.
 async fn send_messages_request(
     http: &HttpClient,
     endpoint: String,
@@ -105,6 +135,7 @@ fn messages_endpoint(base_url: &str) -> String {
     format!("{}/messages", base_url.trim_end_matches('/'))
 }
 
+/// Formats the structured Anthropic error when present, otherwise retains the error body.
 fn format_anthropic_http_error(status: u16, body: &str) -> String {
     let response: Value = match serde_json::from_str(body) {
         Ok(value) => value,
@@ -131,6 +162,7 @@ fn format_anthropic_http_error(status: u16, body: &str) -> String {
     }
 }
 
+/// Rejects empty history and a final assistant tool call without subsequent results.
 fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     if messages.is_empty() {
         return Err(RathError::Validation("messages must not be empty".into()));
@@ -146,6 +178,7 @@ fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     Ok(())
 }
 
+/// Constructs provider wire input, including enabled tools, schemas and generation settings.
 fn build_payload(
     model: &str,
     options: &LlmOptions,
@@ -154,7 +187,7 @@ fn build_payload(
 ) -> Value {
     let mut payload = json!({
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": options.max_output_tokens.unwrap_or(4096),
         "messages": build_messages(messages),
     });
 
@@ -162,6 +195,22 @@ fn build_payload(
         payload["temperature"] = json!(t);
     }
 
+    if let Some(system) = build_system(options, messages) {
+        payload["system"] = system;
+    }
+
+    if tools_enabled {
+        payload["tools"] = Value::Array(build_tools(&options.tools));
+        if options.tool_choice == ToolChoice::Required {
+            payload["tool_choice"] = json!({ "type": "any" });
+        }
+    }
+
+    payload
+}
+
+/// Renders system instructions, schema guidance, and optional cache control once.
+fn build_system(options: &LlmOptions, messages: &[Message]) -> Option<Value> {
     let mut system = Vec::new();
     if let Some(preamble) = options.effective_preamble() {
         system.push(preamble);
@@ -190,26 +239,20 @@ fn build_payload(
                 CacheControl::Ephemeral5m => json!({"type": "ephemeral"}),
                 CacheControl::Ephemeral1h => json!({"type": "ephemeral", "ttl": "1h"}),
             };
-            payload["system"] = json!([{
+            return Some(json!([{
                 "type": "text",
                 "text": system.join("\n\n"),
                 "cache_control": cache_control,
-            }]);
+            }]));
         } else {
-            payload["system"] = Value::String(system.join("\n\n"));
+            return Some(Value::String(system.join("\n\n")));
         }
     }
 
-    if tools_enabled {
-        payload["tools"] = Value::Array(build_tools(&options.tools));
-        if options.tool_choice == ToolChoice::Required {
-            payload["tool_choice"] = json!({ "type": "any" });
-        }
-    }
-
-    payload
+    None
 }
 
+/// Serializes retained history and adapter instructions into provider messages.
 fn build_messages(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::new();
     for msg in messages {
@@ -249,6 +292,7 @@ fn build_messages(messages: &[Message]) -> Vec<Value> {
     out
 }
 
+/// Serializes user text and supported attachments in provider content format.
 fn build_user_message(msg: &Message) -> Value {
     if msg.attachments.is_empty() {
         return json!({ "role": "user", "content": msg.content });
@@ -268,6 +312,7 @@ fn anthropic_image_blocks(attachments: &[Attachment]) -> Vec<Value> {
         .collect()
 }
 
+/// Serializes supported image sources and omits unsupported attachment forms.
 fn anthropic_image_block(att: &Attachment) -> Option<Value> {
     match att {
         Attachment::Inline { mime_type, data } if mime_type.starts_with("image/") => Some(json!({
@@ -297,6 +342,7 @@ fn anthropic_image_block(att: &Attachment) -> Option<Value> {
     }
 }
 
+/// Serializes enabled tool definitions and their parameter schemas for this provider.
 fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
     tools
         .iter()
@@ -310,7 +356,9 @@ fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
+/// Rejects token-limited output before normalizing content, calls and usage.
 fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, RathError> {
+    crate::llm::counting::check_output_limit(Provider::Anthropic, &response)?;
     let usage = response.get("usage").map(usage_from_value);
     let provider_model = response
         .get("model")
@@ -344,6 +392,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
     .with_raw_metadata(metadata))
 }
 
+/// Collects provider text and function calls from returned content blocks.
 fn collect_content(response: &Value) -> (Option<String>, Vec<ToolCall>) {
     let mut text = String::new();
     let mut calls = Vec::new();
@@ -378,6 +427,7 @@ fn collect_content(response: &Value) -> (Option<String>, Vec<ToolCall>) {
     ((!text.is_empty()).then_some(text), calls)
 }
 
+/// Extracts provider-reported input/output usage when present.
 fn usage_from_value(value: &Value) -> TokenUsage {
     TokenUsage {
         input: value
@@ -392,285 +442,5 @@ fn usage_from_value(value: &Value) -> TokenUsage {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn custom_base_url_builds_anthropic_messages_endpoint() {
-        assert_eq!(
-            messages_endpoint("https://anthropic-proxy.example/v1/"),
-            "https://anthropic-proxy.example/v1/messages"
-        );
-    }
-
-    /// Anthropic HTTP errors keep the API's structured message and type.
-    #[test]
-    fn formats_structured_http_errors() {
-        let msg = format_anthropic_http_error(
-            404,
-            r#"{"type":"error","error":{"type":"not_found_error","message":"model claude-3-5-haiku-latest not found"}}"#,
-        );
-        assert!(msg.contains("HTTP 404"));
-        assert!(msg.contains("not_found_error"));
-        assert!(msg.contains("model claude-3-5-haiku-latest not found"));
-    }
-
-    /// Anthropic HTTP errors fall back to the raw body when it is not valid JSON.
-    #[test]
-    fn formats_unstructured_http_errors() {
-        let msg = format_anthropic_http_error(500, "upstream unavailable");
-        assert!(msg.contains("HTTP 500"));
-        assert!(msg.contains("upstream unavailable"));
-    }
-
-    #[test]
-    fn messages_encode_tool_exchange() {
-        let msgs = build_messages(&[
-            Message::user("hi"),
-            Message {
-                role: Role::AssistantToolCalls {
-                    calls: vec![ToolCall {
-                        id: "toolu_1".into(),
-                        name: "lookup".into(),
-                        args: json!({"q":"x"}),
-                        thought_signatures: None,
-                    }],
-                },
-                content: "checking".into(),
-                attachments: Vec::new(),
-                usage: None,
-            },
-            Message::tool_output("toolu_1".into(), r#"{"ok":true}"#),
-        ]);
-        assert_eq!(msgs[1]["content"][1]["type"], "tool_use");
-        assert_eq!(msgs[2]["content"][0]["tool_use_id"], "toolu_1");
-    }
-
-    /// Tool results remain unchanged when a reminder is appended as a later user turn.
-    #[test]
-    fn messages_keep_tool_result_and_reminder_separate() {
-        let msgs = build_messages(&[
-            Message {
-                role: Role::AssistantToolCalls {
-                    calls: vec![ToolCall {
-                        id: "toolu_1".into(),
-                        name: "lookup".into(),
-                        args: json!({"q":"x"}),
-                        thought_signatures: None,
-                    }],
-                },
-                content: String::new(),
-                attachments: Vec::new(),
-                usage: None,
-            },
-            Message::tool_output("toolu_1".into(), r#"{"ok":true}"#),
-            Message::user(
-                "<system-reminder><critical>call final_answer</critical></system-reminder>",
-            ),
-        ]);
-
-        assert_eq!(msgs[1]["content"][0]["type"], "tool_result");
-        assert_eq!(
-            msgs[1]["content"][0]["content"][0]["text"],
-            r#"{"ok":true}"#
-        );
-        assert_eq!(msgs[2]["role"], "user");
-        assert_eq!(
-            msgs[2]["content"],
-            "<system-reminder><critical>call final_answer</critical></system-reminder>"
-        );
-    }
-
-    #[test]
-    fn maps_tool_call_and_usage() {
-        let response = json!({
-            "id": "msg_1",
-            "model": "claude-x",
-            "usage": {"input_tokens": 7, "output_tokens": 3},
-            "content": [{"type":"tool_use","id":"toolu_1","name":"lookup","input":{"q":"x"}}]
-        });
-        let mapped = map_response(response, false).unwrap();
-        assert_eq!(mapped.usage.unwrap().total(), Some(10));
-        match mapped.output {
-            LlmOutput::ToolCalls { calls, .. } => assert_eq!(calls[0].id, "toolu_1"),
-            _ => panic!("expected tool call"),
-        }
-    }
-
-    #[test]
-    fn payload_appends_input_schema_to_system_prompt() {
-        let options = LlmOptions::default()
-            .with_preamble("You are helpful.")
-            .with_input_schema(json!({
-                "type": "object",
-                "properties": {
-                    "kind": { "type": "string" }
-                },
-                "required": ["kind"]
-            }));
-
-        let payload = build_payload("claude", &options, &[Message::user("hi")], false);
-
-        let system = payload["system"]
-            .as_str()
-            .expect("system prompt should be a string");
-        assert!(system.contains("You are helpful."));
-        assert!(system.contains("The user message is JSON."));
-        assert!(system.contains("\"required\":[\"kind\"]"));
-    }
-
-    #[test]
-    fn payload_without_input_schema_keeps_text_mode() {
-        let payload = build_payload(
-            "claude",
-            &LlmOptions::default().with_preamble("You are helpful."),
-            &[Message::user("hi")],
-            false,
-        );
-        assert_eq!(payload["system"], "You are helpful.");
-    }
-
-    /// Explicit JSON response mode appends a textual JSON-only instruction.
-    #[test]
-    fn payload_with_json_response_and_no_output_schema_requests_json_textually() {
-        let payload = build_payload(
-            "claude",
-            &LlmOptions::default()
-                .with_preamble("You are helpful.")
-                .with_response_format(crate::llm::ResponseFormat::Json),
-            &[Message::user("hi")],
-            false,
-        );
-        let system = payload["system"]
-            .as_str()
-            .expect("system prompt should be present");
-        assert!(system.contains("Return only valid JSON."));
-    }
-
-    /// User attachments are emitted as Anthropic image blocks ahead of text.
-    #[test]
-    fn user_attachments_use_image_blocks() {
-        let msgs = build_messages(&[Message {
-            role: Role::User,
-            content: "describe this".into(),
-            attachments: vec![Attachment::Inline {
-                mime_type: "image/png".into(),
-                data: "aGVsbG8=".into(),
-            }],
-            usage: None,
-        }]);
-
-        assert_eq!(msgs[0]["content"][0]["type"], "image");
-        assert_eq!(msgs[0]["content"][1]["type"], "text");
-    }
-
-    #[test]
-    fn schema_and_tools_anthropic_sends_both_tools_and_output_hint() {
-        let options = LlmOptions::default()
-            .with_preamble("You are helpful.")
-            .with_tool_choice(ToolChoice::Required)
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "answer": { "type": "string" }
-                },
-                "required": ["answer"]
-            }))
-            .with_tools(vec![ToolDefinition {
-                name: "submit".into(),
-                description: "Submit the final answer.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "answer": { "type": "string" }
-                    },
-                    "required": ["answer"]
-                }),
-            }]);
-
-        let payload = build_payload("claude", &options, &[Message::user("hi")], true);
-
-        let system = payload["system"]
-            .as_str()
-            .expect("system should be a string");
-        assert!(
-            system.contains("You are helpful."),
-            "system should contain preamble"
-        );
-        assert!(
-            system.contains("JSON Schema"),
-            "system should contain JSON schema hint"
-        );
-        assert_eq!(payload["tool_choice"]["type"], "any");
-        assert_eq!(payload["tools"][0]["name"], "submit");
-    }
-
-    #[test]
-    fn map_response_without_json_mode_returns_string() {
-        let response = json!({
-            "id": "msg_1",
-            "model": "claude-x",
-            "content": [{"type":"text","text":"plain text"}]
-        });
-        let mapped = map_response(response, false).unwrap();
-        match mapped.output {
-            LlmOutput::Output(Value::String(text)) => assert_eq!(text, "plain text"),
-            _ => panic!("expected string output"),
-        }
-    }
-
-    /// With cache=5m, system is an array with a cache_control block.
-    #[test]
-    fn payload_with_cache_5m_uses_ephemeral_cache_control() {
-        let mut options = LlmOptions::default().with_preamble("Be concise.");
-        options.cache = Some(CacheControl::Ephemeral5m);
-        let payload = build_payload("claude", &options, &[Message::user("hi")], false);
-        let system = payload["system"]
-            .as_array()
-            .expect("system should be an array with cache");
-        assert_eq!(system[0]["type"], "text");
-        assert_eq!(system[0]["text"], "Be concise.");
-        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
-        assert!(system[0]["cache_control"].get("ttl").is_none());
-    }
-
-    /// With cache=1h, system includes ttl field.
-    #[test]
-    fn payload_with_cache_1h_includes_ttl() {
-        let mut options = LlmOptions::default().with_preamble("Be concise.");
-        options.cache = Some(CacheControl::Ephemeral1h);
-        let payload = build_payload("claude", &options, &[Message::user("hi")], false);
-        let system = payload["system"]
-            .as_array()
-            .expect("system should be an array with cache");
-        assert_eq!(system[0]["cache_control"]["ttl"], "1h");
-    }
-
-    /// Without cache, system remains a plain string.
-    #[test]
-    fn payload_without_cache_system_is_string() {
-        let options = LlmOptions::default().with_preamble("Be concise.");
-        let payload = build_payload("claude", &options, &[Message::user("hi")], false);
-        assert!(payload["system"].is_string());
-    }
-
-    /// cache=5m + json output: schema hint is included in the cached system text.
-    #[test]
-    fn payload_cache_with_json_output_includes_schema_hint() {
-        let mut options = LlmOptions::default()
-            .with_preamble("Be concise.")
-            .with_response_format(crate::llm::ResponseFormat::Json);
-        options.cache = Some(CacheControl::Ephemeral5m);
-        let payload = build_payload("claude", &options, &[Message::user("hi")], false);
-        let system = payload["system"]
-            .as_array()
-            .expect("system should be an array with cache");
-        assert!(
-            system[0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("Return only valid JSON.")
-        );
-    }
-}
+#[path = "anthropic/tests/mod.rs"]
+mod tests;

@@ -1,0 +1,38 @@
+[
+  {
+    "id": "gemini-published-text-example",
+    "provenance": "Published illustrative count, not a live Rath measurement",
+    "source": "https://ai.google.dev/api/tokens#text",
+    "recorded_on": "2026-09-12",
+    "provider": "Gemini",
+    "model": "gemini-3.8-flash",
+    "input_tokens": 10,
+    "wire_messages": 1,
+    "tool_definitions": 0,
+    "prompt": {"contents": [{"role": "user", "parts": [{"text": "The quick brown fox jumps over the lazy dog."}]}]}
+  },
+  {
+    "id": "gemini-published-chat-example",
+    "provenance": "Published illustrative count, not a live Rath measurement",
+    "source": "https://ai.google.dev/api/tokens#chat",
+    "recorded_on": "2026-09-12",
+    "provider": "Gemini",
+    "model": "gemini-3.8-flash",
+    "input_tokens": 10,
+    "wire_messages": 2,
+    "tool_definitions": 0,
+    "prompt": {"contents": [{"role": "user", "parts": [{"text": "Hi my name is Bob"}]}, {"role": "model", "parts": [{"text": "Hi Bob!"}]}]}
+  },
+  {
+    "id": "anthropic-published-system-example",
+    "provenance": "Published example output, not a live Rath measurement",
+    "source": "https://platform.claude.com/docs/en/build-with-claude/token-counting#count-tokens-in-basic-messages",
+    "recorded_on": "2026-09-12",
+    "provider": "Anthropic",
+    "model": "claude-opus-5",
+    "input_tokens": 14,
+    "wire_messages": 1,
+    "tool_definitions": 0,
+    "prompt": {"system": "You are a scientist", "messages": [{"role": "user", "content": "Hello, Claude"}]}
+  }
+]
