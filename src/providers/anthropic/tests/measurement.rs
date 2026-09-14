@@ -153,3 +153,23 @@ async fn native_failures_remain_errors() {
         );
     }
 }
+
+/// Application keys are absent from the shared generation and counting payload builder.
+#[test]
+fn message_keys_never_enter_provider_payloads() {
+    let messages = [
+        Message::user("hello"),
+        Message::assistant("welcome"),
+        Message::user("current"),
+    ];
+    let keyed: Vec<_> = messages
+        .iter()
+        .cloned()
+        .map(|message| message.with_key("PRIVATE-APPLICATION-KEY"))
+        .collect();
+    let options = LlmOptions::default();
+    assert_eq!(
+        build_payload("model", &options, &messages, false),
+        build_payload("model", &options, &keyed, false)
+    );
+}

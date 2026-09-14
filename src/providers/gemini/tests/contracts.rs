@@ -22,6 +22,7 @@ fn build_messages_user_only() {
 #[test]
 fn build_messages_user_with_attachment_adds_inline_part() {
     let history = vec![Message {
+        key: None,
         role: Role::User,
         content: "describe this".into(),
         attachments: vec![Attachment::Inline {
@@ -71,6 +72,7 @@ fn build_messages_history_in_order() {
 fn build_messages_tool_role_included() {
     let history = vec![
         Message {
+            key: None,
             role: Role::AssistantToolCalls {
                 calls: vec![make_call("call-42", "read_file")],
             },
@@ -79,6 +81,7 @@ fn build_messages_tool_role_included() {
             usage: None,
         },
         Message {
+            key: None,
             role: Role::Tool {
                 call_id: "call-42".into(),
             },
@@ -99,6 +102,7 @@ fn build_messages_continue_after_tool_result() {
     let history = vec![
         Message::user(r#"{"goal":"ship","known_context":[]}"#),
         Message {
+            key: None,
             role: Role::AssistantToolCalls {
                 calls: vec![make_call("c1", "project_outline")],
             },
@@ -107,6 +111,7 @@ fn build_messages_continue_after_tool_result() {
             usage: None,
         },
         Message {
+            key: None,
             role: Role::Tool {
                 call_id: "c1".into(),
             },
@@ -124,6 +129,7 @@ fn build_messages_continue_after_tool_result() {
 fn build_messages_keeps_tool_response_and_reminder_separate() {
     let history = vec![
         Message {
+            key: None,
             role: Role::AssistantToolCalls {
                 calls: vec![make_call("c1", "project_outline")],
             },
@@ -132,6 +138,7 @@ fn build_messages_keeps_tool_response_and_reminder_separate() {
             usage: None,
         },
         Message {
+            key: None,
             role: Role::Tool {
                 call_id: "c1".into(),
             },

@@ -49,6 +49,10 @@ pub enum Role {
 /// calling a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Opaque application identity, assigned and interpreted by the caller.
+    /// Preserved in storage serialization; excluded from provider requests and token counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     /// Role that produced this message.
     pub role: Role,
     /// Text body of the message.
@@ -63,9 +67,17 @@ pub struct Message {
 }
 
 impl Message {
+    /// Sets or replaces the application key without changing provider-visible content.
+    /// Rath does not generate keys, validate uniqueness, or deduplicate messages.
+    pub fn with_key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
     /// Creates a user-role message with the given text.
     pub fn user(content: impl Into<String>) -> Self {
         Message {
+            key: None,
             role: Role::User,
             content: content.into(),
             attachments: Vec::new(),
@@ -76,6 +88,7 @@ impl Message {
     /// Creates an assistant-role message with the given text.
     pub fn assistant(content: impl Into<String>) -> Self {
         Message {
+            key: None,
             role: Role::Assistant,
             content: content.into(),
             attachments: Vec::new(),
@@ -86,6 +99,7 @@ impl Message {
     /// Creates a tool-result message. `call_id` must match the originating [`ToolCall::id`].
     pub fn tool_output(call_id: String, content: impl Into<String>) -> Self {
         Message {
+            key: None,
             role: Role::Tool { call_id },
             content: content.into(),
             attachments: Vec::new(),
@@ -96,6 +110,7 @@ impl Message {
     /// Builds a message by JSON-encoding `value`.
     pub fn from_json(role: Role, value: &impl serde::Serialize) -> Result<Self, serde_json::Error> {
         Ok(Message {
+            key: None,
             role,
             content: serde_json::to_string(value)?,
             attachments: Vec::new(),

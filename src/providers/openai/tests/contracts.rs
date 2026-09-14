@@ -84,6 +84,7 @@ fn non_image_user_attachments_are_dropped() {
         "custom-model",
         &LlmOptions::default(),
         &[Message {
+            key: None,
             role: Role::User,
             content: "describe this".into(),
             attachments: vec![Attachment::Inline {
@@ -107,6 +108,7 @@ fn user_attachments_use_content_array() {
         "custom-model",
         &LlmOptions::default(),
         &[Message {
+            key: None,
             role: Role::User,
             content: "describe this".into(),
             attachments: vec![Attachment::Inline {
@@ -128,6 +130,7 @@ fn user_attachments_use_content_array() {
 fn build_input_keeps_tool_output_and_reminder_separate() {
     let input = build_input(&[
         Message {
+            key: None,
             role: Role::AssistantToolCalls {
                 calls: vec![ToolCall {
                     id: "call_1".into(),

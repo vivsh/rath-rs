@@ -67,6 +67,7 @@ fn all_adapters_measure_complete_history() {
         ] {
             let messages = [
                 Message {
+                    key: None,
                     role,
                     content: marker.clone(),
                     attachments: vec![],
@@ -120,5 +121,28 @@ fn injected_exit_tool_is_measured_once_as_effective_request_state() {
             .unwrap()
             .input_tokens;
         assert!(full > c.estimate_content_tokens("x").unwrap().input_tokens + 100);
+    }
+}
+
+/// Application keys have no influence on any adapter's prompt projection or estimate.
+#[test]
+fn message_keys_do_not_affect_token_estimates() {
+    let messages = [
+        Message::user("hello"),
+        Message::assistant("welcome"),
+        Message::user("current"),
+    ];
+    let keyed: Vec<_> = messages
+        .iter()
+        .cloned()
+        .map(|message| message.with_key("private application key ".repeat(1000)))
+        .collect();
+    for provider in ["openai", "gemini", "anthropic", "ollama", "openrouter"] {
+        let c = client(provider, options()).unwrap();
+        assert_eq!(
+            c.estimate_tokens(&messages).unwrap(),
+            c.estimate_tokens(&keyed).unwrap(),
+            "{provider}"
+        );
     }
 }

@@ -337,3 +337,24 @@ For an offline comparison against sourced documentation examples, run
 its model, request projection, published count and source. These illustrative
 examples are not live captures or a representative calibration corpus; their
 error/underestimation report does not establish context safety.
+
+## Application message keys
+
+Attach an optional opaque identity to a message for storage and correlation:
+
+```rust
+use rath::llm::Message;
+
+let message = Message::user("Hello").with_key("message:42");
+assert_eq!(message.key.as_deref(), Some("message:42"));
+```
+
+`Message::key` is `Option<String>`. Constructors leave it unset, and absent keys
+are omitted from message serialization. Older stored messages remain readable;
+keys survive serialization, cloning and other message builders. The caller owns
+assignment and uniqueness: Rath does not generate keys or deduplicate messages.
+
+Keys are application metadata. Provider adapters omit them from generation and
+counting requests, so they consume no prompt tokens. They are separate from the
+tool-call IDs used to correlate calls and results. Exhaustive Rust `Message`
+literals must add `key: None` (or an application key).

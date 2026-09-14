@@ -31,6 +31,7 @@ fn qwen_no_think_is_added_to_first_user_message() {
 fn user_attachments_use_content_parts() {
     let messages = build_messages(
         &[Message {
+            key: None,
             role: Role::User,
             content: "describe this".into(),
             attachments: vec![Attachment::Inline {
@@ -53,6 +54,7 @@ fn user_attachments_use_content_parts() {
 fn tool_attachments_become_synthetic_user_images() {
     let messages = build_messages(
         &[Message {
+            key: None,
             role: Role::Tool {
                 call_id: "call-1".into(),
             },
@@ -79,6 +81,7 @@ fn build_messages_keep_tool_result_and_reminder_separate() {
     let messages = build_messages(
         &[
             Message {
+                key: None,
                 role: Role::AssistantToolCalls {
                     calls: vec![ToolCall {
                         id: "call-1".into(),

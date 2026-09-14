@@ -22,6 +22,7 @@ fn includes_system_instructions_and_excludes_options_for_content() {
     );
     let messages = [
         Message {
+            key: None,
             role: Role::System,
             content: "retained summary".into(),
             attachments: vec![],
@@ -124,6 +125,7 @@ async fn full_native_count_matches_generation_request() {
         .unwrap();
     let messages = [
         Message {
+            key: None,
             role: Role::System,
             content: "summary".into(),
             attachments: vec![],
@@ -178,4 +180,30 @@ async fn native_count_failure_is_explicit() {
                 .contains(":countTokens")
         );
     }
+}
+
+/// Application keys are absent from Gemini's shared generation and counting request.
+#[test]
+fn message_keys_never_enter_provider_payloads() {
+    let c = client(LlmOptions::default());
+    let messages = [
+        Message::user("hello"),
+        Message::assistant("welcome"),
+        Message::user("current"),
+    ];
+    let keyed: Vec<_> = messages
+        .iter()
+        .cloned()
+        .map(|message| message.with_key("PRIVATE-APPLICATION-KEY"))
+        .collect();
+    let plain = request::build_request(&c.client, &c.options, &messages, false)
+        .unwrap()
+        .build();
+    let keyed = request::build_request(&c.client, &c.options, &keyed, false)
+        .unwrap()
+        .build();
+    assert_eq!(
+        serde_json::to_value(plain).unwrap(),
+        serde_json::to_value(keyed).unwrap()
+    );
 }

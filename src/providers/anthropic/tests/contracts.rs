@@ -36,6 +36,7 @@ fn messages_encode_tool_exchange() {
     let msgs = build_messages(&[
         Message::user("hi"),
         Message {
+            key: None,
             role: Role::AssistantToolCalls {
                 calls: vec![ToolCall {
                     id: "toolu_1".into(),
@@ -59,6 +60,7 @@ fn messages_encode_tool_exchange() {
 fn messages_keep_tool_result_and_reminder_separate() {
     let msgs = build_messages(&[
         Message {
+            key: None,
             role: Role::AssistantToolCalls {
                 calls: vec![ToolCall {
                     id: "toolu_1".into(),
@@ -160,6 +162,7 @@ fn payload_with_json_response_and_no_output_schema_requests_json_textually() {
 #[test]
 fn user_attachments_use_image_blocks() {
     let msgs = build_messages(&[Message {
+        key: None,
         role: Role::User,
         content: "describe this".into(),
         attachments: vec![Attachment::Inline {
