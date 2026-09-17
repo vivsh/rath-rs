@@ -178,6 +178,70 @@ println!("{} bytes of {}", response.data.len(), response.mime_type);
 # }
 ```
 
+### Fal speech
+
+Fal supports these explicitly mapped endpoints:
+
+| Capability | Model URL |
+|---|---|
+| TTS | `fal:///fal-ai/kokoro/american-english` |
+| TTS | `fal:///fal-ai/elevenlabs/tts/turbo-v2.5` |
+| STT | `fal:///fal-ai/wizper` |
+| STT | `fal:///fal-ai/elevenlabs/speech-to-text/scribe-v2` |
+
+Set `FAL_KEY`, or select another credential variable with `api_key_env`.
+
+```rust
+use rath::audio::tts::{TtsOptions, TtsRequest};
+use rath::audio::stt::{SttOptions, SttRequest};
+
+# async fn run() -> Result<(), rath::core::RathError> {
+let tts = TtsOptions::default().create("fal:///fal-ai/kokoro/american-english")?;
+let speech = tts.synthesize_speech(&TtsRequest {
+    input: "Hello from Rath.".into(),
+    voice: Some("af_heart".into()),
+    ..Default::default()
+}).await?;
+
+let stt = SttOptions::default()
+    .create("fal:///fal-ai/elevenlabs/speech-to-text/scribe-v2")?;
+let transcript = stt.transcribe_audio(&SttRequest {
+    mime_type: speech.mime_type,
+    data: speech.data,
+    model: None,
+    provider_config: Some(serde_json::json!({"language_code": "en"})),
+}).await?;
+println!("{}", transcript.text);
+# Ok(())
+# }
+```
+
+Both operations submit once to Fal's queue, poll every five seconds and have a
+five-minute I/O deadline. Rath does not automatically resubmit failures. Timing
+out or dropping the future stops local waiting; the remote job may continue.
+There is no persistent job tracking or resume API for audio.
+
+TTS downloads the generated audio into `TtsResponse.data`. STT sends the supplied
+bytes as a base64 data URI, without a separate upload. This uses additional memory
+for encoding; provider file-size limits still apply. Use an `audio/*` MIME type
+without parameters. Rath does not transcode files. Fal results are preserved in
+`raw_metadata`, including timestamps or speaker information when available.
+
+`provider_config` must be an object. Request configuration overrides client
+configuration, then typed input/audio and any supplied voice take precedence.
+Other settings retain the endpoint's native names and defaults: for example,
+Wizper uses `language` (default `en`, explicit `null` for detection), while Scribe
+uses `language_code`. `request.model` selects a supported endpoint for that call
+without changing the client. Unknown endpoints fail locally. The supported TTS
+endpoints do not expose format selection, so leave `format` unset.
+
+The default queue is `https://queue.fal.run`; a custom `base_url` is used as the
+queue base without rerouting to Fal. Status/result URLs must share that origin.
+Audio downloads never receive the API key. Redirects are rejected, so custom
+services must provide direct queue and download URLs. Normal audio errors omit
+provider bodies, transcripts, credentials and signed URLs; callers should treat
+explicit `raw_metadata` as potentially private.
+
 ## LLM Usage
 
 ```rust

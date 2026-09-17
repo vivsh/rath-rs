@@ -62,6 +62,7 @@ pub(crate) fn create_tts_client(
 ) -> Result<Box<dyn TtsClient>, RathError> {
     match url.provider {
         Provider::OpenAi => openai::new_tts_client(url, options),
+        Provider::Fal => fal::new_tts_client(url, options),
         _ => Err(RathError::UnsupportedCapability {
             provider: url.provider.clone(),
             capability: "text-to-speech".to_string(),
@@ -76,6 +77,7 @@ pub(crate) fn create_stt_client(
 ) -> Result<Box<dyn SttClient>, RathError> {
     match url.provider {
         Provider::OpenAi => openai::new_stt_client(url, options),
+        Provider::Fal => fal::new_stt_client(url, options),
         _ => Err(RathError::UnsupportedCapability {
             provider: url.provider.clone(),
             capability: "speech-to-text".to_string(),
