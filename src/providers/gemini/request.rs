@@ -5,12 +5,13 @@ use gemini_rust::ContentBuilder;
 /// Builds the same provider request for generation, estimation, and native counting.
 pub(super) fn build_request(
     client: &Gemini,
+    model: &str,
     options: &LlmOptions,
     messages: &[Message],
     minimal: bool,
 ) -> Result<ContentBuilder, RathError> {
     validate_request(options, messages)?;
-    let mut builder = generation_options(client.generate_content(), options, minimal);
+    let mut builder = generation_options(client.generate_content(), model, options, minimal);
     let mut system = options.effective_preamble().into_iter().collect::<Vec<_>>();
     system.extend(
         messages
@@ -47,10 +48,22 @@ pub(super) fn build_request(
 /// Retains generation defaults while omitting thinking entirely for standalone content.
 fn generation_options(
     mut builder: ContentBuilder,
+    model: &str,
     options: &LlmOptions,
     minimal: bool,
 ) -> ContentBuilder {
-    if !minimal {
+    if !minimal
+        && model
+            .strip_prefix("models/")
+            .unwrap_or(model)
+            .starts_with("gemma-4-")
+    {
+        let level = match options.thinking {
+            None | Some(ThinkingLevel::Off) => gemini_rust::ThinkingLevel::Minimal,
+            Some(_) => gemini_rust::ThinkingLevel::High,
+        };
+        builder = builder.with_thinking_level(level);
+    } else if !minimal {
         let budget = match options.thinking {
             None | Some(ThinkingLevel::Off) => 0,
             Some(ThinkingLevel::Low) => 512,

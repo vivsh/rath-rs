@@ -387,10 +387,16 @@ impl LlmClient for GeminiClient {
     /// Dispatches a validated request and rejects token-limited output before interpreting it.
     async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
         let wants_json_output = wants_json_output(&self.options);
-        let response = request::build_request(&self.client, &self.options, messages, false)?
-            .execute()
-            .await
-            .map_err(|e| RathError::Provider(format_error_chain(&e)))?;
+        let response = request::build_request(
+            &self.client,
+            &self.url.model,
+            &self.options,
+            messages,
+            false,
+        )?
+        .execute()
+        .await
+        .map_err(|e| RathError::Provider(format_error_chain(&e)))?;
         let result = map_response(response, wants_json_output)?;
 
         if let Some(ref name) = self.exit_tool_name

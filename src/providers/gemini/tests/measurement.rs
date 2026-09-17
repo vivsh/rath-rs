@@ -30,7 +30,7 @@ fn includes_system_instructions_and_excludes_options_for_content() {
         },
         Message::user("current"),
     ];
-    let request = request::build_request(&c.client, &c.options, &messages, false)
+    let request = request::build_request(&c.client, &c.url.model, &c.options, &messages, false)
         .unwrap()
         .build();
     let payload = serde_json::to_value(request).unwrap();
@@ -134,7 +134,7 @@ async fn full_native_count_matches_generation_request() {
         Message::user("current"),
     ];
     let expected = serde_json::to_value(
-        request::build_request(&c.client, &c.options, &messages, false)
+        request::build_request(&c.client, &c.url.model, &c.options, &messages, false)
             .unwrap()
             .build(),
     )
@@ -196,10 +196,10 @@ fn message_keys_never_enter_provider_payloads() {
         .cloned()
         .map(|message| message.with_key("PRIVATE-APPLICATION-KEY"))
         .collect();
-    let plain = request::build_request(&c.client, &c.options, &messages, false)
+    let plain = request::build_request(&c.client, &c.url.model, &c.options, &messages, false)
         .unwrap()
         .build();
-    let keyed = request::build_request(&c.client, &c.options, &keyed, false)
+    let keyed = request::build_request(&c.client, &c.url.model, &c.options, &keyed, false)
         .unwrap()
         .build();
     assert_eq!(

@@ -10,7 +10,9 @@ impl GeminiClient {
         minimal: bool,
     ) -> Result<TokenCount, RathError> {
         counting::validate_measurement(Provider::Gemini, options, messages, false)?;
-        let request = request::build_request(&self.client, options, messages, minimal)?.build();
+        let request =
+            request::build_request(&self.client, &self.url.model, options, messages, minimal)?
+                .build();
         let payload = serde_json::to_value(request).map_err(RathError::Serialize)?;
         let mut prompt = counting::project(
             &payload,
@@ -50,10 +52,11 @@ impl GeminiClient {
         minimal: bool,
     ) -> Result<TokenCount, RathError> {
         counting::validate_measurement(Provider::Gemini, options, messages, true)?;
-        let result = request::build_request(&self.client, options, messages, minimal)?
-            .count_tokens()
-            .await
-            .map_err(count_error)?;
+        let result =
+            request::build_request(&self.client, &self.url.model, options, messages, minimal)?
+                .count_tokens()
+                .await
+                .map_err(count_error)?;
         Ok(TokenCount {
             input_tokens: u64::from(result.total_tokens),
             source: TokenCountSource::ProviderReported,
