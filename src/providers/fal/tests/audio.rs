@@ -4,6 +4,47 @@ use super::http::{json as reply, serve};
 use crate::audio::tts::{TtsOptions, TtsRequest};
 use crate::core::ModelUrl;
 
+/// Eleven v3 uses the public factory and existing queue/download path without altering audio tags.
+#[tokio::test]
+async fn eleven_v3_complete_path() {
+    let (base, requests) = serve(vec![
+        reply(json!({"status_url":"BASE/status", "response_url":"BASE/result"})),
+        reply(json!({"status":"COMPLETED"})),
+        reply(json!({"audio":{"url":"BASE/audio"}})),
+        (200, "audio/mpeg", "test-audio".into()),
+    ]);
+    let mut url = ModelUrl::parse("fal:///fal-ai/elevenlabs/tts/eleven-v3").unwrap();
+    url.base_url = Some(base);
+    url.api_key = Some("test-secret".into());
+    let client = crate::providers::create_tts_client(&url, TtsOptions::default()).unwrap();
+    let result = client
+        .synthesize_speech(&TtsRequest {
+            input: "[whispers] Hello 世界".into(),
+            voice: Some("Rachel".into()),
+            provider_config: Some(json!({"stability":0.5})),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.mime_type, "audio/mpeg");
+    assert_eq!(result.data, b"test-audio");
+    assert!(result.raw_metadata.unwrap().get("audio").is_some());
+    let wires: Vec<_> = requests.try_iter().collect();
+    assert_eq!(wires.len(), 4);
+    assert!(wires[0].starts_with("POST /fal-ai/elevenlabs/tts/eleven-v3 "));
+    let (_, body) = wires[0].split_once("\r\n\r\n").unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body).unwrap(),
+        json!({
+            "text":"[whispers] Hello 世界", "voice":"Rachel", "stability":0.5
+        })
+    );
+    for request in &wires[..3] {
+        assert!(request.contains("Key test-secret"));
+    }
+    assert!(!wires[3].to_lowercase().contains("authorization"));
+}
+
 /// Exercises construction, queue completion, payload mapping and unauthenticated audio download.
 #[tokio::test]
 async fn kokoro_complete_path() {

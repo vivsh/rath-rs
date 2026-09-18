@@ -11,6 +11,7 @@ use crate::core::{ModelUrl, Provider, RathError};
 
 const KOKORO: &str = "fal-ai/kokoro/american-english";
 const ELEVENLABS: &str = "fal-ai/elevenlabs/tts/turbo-v2.5";
+const ELEVENLABS_V3: &str = "fal-ai/elevenlabs/tts/eleven-v3";
 const WIZPER: &str = "fal-ai/wizper";
 const SCRIBE: &str = "fal-ai/elevenlabs/speech-to-text/scribe-v2";
 
@@ -118,7 +119,7 @@ fn tts_payload(
 fn tts_input_field(model: &str) -> Result<&'static str, RathError> {
     match model {
         KOKORO => Ok("prompt"),
-        ELEVENLABS => Ok("text"),
+        ELEVENLABS | ELEVENLABS_V3 => Ok("text"),
         _ => Err(unsupported("text-to-speech")),
     }
 }

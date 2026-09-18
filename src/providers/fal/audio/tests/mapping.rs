@@ -2,6 +2,34 @@ use serde_json::json;
 
 use super::super::*;
 
+/// Eleven v3 preserves inline delivery cues and typed text/voice precedence without extra defaults.
+#[test]
+fn eleven_v3_preserves_audio_tags_and_settings() {
+    let input = "[whispers] Stay close. [laughs] I was only teasing.";
+    let request = TtsRequest {
+        input: input.into(),
+        voice: Some("Rachel".into()),
+        provider_config: Some(json!({"stability":0.5,"text":"ignored","voice":"ignored"})),
+        ..Default::default()
+    };
+    let payload = tts_payload(ELEVENLABS_V3, &Some(json!({"stability":1.0})), &request).unwrap();
+    assert_eq!(payload["text"], input);
+    assert_eq!(payload["voice"], "Rachel");
+    assert_eq!(payload["stability"], 0.5);
+    assert!(!payload.contains_key("prompt"));
+    assert!(!payload.contains_key("model"));
+    let plain = tts_payload(
+        ELEVENLABS_V3,
+        &None,
+        &TtsRequest {
+            input: input.into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(plain, json!({"text":input}).as_object().unwrap().clone());
+}
+
 /// Keeps typed values authoritative while request configuration overrides client defaults.
 #[test]
 fn tts_configuration_precedence() {

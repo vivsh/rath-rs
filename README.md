@@ -186,10 +186,18 @@ Fal supports these explicitly mapped endpoints:
 |---|---|
 | TTS | `fal:///fal-ai/kokoro/american-english` |
 | TTS | `fal:///fal-ai/elevenlabs/tts/turbo-v2.5` |
+| TTS | `fal:///fal-ai/elevenlabs/tts/eleven-v3` |
 | STT | `fal:///fal-ai/wizper` |
 | STT | `fal:///fal-ai/elevenlabs/speech-to-text/scribe-v2` |
 
 Set `FAL_KEY`, or select another credential variable with `api_key_env`.
+
+Eleven v3 accepts inline audio tags in `TtsRequest.input`, for example
+`[whispers] Stay close. [laughs] I was only teasing.` Rath passes these unchanged;
+it does not generate delivery cues. Use `voice: Some("Rachel".into())` for an
+explicit female voice, or omit it for the endpoint default. Native v3 settings
+such as `stability` go in `provider_config`; no settings are added implicitly.
+Audio tags are model-specific and should not be assumed to work with Turbo.
 
 ```rust
 use rath::audio::tts::{TtsOptions, TtsRequest};
