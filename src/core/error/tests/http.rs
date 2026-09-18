@@ -32,7 +32,7 @@ fn serve(status: u16, headers: &str, body: Vec<u8>, declared: Option<usize>) -> 
 #[tokio::test]
 async fn http_details_and_redaction() {
     let body = json!({"error":{"code":"quota", "message":"quota exceeded KEY/123"},
-        "unknown":"PRIVATE-PROSE", "password":"do-not-retain"})
+        "request_id":"body-request", "unknown":"PRIVATE-PROSE", "password":"do-not-retain"})
     .to_string()
     .into_bytes();
     let url = serve(
@@ -64,6 +64,7 @@ async fn http_details_and_redaction() {
     }
     assert!(!formatted.contains("PRIVATE-PROSE"));
     assert!(body.contains("PRIVATE-PROSE"));
+    assert!(body.contains("body-request"));
 }
 
 /// Interrupted transfers keep already-received bytes, status, and the transport cause chain.

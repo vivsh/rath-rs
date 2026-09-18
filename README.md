@@ -436,6 +436,12 @@ literals must add `key: None` (or an application key).
 
 ## Error reporting and migration
 
+Since 0.2.8, `RathError` stores its diagnostic details in an internal `Box`, making
+the error value pointer-sized. Keep using `Result<T, RathError>`; callers do not
+need to box it to reduce its size. Constructors, accessors, cause traversal and
+formatting are unchanged. `LlmResponse` remains returned by value. Each error
+level owns one allocation for its details; cloning still copies its snapshot.
+
 `RathError` is now a structured diagnostic with private fields. Import `RathError`,
 `ErrorKind` and `ErrorBody` from `rath` (also available through `core` and `llm`).
 Replace enum-pattern matching with `kind()` and borrowing accessors:

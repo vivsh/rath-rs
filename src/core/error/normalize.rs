@@ -21,39 +21,37 @@ impl RathError {
 
     /// Removes operation-local credentials from all retained diagnostic fields.
     pub(crate) fn sanitized(mut self, secrets: &[&str]) -> Self {
-        self.message = redact::text(&self.message, secrets);
+        self.inner.message = redact::text(&self.inner.message, secrets);
         for value in [
-            &mut self.provider_code,
-            &mut self.request_id,
-            &mut self.retry_after,
+            &mut self.inner.provider_code,
+            &mut self.inner.request_id,
+            &mut self.inner.retry_after,
         ]
         .into_iter()
         .flatten()
         {
             *value = redact::text(value, secrets);
         }
-        if let Some(body) = &mut self.response_body {
+        if let Some(body) = &mut self.inner.response_body {
             match body {
                 ErrorBody::Complete(bytes) | ErrorBody::Incomplete(bytes) => {
                     *bytes = redact::bytes(bytes, secrets)
                 }
             }
         }
-        self.source = self
-            .source
-            .map(|source| Box::new(source.sanitized(secrets)));
+        self.inner.source = self.inner.source.map(|source| source.sanitized(secrets));
         self
     }
 
     /// Retains explicit body bytes and their transfer completeness without formatting them.
     pub(crate) fn with_body(mut self, body: ErrorBody) -> Self {
-        self.response_body = Some(body);
+        self.inner.response_body = Some(body);
         self.sanitized(&[])
     }
 
     /// Attaches a decoded response when no original body is already available.
     pub(crate) fn with_response(mut self, response: &Value) -> Self {
-        if self.response_body.is_none() {
+        if self.inner.response_body.is_none() {
             match serde_json::to_vec(response) {
                 Ok(bytes) => self = self.with_body(ErrorBody::Complete(bytes)),
                 Err(error) => {
@@ -66,7 +64,7 @@ impl RathError {
 
     /// Reclassifies a failure without losing status, body or causes.
     pub(crate) fn classified(mut self, kind: ErrorKind) -> Self {
-        self.kind = kind;
+        self.inner.kind = kind;
         self
     }
 
@@ -99,17 +97,17 @@ pub(super) fn details(error: &mut RathError, value: &Value) {
         .or_else(|| native.get("message").and_then(Value::as_str))
         .or_else(|| native.get("detail").and_then(Value::as_str));
     if let Some(message) = message {
-        error.message = redact::text(message, &[]);
+        error.inner.message = redact::text(message, &[]);
     } else if let Some(messages) = validation_messages(native) {
-        error.message = redact::text(&messages, &[]);
+        error.inner.message = redact::text(&messages, &[]);
     }
-    error.provider_code = native
+    error.inner.provider_code = native
         .get("code")
         .or_else(|| native.get("type"))
         .or_else(|| native.get("status"))
         .and_then(scalar);
-    if error.request_id.is_none() {
-        error.request_id = value
+    if error.inner.request_id.is_none() {
+        error.inner.request_id = value
             .get("request_id")
             .or_else(|| native.get("request_id"))
             .and_then(scalar);
@@ -176,7 +174,7 @@ pub(crate) fn sdk_http(status: u16, body: Option<&str>, secrets: &[&str]) -> Rat
         ErrorKind::Http,
         "request failed; response details available",
     );
-    error.http_status = Some(status);
+    error.inner.http_status = Some(status);
     if let Some(body) = body {
         match serde_json::from_str::<Value>(body) {
             Ok(value) => details(&mut error, &value),

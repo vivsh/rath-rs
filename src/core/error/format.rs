@@ -1,7 +1,7 @@
-use super::RathError;
+use super::{ErrorDetails, RathError};
 use std::fmt;
 
-impl fmt::Display for RathError {
+impl fmt::Display for ErrorDetails {
     /// Formats useful context and distinct cause messages, never response bytes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut seen = Vec::new();
@@ -41,7 +41,7 @@ impl fmt::Display for RathError {
                 seen.push(error.message.as_str());
             }
             written |= distinct || has_context;
-            next = error.source();
+            next = error.source.as_ref().map(|source| source.inner.as_ref());
         }
         Ok(())
     }
@@ -50,16 +50,16 @@ impl fmt::Display for RathError {
 impl fmt::Debug for RathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RathError")
-            .field("kind", &self.kind)
-            .field("provider", &self.provider)
-            .field("operation", &self.operation)
-            .field("message", &self.message)
-            .field("http_status", &self.http_status)
-            .field("provider_code", &self.provider_code)
-            .field("request_id", &self.request_id)
-            .field("retry_after", &self.retry_after)
-            .field("response_body", &self.response_body)
-            .field("source", &self.source)
+            .field("kind", &self.inner.kind)
+            .field("provider", &self.inner.provider)
+            .field("operation", &self.inner.operation)
+            .field("message", &self.inner.message)
+            .field("http_status", &self.inner.http_status)
+            .field("provider_code", &self.inner.provider_code)
+            .field("request_id", &self.inner.request_id)
+            .field("retry_after", &self.inner.retry_after)
+            .field("response_body", &self.inner.response_body)
+            .field("source", &self.inner.source)
             .finish()
     }
 }

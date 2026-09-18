@@ -1,7 +1,7 @@
 //! Shared stateless request/response diagnostics using the adapter's existing HTTP client.
 use super::{ErrorBody, ErrorKind, RathError, normalize::details};
 use crate::core::Provider;
-use reqwest::{RequestBuilder, Response};
+use reqwest::{RequestBuilder, Response, header::HeaderValue};
 use serde_json::Value;
 
 /// Normalizes transport errors without flattening their source chain.
@@ -41,32 +41,37 @@ pub(crate) async fn read(
     operation: &'static str,
     secrets: &[&str],
 ) -> Result<Vec<u8>, RathError> {
-    let mut error = metadata(&response, provider, operation);
     let mut bytes = Vec::new();
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
             Ok(None) => break,
             Err(cause) => {
-                error.kind = if cause.is_timeout() {
-                    ErrorKind::Timeout
-                } else {
-                    ErrorKind::Transport
-                };
-                error.message =
-                    "response transfer failed; incomplete response details available".into();
-                return Err(error
-                    .with_source(RathError::from_error(error_kind(&cause), &cause))
-                    .with_body(ErrorBody::Incomplete(bytes))
-                    .sanitized(secrets));
+                let error = RathError::new(
+                    error_kind(&cause),
+                    "response transfer failed; incomplete response details available",
+                )
+                .with_context(provider, operation)
+                .with_source(RathError::from_error(error_kind(&cause), &cause));
+                return Err(enrich(
+                    error,
+                    metadata(&response),
+                    ErrorBody::Incomplete(bytes),
+                    secrets,
+                ));
             }
         }
     }
     if !response.status().is_success() {
+        let mut error = RathError::new(
+            ErrorKind::Http,
+            "request failed; response details available",
+        )
+        .with_context(provider, operation);
+        let meta = metadata(&response);
+        error.inner.request_id = meta.1.as_ref().map(header_text);
         attach_details(&mut error, &bytes);
-        return Err(error
-            .with_body(ErrorBody::Complete(bytes))
-            .sanitized(secrets));
+        return Err(enrich(error, meta, ErrorBody::Complete(bytes), secrets));
     }
     Ok(bytes)
 }
@@ -79,35 +84,30 @@ pub(crate) async fn read_checked(
     secrets: &[&str],
     validate: impl FnOnce(&[u8]) -> Result<(), RathError>,
 ) -> Result<Vec<u8>, RathError> {
-    let meta = metadata(&response, provider.clone(), operation);
+    let meta = metadata(&response);
     let bytes = read(response, provider, operation, secrets).await?;
     if let Err(error) = validate(&bytes) {
-        return Err(enrich(error, meta, bytes, secrets));
+        return Err(enrich(error, meta, ErrorBody::Complete(bytes), secrets));
     }
     Ok(bytes)
 }
 
-/// Preserves documented request and retry identifiers, excluding unrelated headers.
-fn metadata(response: &Response, provider: Provider, operation: &'static str) -> RathError {
-    let mut error = RathError::new(
-        ErrorKind::Http,
-        "request failed; response details available",
-    )
-    .with_context(provider, operation);
-    error.http_status = Some(response.status().as_u16());
-    for name in [
+/// Borrows/clones only selected headers; no error snapshot is allocated on successful responses.
+fn metadata(response: &Response) -> (u16, Option<HeaderValue>, Option<HeaderValue>) {
+    let request_id = [
         "request-id",
         "x-request-id",
         "x-goog-request-id",
         "x-fal-request-id",
-    ] {
-        if let Some(value) = response.headers().get(name) {
-            error.request_id = Some(header_text(value));
-            break;
-        }
-    }
-    error.retry_after = response.headers().get("retry-after").map(header_text);
-    error
+    ]
+    .into_iter()
+    .find_map(|name| response.headers().get(name))
+    .cloned();
+    (
+        response.status().as_u16(),
+        request_id,
+        response.headers().get("retry-after").cloned(),
+    )
 }
 
 /// Keeps non-text metadata losslessly inspectable using byte escapes rather than dropping it.
@@ -123,10 +123,7 @@ fn attach_details(error: &mut RathError, bytes: &[u8]) {
     match serde_json::from_slice::<Value>(bytes) {
         Ok(value) => details(error, &value),
         Err(cause) => {
-            error.source = Some(Box::new(RathError::from_error(
-                ErrorKind::Deserialize,
-                &cause,
-            )))
+            error.inner.source = Some(RathError::from_error(ErrorKind::Deserialize, &cause))
         }
     }
 }
@@ -168,7 +165,7 @@ pub(crate) async fn mapped_response<T>(
     secrets: &[&str],
     decode: impl FnOnce(Value) -> Result<T, RathError>,
 ) -> Result<T, RathError> {
-    let meta = metadata(&response, provider.clone(), operation);
+    let meta = metadata(&response);
     let bytes = read(response, provider.clone(), operation, secrets).await?;
     let result = serde_json::from_slice::<Value>(&bytes)
         .map_err(|cause| {
@@ -183,20 +180,23 @@ pub(crate) async fn mapped_response<T>(
         enrich(
             error.with_context(provider, operation),
             meta,
-            bytes,
+            ErrorBody::Complete(bytes),
             secrets,
         )
     })
 }
 
 /// Attaches original wire bytes and selected response headers to a decoding/validation error.
-fn enrich(mut error: RathError, meta: RathError, bytes: Vec<u8>, secrets: &[&str]) -> RathError {
-    error.http_status = meta.http_status;
-    if error.request_id.is_none() {
-        error.request_id = meta.request_id;
+fn enrich(
+    mut error: RathError,
+    (status, request_id, retry_after): (u16, Option<HeaderValue>, Option<HeaderValue>),
+    body: ErrorBody,
+    secrets: &[&str],
+) -> RathError {
+    error.inner.http_status = Some(status);
+    if error.inner.request_id.is_none() {
+        error.inner.request_id = request_id.as_ref().map(header_text);
     }
-    error.retry_after = meta.retry_after;
-    error
-        .with_body(ErrorBody::Complete(bytes))
-        .sanitized(secrets)
+    error.inner.retry_after = retry_after.as_ref().map(header_text);
+    error.with_body(body).sanitized(secrets)
 }

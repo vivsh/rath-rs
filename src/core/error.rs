@@ -43,10 +43,17 @@ pub enum ErrorKind {
     Other,
 }
 
-/// An immutable diagnostic snapshot. Response bodies require explicit access.
+/// An owned diagnostic snapshot with pointer-sized storage and explicit body access.
 /// Known credentials must be supplied to adapter normalization before return.
 #[derive(Clone, thiserror::Error)]
+#[error(transparent)]
 pub struct RathError {
+    inner: Box<ErrorDetails>,
+}
+
+/// Owns one diagnostic level; causes carry their own boxed details without another wrapper.
+#[derive(Clone, Debug, thiserror::Error)]
+struct ErrorDetails {
     kind: ErrorKind,
     provider: Option<Provider>,
     operation: Option<&'static str>,
@@ -57,89 +64,92 @@ pub struct RathError {
     retry_after: Option<String>,
     response_body: Option<ErrorBody>,
     #[source]
-    source: Option<Box<RathError>>,
+    source: Option<RathError>,
 }
 
 impl RathError {
     /// Creates a local failure, sanitizing credential fields and URL components.
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
-            kind,
-            provider: None,
-            operation: None,
-            message: redact::text(&message.into(), &[]),
-            http_status: None,
-            provider_code: None,
-            request_id: None,
-            retry_after: None,
-            response_body: None,
-            source: None,
+            inner: Box::new(ErrorDetails {
+                kind,
+                provider: None,
+                operation: None,
+                message: redact::text(&message.into(), &[]),
+                http_status: None,
+                provider_code: None,
+                request_id: None,
+                retry_after: None,
+                response_body: None,
+                source: None,
+            }),
         }
     }
 
     /// Adds operation context. Existing distinct context remains in the cause chain.
     pub fn with_context(mut self, provider: Provider, operation: &'static str) -> Self {
-        if self.operation.is_some()
-            && (self.operation != Some(operation) || self.provider.as_ref() != Some(&provider))
+        if self.inner.operation.is_some()
+            && (self.inner.operation != Some(operation)
+                || self.inner.provider.as_ref() != Some(&provider))
         {
-            return Self::new(self.kind, "operation failed")
+            return Self::new(self.inner.kind, "operation failed")
                 .with_context(provider, operation)
                 .with_source(self);
         }
-        self.provider = Some(provider);
-        self.operation = Some(operation);
+        self.inner.provider = Some(provider);
+        self.inner.operation = Some(operation);
         self
     }
 
     /// Appends a cause without discarding any existing cause chain.
     pub fn with_source(mut self, source: RathError) -> Self {
-        let mut tail = &mut self.source;
+        let mut tail = &mut self.inner.source;
         while let Some(node) = tail {
-            tail = &mut node.source;
+            tail = &mut node.inner.source;
         }
-        *tail = Some(Box::new(source));
+        *tail = Some(source);
         self
     }
 
     /// Returns the stable failure classification.
     pub fn kind(&self) -> ErrorKind {
-        self.kind
+        self.inner.kind
     }
     /// Returns the provider when the failure occurred at a provider boundary.
     pub fn provider(&self) -> Option<&Provider> {
-        self.provider.as_ref()
+        self.inner.provider.as_ref()
     }
     /// Returns the static operation name, excluding caller data.
     pub fn operation(&self) -> Option<&'static str> {
-        self.operation
+        self.inner.operation
     }
     /// Returns this level's useful message, without flattening its causes.
     pub fn message(&self) -> &str {
-        &self.message
+        &self.inner.message
     }
     /// Returns the response status when available.
     pub fn http_status(&self) -> Option<u16> {
-        self.http_status
+        self.inner.http_status
     }
     /// Returns the native provider error code when available.
     pub fn provider_code(&self) -> Option<&str> {
-        self.provider_code.as_deref()
+        self.inner.provider_code.as_deref()
     }
     /// Returns the request identifier when available.
     pub fn request_id(&self) -> Option<&str> {
-        self.request_id.as_deref()
+        self.inner.request_id.as_deref()
     }
     /// Returns the native Retry-After header without interpreting its units.
     pub fn retry_after(&self) -> Option<&str> {
-        self.retry_after.as_deref()
+        self.inner.retry_after.as_deref()
     }
     /// Explicitly accesses response or partial-output bytes, which may contain private content.
     pub fn response_body(&self) -> Option<&ErrorBody> {
-        self.response_body.as_ref()
+        self.inner.response_body.as_ref()
     }
     /// Returns the next normalized cause; also exposed through std::error::Error::source.
     pub fn source(&self) -> Option<&RathError> {
-        self.source.as_deref()
+        self.inner.source.as_ref()
     }
 }
 
