@@ -1,3 +1,4 @@
+use crate::core::error::http;
 mod measurement;
 
 use async_trait::async_trait;
@@ -47,38 +48,58 @@ impl LlmClient for OpenRouterClient {
 
     fn estimate_tokens(&self, messages: &[Message]) -> Result<crate::llm::TokenCount, RathError> {
         self.estimate_request(&self.options, messages)
+            .map_err(|error| {
+                error
+                    .with_context(Provider::OpenRouter, "token estimation")
+                    .sanitized(&[&self.api_key])
+            })
     }
 
     fn estimate_content_tokens(&self, content: &str) -> Result<crate::llm::TokenCount, RathError> {
         self.estimate_request(&LlmOptions::default(), &[Message::user(content)])
+            .map_err(|error| {
+                error
+                    .with_context(Provider::OpenRouter, "token estimation")
+                    .sanitized(&[&self.api_key])
+            })
     }
 
     /// Dispatches a validated request and rejects token-limited output before interpreting it.
     async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
-        crate::llm::counting::validate_options(Provider::OpenRouter, &self.options)?;
-        validate_history(messages)?;
-        validate_tools(Provider::OpenRouter, &self.options.tools)?;
+        crate::llm::counting::validate_options(Provider::OpenRouter, &self.options).map_err(
+            |error| {
+                error
+                    .with_context(Provider::OpenRouter, "generation")
+                    .sanitized(&[&self.api_key])
+            },
+        )?;
+        validate_history(messages).map_err(|error| {
+            error
+                .with_context(Provider::OpenRouter, "generation")
+                .sanitized(&[&self.api_key])
+        })?;
+        validate_tools(Provider::OpenRouter, &self.options.tools).map_err(|error| {
+            error
+                .with_context(Provider::OpenRouter, "generation")
+                .sanitized(&[&self.api_key])
+        })?;
 
         let tools_enabled =
             !self.options.tools.is_empty() && self.options.tool_choice != ToolChoice::Disabled;
         let wants_json_output = self.options.wants_json_output();
         let payload = build_payload(&self.model, &self.options, messages, tools_enabled);
 
-        let response: Value = self
-            .http
-            .post(chat_completions_endpoint(&self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| RathError::Provider(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| RathError::Provider(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| RathError::Provider(e.to_string()))?;
-
-        map_response(response, wants_json_output)
+        http::mapped(
+            self.http
+                .post(chat_completions_endpoint(&self.base_url))
+                .bearer_auth(&self.api_key)
+                .json(&payload),
+            Provider::OpenRouter,
+            "generation",
+            &[&self.api_key],
+            |response| map_response(response, wants_json_output),
+        )
+        .await
     }
 }
 
@@ -89,14 +110,18 @@ fn chat_completions_endpoint(base_url: &str) -> String {
 /// Rejects empty history and a final assistant tool call without subsequent results.
 fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     if messages.is_empty() {
-        return Err(RathError::Validation("messages must not be empty".into()));
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "messages must not be empty",
+        ));
     }
     if matches!(
         messages.last().map(|m| &m.role),
         Some(Role::AssistantToolCalls { .. })
     ) {
-        return Err(RathError::Validation(
-            "history ends with assistant tool calls without tool results".into(),
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "history ends with assistant tool calls without tool results",
         ));
     }
     Ok(())
@@ -272,11 +297,8 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         "object": response.get("object").cloned().unwrap_or(Value::Null),
     }));
     let message = response
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .ok_or(RathError::EmptyResponse)?;
+        .pointer("/choices/0/message")
+        .ok_or_else(|| RathError::invalid("missing choices[0].message", &response))?;
 
     let calls = collect_tool_calls(message)?;
     if !calls.is_empty() {
@@ -298,7 +320,10 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
     let text = message
         .get("content")
         .and_then(Value::as_str)
-        .ok_or(RathError::EmptyResponse)?;
+        .ok_or(RathError::new(
+            crate::core::ErrorKind::InvalidResponse,
+            "missing choices[0].message.content or tool_calls",
+        ))?;
     Ok(LlmResponse::new(
         Provider::OpenRouter,
         LlmOutput::Output(decode_output_text(text, wants_json_output)?),
@@ -317,27 +342,38 @@ fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, RathError> {
         .into_iter()
         .flatten()
     {
-        let id = call
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RathError::Validation("OpenRouter tool call missing id".into()))?;
-        let function = call
-            .get("function")
-            .ok_or_else(|| RathError::Validation("OpenRouter tool call missing function".into()))?;
+        let id = call.get("id").and_then(Value::as_str).ok_or_else(|| {
+            RathError::new(
+                crate::core::ErrorKind::InvalidResponse,
+                "OpenRouter tool call missing id",
+            )
+        })?;
+        let function = call.get("function").ok_or_else(|| {
+            RathError::new(
+                crate::core::ErrorKind::InvalidResponse,
+                "OpenRouter tool call missing function",
+            )
+        })?;
         let name = function
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                RathError::Validation("OpenRouter tool call missing function name".into())
+                RathError::new(
+                    crate::core::ErrorKind::InvalidResponse,
+                    "OpenRouter tool call missing function name",
+                )
             })?;
         let raw_args = function
             .get("arguments")
             .and_then(Value::as_str)
-            .unwrap_or("{}");
-        let args = serde_json::from_str(raw_args).map_err(|e| RathError::Deserialize {
-            source: e,
-            raw: raw_args.to_string(),
-        })?;
+            .ok_or_else(|| {
+                RathError::new(
+                    crate::core::ErrorKind::InvalidResponse,
+                    "function call missing string arguments",
+                )
+            })?;
+        let args =
+            serde_json::from_str(raw_args).map_err(|e| RathError::deserialize(&e, raw_args))?;
         calls.push(ToolCall {
             id: id.to_string(),
             name: name.to_string(),

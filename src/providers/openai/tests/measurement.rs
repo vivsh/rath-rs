@@ -53,7 +53,7 @@ fn cap_and_truncation_are_explicit() {
         let response = json!({"status":"incomplete", "incomplete_details":{"reason":"max_output_tokens"}, "output":output});
         assert!(matches!(
             map_response(response, true),
-            Err(RathError::OutputLimitReached { .. })
+            Err(error) if error.kind() == crate::core::ErrorKind::OutputLimitReached
         ));
     }
 }
@@ -99,9 +99,9 @@ async fn native_count_does_not_fallback() {
         c.base_url = base_url;
         let error = c.count_content_tokens("summary").await.unwrap_err();
         if status == 404 {
-            assert!(matches!(error, RathError::UnsupportedCapability { .. }));
+            assert!(error.kind() == crate::core::ErrorKind::UnsupportedCapability);
         } else {
-            assert!(matches!(error, RathError::Provider(_)));
+            assert!(error.kind() == crate::core::ErrorKind::Http);
         }
         assert!(
             requests
@@ -121,7 +121,7 @@ async fn rejected_cap_is_not_retried() {
     c.base_url = base_url;
     assert!(matches!(
         c.execute(&[Message::user("x")]).await,
-        Err(RathError::Provider(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::Http
     ));
     let request = requests.recv().unwrap();
     assert!(request.starts_with("POST /responses "));
@@ -135,11 +135,11 @@ async fn invalid_execution_cap_never_dispatches() {
     c.options.max_output_tokens = Some(0);
     assert!(matches!(
         c.execute(&[Message::user("x")]).await,
-        Err(RathError::Validation(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::Validation
     ));
     assert!(matches!(
         c.estimate_tokens(&[Message::user("x")]),
-        Err(RathError::Validation(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::Validation
     ));
 }
 
@@ -172,7 +172,7 @@ async fn missing_model_is_not_endpoint_absence() {
     c.base_url = url;
     assert!(matches!(
         c.count_content_tokens("summary").await,
-        Err(RathError::Provider(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::Http
     ));
 }
 

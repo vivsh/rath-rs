@@ -13,7 +13,8 @@ impl GeminiClient {
         let request =
             request::build_request(&self.client, &self.url.model, options, messages, minimal)?
                 .build();
-        let payload = serde_json::to_value(request).map_err(RathError::Serialize)?;
+        let payload = serde_json::to_value(request)
+            .map_err(|error| RathError::from_error(crate::core::ErrorKind::Serialize, &error))?;
         let mut prompt = counting::project(
             &payload,
             &["contents", "systemInstruction", "tools", "toolConfig"],
@@ -56,7 +57,7 @@ impl GeminiClient {
             request::build_request(&self.client, &self.url.model, options, messages, minimal)?
                 .count_tokens()
                 .await
-                .map_err(count_error)?;
+                .map_err(|error| count_error(error, self.url.api_key.as_deref()))?;
         Ok(TokenCount {
             input_tokens: u64::from(result.total_tokens),
             source: TokenCountSource::ProviderReported,
@@ -65,13 +66,14 @@ impl GeminiClient {
 }
 
 /// Distinguishes unavailable counting endpoints from other Gemini provider errors.
-fn count_error(error: gemini_rust::client::Error) -> RathError {
+fn count_error(error: gemini_rust::client::Error, credential: Option<&str>) -> RathError {
     if let gemini_rust::client::Error::BadResponse { code, description } = &error {
         let model_error =
             *code == 404 && description.as_deref().is_some_and(counting::missing_model);
         if matches!(code, 404 | 405 | 501) && !model_error {
-            return counting::unsupported(Provider::Gemini, "provider token counting endpoint");
+            return errors::normalize(&error, "token counting", credential)
+                .classified(crate::core::ErrorKind::UnsupportedCapability);
         }
     }
-    RathError::Provider(format_error_chain(&error))
+    errors::normalize(&error, "token counting", credential)
 }

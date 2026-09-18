@@ -1,3 +1,6 @@
+// Keep the existing generateContent wire contract while using the official SDK.
+#![allow(deprecated)]
+mod errors;
 mod measurement;
 mod request;
 
@@ -21,30 +24,21 @@ use crate::llm::{
     decode_output_text, extract_exit_tool_call, inject_exit_tool, validate_tools,
 };
 
-fn format_error_chain(e: &dyn std::error::Error) -> String {
-    let mut msg = e.to_string();
-    let mut source = e.source();
-    while let Some(cause) = source {
-        msg.push_str(": ");
-        msg.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    msg
-}
-
 /// Constructs the provider client with resolved credentials and endpoint settings.
 fn build_client(url: &ModelUrl) -> Result<Gemini, RathError> {
     if url.base_url.is_some() {
-        return Err(RathError::UnsupportedCapability {
-            provider: Provider::Gemini,
-            capability: "custom endpoint".into(),
-        });
+        return Err(RathError::unsupported(Provider::Gemini, "custom endpoint"));
     }
     let api_key = if let Some(key) = &url.api_key {
         key.clone()
     } else {
-        std::env::var("GEMINI_API_KEY")
-            .map_err(|_| RathError::Provider("GEMINI_API_KEY is not set".into()))?
+        std::env::var("GEMINI_API_KEY").map_err(|error| {
+            RathError::new(
+                crate::core::ErrorKind::Validation,
+                "GEMINI_API_KEY is not set",
+            )
+            .with_source(crate::core::error::credential_cause(&error))
+        })?
     };
     let model_id = if url.model.starts_with("models/") {
         url.model.clone()
@@ -52,7 +46,8 @@ fn build_client(url: &ModelUrl) -> Result<Gemini, RathError> {
         format!("models/{}", url.model)
     };
     let model = GeminiModel::Custom(model_id);
-    Gemini::with_model(&api_key, model).map_err(|e| RathError::Provider(format_error_chain(&e)))
+    Gemini::with_model(&api_key, model)
+        .map_err(|e| errors::normalize(&e, "client construction", Some(&api_key)))
 }
 
 struct GeminiClient {
@@ -252,7 +247,8 @@ fn build_fn_decl(tool: &ToolDefinition) -> Result<FunctionDeclaration, RathError
         "description": tool.description,
         "parameters": sanitized,
     });
-    serde_json::from_value(json).map_err(RathError::Serialize)
+    serde_json::from_value(json)
+        .map_err(|error| RathError::from_error(crate::core::ErrorKind::Serialize, &error))
 }
 
 /// Maps the raw Gemini response into a [`LlmOutput`].
@@ -272,11 +268,7 @@ fn map_response(
     let fcs = response.function_calls_with_thoughts();
     if !fcs.is_empty() {
         let thought_text = response.text();
-        let thought = if thought_text.is_empty() {
-            None
-        } else {
-            Some(thought_text)
-        };
+        let thought = (!thought_text.is_empty()).then_some(thought_text);
         let calls: Vec<ToolCall> = fcs
             .iter()
             .enumerate()
@@ -296,7 +288,10 @@ fn map_response(
     }
     let text = response.text();
     if text.is_empty() {
-        return Err(RathError::EmptyResponse);
+        return Err(RathError::new(
+            crate::core::ErrorKind::InvalidResponse,
+            "missing nonempty candidates[].content.parts[].text or functionCall",
+        ));
     }
     Ok(LlmResponse::new(
         Provider::Gemini,
@@ -329,22 +324,29 @@ fn gemini_safety_settings_from_provider_config(
         return Ok(None);
     };
     let Value::Object(map) = config else {
-        return Err(RathError::Validation(
-            "Gemini provider_config must be a JSON object".into(),
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "Gemini provider_config must be a JSON object",
         ));
     };
 
     if let Some(key) = map.keys().find(|key| key.as_str() != "safetySettings") {
-        return Err(RathError::Validation(format!(
-            "unsupported Gemini provider_config key '{key}'"
-        )));
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            format!("unsupported Gemini provider_config key '{key}'"),
+        ));
     }
 
     map.get("safetySettings")
         .map(|value| {
             serde_json::from_value::<Vec<SafetySetting>>(value.clone()).map_err(|e| {
-                RathError::Validation(format!(
-                    "invalid Gemini provider_config.safetySettings: {e}"
+                RathError::new(
+                    crate::core::ErrorKind::Validation,
+                    "invalid Gemini provider_config.safetySettings",
+                )
+                .with_source(RathError::from_error(
+                    crate::core::ErrorKind::Deserialize,
+                    &e,
                 ))
             })
         })
@@ -363,17 +365,25 @@ impl LlmClient for GeminiClient {
 
     fn estimate_tokens(&self, messages: &[Message]) -> Result<crate::llm::TokenCount, RathError> {
         self.estimate_request(&self.options, messages, false)
+            .map_err(|error| {
+                errors::context(error, "token estimation", self.url.api_key.as_deref())
+            })
     }
 
     async fn count_tokens(
         &self,
         messages: &[Message],
     ) -> Result<crate::llm::TokenCount, RathError> {
-        self.count_request(&self.options, messages, false).await
+        self.count_request(&self.options, messages, false)
+            .await
+            .map_err(|error| errors::context(error, "token counting", self.url.api_key.as_deref()))
     }
 
     fn estimate_content_tokens(&self, content: &str) -> Result<crate::llm::TokenCount, RathError> {
         self.estimate_request(&LlmOptions::default(), &[Message::user(content)], true)
+            .map_err(|error| {
+                errors::context(error, "token estimation", self.url.api_key.as_deref())
+            })
     }
 
     async fn count_content_tokens(
@@ -382,6 +392,7 @@ impl LlmClient for GeminiClient {
     ) -> Result<crate::llm::TokenCount, RathError> {
         self.count_request(&LlmOptions::default(), &[Message::user(content)], true)
             .await
+            .map_err(|error| errors::context(error, "token counting", self.url.api_key.as_deref()))
     }
 
     /// Dispatches a validated request and rejects token-limited output before interpreting it.
@@ -393,11 +404,20 @@ impl LlmClient for GeminiClient {
             &self.options,
             messages,
             false,
-        )?
+        )
+        .map_err(|error| errors::context(error, "generation", self.url.api_key.as_deref()))?
         .execute()
         .await
-        .map_err(|e| RathError::Provider(format_error_chain(&e)))?;
-        let result = map_response(response, wants_json_output)?;
+        .map_err(|e| errors::normalize(&e, "generation", self.url.api_key.as_deref()))?;
+        let raw = serde_json::to_value(&response)
+            .map_err(|e| RathError::from_error(crate::core::ErrorKind::Serialize, &e))?;
+        let result = map_response(response, wants_json_output).map_err(|error| {
+            errors::context(
+                error.with_response(&raw),
+                "generation",
+                self.url.api_key.as_deref(),
+            )
+        })?;
 
         if let Some(ref name) = self.exit_tool_name
             && let LlmOutput::ToolCalls { calls, .. } = &result.output
@@ -440,7 +460,7 @@ impl EmbeddingClient for GeminiClient {
         let response = builder
             .execute()
             .await
-            .map_err(|e| RathError::Provider(format_error_chain(&e)))?;
+            .map_err(|e| errors::normalize(&e, "embeddings", self.url.api_key.as_deref()))?;
         Ok(EmbedResponse {
             values: response.embedding.values,
         })
@@ -491,6 +511,7 @@ pub fn new_embedding_client(
 mod tests;
 
 fn check_generation_limit(response: &GenerationResponse) -> Result<(), RathError> {
-    let raw = serde_json::to_value(response).map_err(RathError::Serialize)?;
+    let raw = serde_json::to_value(response)
+        .map_err(|error| RathError::from_error(crate::core::ErrorKind::Serialize, &error))?;
     crate::llm::counting::check_output_limit(Provider::Gemini, &raw)
 }

@@ -1,3 +1,4 @@
+use crate::core::error::{http, provider_failure};
 mod audio;
 mod queue;
 
@@ -54,14 +55,15 @@ impl FalClient {
         provider_config: Option<Value>,
         capability: &str,
     ) -> Result<Self, RathError> {
-        let api_key = match &url.api_key {
-            Some(key) => key.clone(),
-            None => std::env::var(DEFAULT_API_KEY_ENV).map_err(|_| {
-                RathError::Validation(format!(
+        let api_key =
+            match &url.api_key {
+                Some(key) => key.clone(),
+                None => std::env::var(DEFAULT_API_KEY_ENV).map_err(|error| {
+                    RathError::new(crate::core::ErrorKind::Validation, format!(
                     "set {DEFAULT_API_KEY_ENV} or pass api_key_env for Fal {capability} calls"
-                ))
-            })?,
-        };
+                )).with_source(crate::core::error::credential_cause(&error))
+                })?,
+            };
         let base_url = url
             .base_url
             .clone()
@@ -79,49 +81,75 @@ impl FalClient {
         })
     }
 
-    async fn post(&self, endpoint: &str, payload: Value) -> Result<Value, RathError> {
-        let response = self
-            .http
-            .post(endpoint)
-            .header("Authorization", format!("Key {}", self.api_key))
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| RathError::Provider(e.to_string()))?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| RathError::Provider(e.to_string()))?;
-        if !status.is_success() {
-            return Err(RathError::Provider(format!(
-                "Fal request failed with status {status}: {body}"
-            )));
-        }
-        serde_json::from_str(&body).map_err(|source| RathError::Deserialize { source, raw: body })
+    async fn post<T>(
+        &self,
+        endpoint: &str,
+        payload: Value,
+        operation: &'static str,
+        decode: impl FnOnce(Value) -> Result<T, RathError>,
+    ) -> Result<T, RathError> {
+        http::mapped(
+            self.http
+                .post(endpoint)
+                .header("Authorization", format!("Key {}", self.api_key))
+                .json(&payload),
+            Provider::Fal,
+            operation,
+            &[&self.api_key],
+            decode,
+        )
+        .await
     }
 
-    async fn get(&self, endpoint: &str) -> Result<Value, RathError> {
-        let response = self
-            .http
-            .get(endpoint)
-            .header("Authorization", format!("Key {}", self.api_key))
-            .send()
-            .await
-            .map_err(|e| RathError::Provider(e.to_string()))?;
+    /// Validates GET responses before their original bytes and headers leave the HTTP boundary.
+    async fn get<T>(
+        &self,
+        endpoint: &str,
+        operation: &'static str,
+        decode: impl FnOnce(Value) -> Result<T, RathError>,
+    ) -> Result<T, RathError> {
+        let response = http::send(
+            self.http
+                .get(endpoint)
+                .header("Authorization", format!("Key {}", self.api_key)),
+            Provider::Fal,
+            operation,
+            &[&self.api_key],
+        )
+        .await?;
+        http::mapped_response(response, Provider::Fal, operation, &[&self.api_key], decode).await
+    }
 
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| RathError::Provider(e.to_string()))?;
-        if !status.is_success() {
-            return Err(RathError::Provider(format!(
-                "Fal request failed with status {status}: {body}"
-            )));
-        }
-        serde_json::from_str(&body).map_err(|source| RathError::Deserialize { source, raw: body })
+    /// Preserves get_video's Failed status, but enriches wait_video failures before dropping headers.
+    async fn fetch_video(
+        &self,
+        job_id: &str,
+        fail_on_job_error: bool,
+    ) -> Result<VideoJobStatus, RathError> {
+        let endpoint = build_status_endpoint(&self.queue_base_url, &self.model, job_id);
+        let raw = self
+            .get(&endpoint, "video status", |raw| {
+                if fail_on_job_error && let Some(message) = failed_status_message(&raw) {
+                    return Err(crate::core::error::provider_failure_message(
+                        Provider::Fal,
+                        "video status",
+                        &raw,
+                        &[&self.api_key],
+                        &message,
+                    ));
+                }
+                Ok(raw)
+            })
+            .await?;
+        video_status_from_status(
+            &self.queue_base_url,
+            &self.model,
+            job_id,
+            raw,
+            self,
+            fail_on_job_error,
+        )
+        .await
     }
 }
 
@@ -129,11 +157,25 @@ impl FalClient {
 impl ImageClient for FalClient {
     async fn generate_image(&self, request: &ImageRequest) -> Result<ImageResponse, RathError> {
         let payload = image_payload(&self.model, &self.provider_config, request);
-        let raw = self.post(&self.endpoint, Value::Object(payload)).await?;
-        Ok(ImageResponse {
-            images: extract_images(&raw),
-            raw_metadata: Some(raw),
-        })
+        self.post(
+            &self.endpoint,
+            Value::Object(payload),
+            "image generation",
+            |raw| {
+                let images = extract_images(&raw);
+                if images.is_empty() {
+                    return Err(RathError::invalid(
+                        "missing image(s), image_url or image data",
+                        &raw,
+                    ));
+                }
+                Ok(ImageResponse {
+                    images,
+                    raw_metadata: Some(raw),
+                })
+            },
+        )
+        .await
     }
 }
 
@@ -142,24 +184,37 @@ impl VideoClient for FalClient {
     async fn submit_video(&self, request: &VideoRequest) -> Result<VideoJob, RathError> {
         let payload = video_payload(&self.provider_config, request);
         let endpoint = build_endpoint(&self.queue_base_url, &self.model);
-        let raw = self.post(&endpoint, Value::Object(payload)).await?;
-        video_job_from_submit(&self.model, raw)
+        self.post(&endpoint, Value::Object(payload), "video submit", |raw| {
+            video_job_from_submit(&self.model, raw)
+        })
+        .await
     }
 
     async fn get_video(&self, job_id: &str) -> Result<VideoJobStatus, RathError> {
-        let endpoint = build_status_endpoint(&self.queue_base_url, &self.model, job_id);
-        let raw = self.get(&endpoint).await?;
-        video_status_from_status(&self.queue_base_url, &self.model, job_id, raw, self).await
+        self.fetch_video(job_id, false).await
     }
 
     async fn wait_video(&self, job_id: &str) -> Result<VideoResponse, RathError> {
         loop {
-            match self.get_video(job_id).await? {
+            match self.fetch_video(job_id, true).await? {
                 VideoJobStatus::Queued { .. } | VideoJobStatus::Running { .. } => {
                     tokio::time::sleep(self.poll_interval).await;
                 }
                 VideoJobStatus::Succeeded { response } => return Ok(response),
-                VideoJobStatus::Failed { message, .. } => return Err(RathError::Provider(message)),
+                VideoJobStatus::Failed {
+                    message,
+                    raw_metadata,
+                } => {
+                    let response =
+                        raw_metadata.unwrap_or_else(|| serde_json::json!({"error": &message}));
+                    return Err(crate::core::error::provider_failure_message(
+                        Provider::Fal,
+                        "video wait",
+                        &response,
+                        &[&self.api_key],
+                        &message,
+                    ));
+                }
             }
         }
     }
@@ -301,7 +356,7 @@ fn video_job_from_submit(model: &str, raw: Value) -> Result<VideoJob, RathError>
     let id = raw
         .get("request_id")
         .and_then(Value::as_str)
-        .ok_or_else(|| RathError::Provider("Fal queue submit response missing request_id".into()))?
+        .ok_or_else(|| RathError::invalid("Fal queue submit response missing request_id", &raw))?
         .to_string();
     Ok(VideoJob {
         id,
@@ -323,17 +378,16 @@ fn video_job_from_submit(model: &str, raw: Value) -> Result<VideoJob, RathError>
     })
 }
 
+/// Maps queue lifecycle status while preserving provider failures and required result fields.
 async fn video_status_from_status(
     queue_base_url: &str,
     model: &str,
     job_id: &str,
     raw: Value,
     client: &FalClient,
+    fail_on_job_error: bool,
 ) -> Result<VideoJobStatus, RathError> {
-    let status = raw
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("UNKNOWN");
+    let status = raw["status"].as_str().unwrap_or("UNKNOWN");
     match status {
         "IN_QUEUE" => Ok(VideoJobStatus::Queued {
             queue_position: raw.get("queue_position").and_then(Value::as_u64),
@@ -343,24 +397,30 @@ async fn video_status_from_status(
             raw_metadata: Some(raw),
         }),
         "COMPLETED" => {
-            if let Some(error) = raw.get("error").and_then(Value::as_str) {
-                return Ok(VideoJobStatus::Failed {
-                    message: error.to_string(),
-                    raw_metadata: Some(raw),
-                });
+            if let Some(failure) = video_failure(&raw, client) {
+                return Ok(failure);
             }
             let endpoint = raw
                 .get("response_url")
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| build_response_endpoint(queue_base_url, model, job_id));
-            let response_raw = client.get(&endpoint).await?;
-            Ok(VideoJobStatus::Succeeded {
-                response: VideoResponse {
-                    videos: extract_videos(&response_raw),
-                    raw_metadata: Some(response_raw),
-                },
-            })
+            client
+                .get(&endpoint, "video result", |response_raw| {
+                    if let Some(failure) = video_failure(&response_raw, client) {
+                        if fail_on_job_error {
+                            return Err(provider_failure(
+                                Provider::Fal,
+                                "video result",
+                                &response_raw,
+                                &[&client.api_key],
+                            ));
+                        }
+                        return Ok(failure);
+                    }
+                    completed_video(response_raw, client)
+                })
+                .await
         }
         other => Ok(VideoJobStatus::Failed {
             message: format!("Fal video job returned unknown status '{other}'"),
@@ -369,12 +429,53 @@ async fn video_status_from_status(
     }
 }
 
-#[cfg(test)]
-fn video_status_from_pending(raw: Value) -> VideoJobStatus {
-    let status = raw
+/// Identifies the existing Failed states without changing queue polling or retry decisions.
+fn failed_status_message(raw: &Value) -> Option<String> {
+    match raw
         .get("status")
         .and_then(Value::as_str)
-        .unwrap_or("UNKNOWN");
+        .unwrap_or("UNKNOWN")
+    {
+        "IN_QUEUE" | "IN_PROGRESS" => None,
+        "COMPLETED" => raw
+            .get("error")
+            .filter(|value| !value.is_null())
+            .map(|_| "video job failed; response details available".into()),
+        other => Some(format!("Fal video job returned unknown status '{other}'")),
+    }
+}
+
+/// Validates required video output fields and preserves the full result on failure.
+fn completed_video(response_raw: Value, client: &FalClient) -> Result<VideoJobStatus, RathError> {
+    let videos = extract_videos(&response_raw);
+    if videos.is_empty() {
+        return Err(
+            RathError::invalid("missing video(s), video_url or video data", &response_raw)
+                .with_context(Provider::Fal, "video result")
+                .sanitized(&[&client.api_key]),
+        );
+    }
+    Ok(VideoJobStatus::Succeeded {
+        response: VideoResponse {
+            videos,
+            raw_metadata: Some(response_raw),
+        },
+    })
+}
+
+/// Recognizes failed-job envelopes without treating partial job output as a successful video.
+fn video_failure(raw: &Value, client: &FalClient) -> Option<VideoJobStatus> {
+    raw.get("error").filter(|error| !error.is_null())?;
+    let error = provider_failure(Provider::Fal, "video result", raw, &[&client.api_key]);
+    Some(VideoJobStatus::Failed {
+        message: error.message().to_owned(),
+        raw_metadata: Some(raw.clone()),
+    })
+}
+
+#[cfg(test)]
+fn video_status_from_pending(raw: Value) -> VideoJobStatus {
+    let status = raw["status"].as_str().unwrap_or("UNKNOWN");
     match status {
         "IN_QUEUE" => VideoJobStatus::Queued {
             queue_position: raw.get("queue_position").and_then(Value::as_u64),

@@ -7,7 +7,8 @@ use serde_json::{Map, Value};
 use super::{FalClient, merged_config, queue};
 use crate::audio::stt::{SttClient, SttOptions, SttRequest, SttResponse};
 use crate::audio::tts::{TtsClient, TtsOptions, TtsRequest, TtsResponse};
-use crate::core::{ModelUrl, Provider, RathError};
+use crate::core::error::http;
+use crate::core::{ErrorKind, ModelUrl, Provider, RathError};
 
 const KOKORO: &str = "fal-ai/kokoro/american-english";
 const ELEVENLABS: &str = "fal-ai/elevenlabs/tts/turbo-v2.5";
@@ -41,7 +42,14 @@ fn audio_client(url: &ModelUrl, config: Option<Value>) -> Result<FalClient, Rath
     client.http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|_| queue::failed("HTTP client construction"))?;
+        .map_err(|error| {
+            http::transport(
+                Provider::Fal,
+                "HTTP client construction",
+                error,
+                &[&client.api_key],
+            )
+        })?;
     Ok(client)
 }
 
@@ -52,7 +60,11 @@ impl TtsClient for FalClient {
         let model = request.model.as_deref().unwrap_or(&self.model);
         let payload = tts_payload(model, &self.provider_config, request)?;
         tokio::time::timeout(queue::AUDIO_TIMEOUT, async {
-            let raw = queue::run(self, model, Value::Object(payload)).await?;
+            let raw = queue::run(self, model, Value::Object(payload), |raw| {
+                audio_url(&raw)?;
+                Ok(raw)
+            })
+            .await?;
             let (mime_type, data) = download(self, &raw).await?;
             Ok(TtsResponse {
                 mime_type,
@@ -61,7 +73,14 @@ impl TtsClient for FalClient {
             })
         })
         .await
-        .map_err(|_| queue::failed("timeout (remote job may still run)"))?
+        .map_err(|error| {
+            RathError::new(
+                ErrorKind::Timeout,
+                "audio deadline elapsed; remote job may still run",
+            )
+            .with_context(Provider::Fal, "audio wait")
+            .with_source(RathError::from_error(ErrorKind::Timeout, &error))
+        })?
     }
 }
 
@@ -71,20 +90,29 @@ impl SttClient for FalClient {
     async fn transcribe_audio(&self, request: &SttRequest) -> Result<SttResponse, RathError> {
         let model = request.model.as_deref().unwrap_or(&self.model);
         let payload = stt_payload(model, &self.provider_config, request)?;
-        tokio::time::timeout(queue::AUDIO_TIMEOUT, async {
-            let raw = queue::run(self, model, Value::Object(payload)).await?;
-            let text = raw
-                .get("text")
-                .and_then(Value::as_str)
-                .ok_or_else(|| queue::failed("transcript decoding"))?
-                .to_string();
-            Ok(SttResponse {
-                text,
-                raw_metadata: Some(raw),
-            })
-        })
+        tokio::time::timeout(
+            queue::AUDIO_TIMEOUT,
+            queue::run(self, model, Value::Object(payload), |raw| {
+                let text = raw
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RathError::invalid("missing text (transcript decoding)", &raw))?
+                    .to_string();
+                Ok(SttResponse {
+                    text,
+                    raw_metadata: Some(raw),
+                })
+            }),
+        )
         .await
-        .map_err(|_| queue::failed("timeout (remote job may still run)"))?
+        .map_err(|error| {
+            RathError::new(
+                ErrorKind::Timeout,
+                "audio deadline elapsed; remote job may still run",
+            )
+            .with_context(Provider::Fal, "audio wait")
+            .with_source(RathError::from_error(ErrorKind::Timeout, &error))
+        })?
     }
 }
 
@@ -98,13 +126,15 @@ fn tts_payload(
     validate_config(config)?;
     validate_config(&request.provider_config)?;
     if request.input.trim().is_empty() {
-        return Err(RathError::Validation(
-            "Fal speech input must not be empty".into(),
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "Fal speech input must not be empty",
         ));
     }
     if request.format.is_some() {
-        return Err(RathError::Validation(
-            "this Fal endpoint does not support selecting an audio format".into(),
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "this Fal endpoint does not support selecting an audio format",
         ));
     }
     let mut payload = merged_config(config, &request.provider_config);
@@ -134,10 +164,7 @@ fn validate_stt_model(model: &str) -> Result<(), RathError> {
 
 /// Reports unsupported endpoint selection without echoing caller-controlled text.
 fn unsupported(capability: &str) -> RathError {
-    RathError::UnsupportedCapability {
-        provider: Provider::Fal,
-        capability: format!("{capability} for selected endpoint"),
-    }
+    RathError::unsupported(Provider::Fal, format!("{capability} for selected endpoint"))
 }
 
 /// Encodes bytes in operation-local storage and retains native model configuration.
@@ -150,15 +177,17 @@ fn stt_payload(
     validate_config(config)?;
     validate_config(&request.provider_config)?;
     if request.data.is_empty() {
-        return Err(RathError::Validation(
-            "Fal transcription audio must not be empty".into(),
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "Fal transcription audio must not be empty",
         ));
     }
     let mime = audio_mime(&request.mime_type)
         .filter(|_| !request.mime_type.contains(';'))
         .ok_or_else(|| {
-            RathError::Validation(
-                "Fal transcription requires an audio MIME type without parameters".into(),
+            RathError::new(
+                crate::core::ErrorKind::Validation,
+                "Fal transcription requires an audio MIME type without parameters",
             )
         })?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&request.data);
@@ -173,53 +202,71 @@ fn stt_payload(
 /// Rejects non-object configuration rather than silently discarding it.
 fn validate_config(config: &Option<Value>) -> Result<(), RathError> {
     if config.as_ref().is_some_and(|value| !value.is_object()) {
-        return Err(RathError::Validation(
-            "Fal audio provider_config must be an object".into(),
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "Fal audio provider_config must be an object",
         ));
     }
     Ok(())
 }
 
-/// Downloads output without authorization headers and requires an identifiable audio MIME type.
-async fn download(client: &FalClient, raw: &Value) -> Result<(String, Vec<u8>), RathError> {
+/// Identifies missing output fields without losing the provider response.
+fn audio_url(raw: &Value) -> Result<&str, RathError> {
     let audio = raw
         .get("audio")
-        .ok_or_else(|| queue::failed("audio decoding"))?;
-    let url = audio
+        .ok_or_else(|| RathError::invalid("missing audio", raw))?;
+    audio
         .get("url")
         .and_then(Value::as_str)
-        .ok_or_else(|| queue::failed("audio URL"))?;
-    let response = client
-        .http
-        .get(queue::parse_url(url, "audio URL")?)
-        .send()
-        .await
-        .map_err(|error| queue::transport_error("download", error))?;
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| queue::transport_error("download body", error))?;
-        return Err(RathError::Provider(format!(
-            "Fal audio download failed (HTTP {status}): {body}"
-        )));
-    }
+        .ok_or_else(|| RathError::invalid("missing audio.url (audio URL)", raw))
+}
+
+/// Downloads output without authorization headers and requires an identifiable audio MIME type.
+async fn download(client: &FalClient, raw: &Value) -> Result<(String, Vec<u8>), RathError> {
+    let url = audio_url(raw).map_err(|error| error.sanitized(&[&client.api_key]))?;
+    let response = http::send(
+        client.http.get(
+            queue::parse_url(url, "audio URL")
+                .map_err(|error| error.with_response(raw).sanitized(&[&client.api_key]))?,
+        ),
+        Provider::Fal,
+        "audio download",
+        &[&client.api_key],
+    )
+    .await?;
+
+    let mime_type = response_mime(&response, &raw["audio"]);
+    let mut normalized_mime = String::new();
+    let data = http::read_checked(
+        response,
+        Provider::Fal,
+        "audio download",
+        &[&client.api_key],
+        |data| {
+            normalized_mime = mime_type.map_err(|error| {
+                error.with_source(
+                    RathError::new(ErrorKind::InvalidResponse, "audio result metadata")
+                        .with_response(raw),
+                )
+            })?;
+            if data.is_empty() {
+                return Err(queue::failed("empty audio"));
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    let mime_type = normalized_mime;
+    Ok((mime_type, data))
+}
+
+/// Resolves MIME metadata while the original response headers are still available.
+fn response_mime(response: &reqwest::Response, audio: &Value) -> Result<String, RathError> {
     let header = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
-    let metadata = audio.get("content_type").and_then(Value::as_str);
-    let mime_type = download_mime(header, metadata)?;
-    let data = response
-        .bytes()
-        .await
-        .map_err(|error| queue::transport_error("download body", error))?
-        .to_vec();
-    if data.is_empty() {
-        return Err(queue::failed("empty audio"));
-    }
-    Ok((mime_type, data))
+    download_mime(header, audio.get("content_type").and_then(Value::as_str))
 }
 
 /// Uses metadata only for absent or generic download types, never to disguise non-audio content.
@@ -233,7 +280,11 @@ fn download_mime(header: Option<&str>, metadata: Option<&str>) -> Result<String,
             .next()
             .is_some_and(|h| h.trim().eq_ignore_ascii_case("application/octet-stream"))
         {
-            return Err(queue::failed("audio MIME type"));
+            return Err(RathError::new(
+                ErrorKind::InvalidResponse,
+                format!("invalid audio MIME type: {header}"),
+            )
+            .with_context(Provider::Fal, "audio download"));
         }
     }
     metadata

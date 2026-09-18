@@ -66,11 +66,11 @@ async fn provider_count_is_explicitly_unsupported() {
     let c = client(LlmOptions::default());
     assert!(matches!(
         c.count_tokens(&[Message::user("x")]).await,
-        Err(RathError::UnsupportedCapability { .. })
+        Err(error) if error.kind() == crate::core::ErrorKind::UnsupportedCapability
     ));
     assert!(matches!(
         c.count_content_tokens("x").await,
-        Err(RathError::UnsupportedCapability { .. })
+        Err(error) if error.kind() == crate::core::ErrorKind::UnsupportedCapability
     ));
 }
 
@@ -81,11 +81,11 @@ async fn invalid_execution_cap_never_dispatches() {
     c.options.max_output_tokens = Some(0);
     assert!(matches!(
         c.execute(&[Message::user("x")]).await,
-        Err(RathError::Validation(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::Validation
     ));
     assert!(matches!(
         c.estimate_tokens(&[Message::user("x")]),
-        Err(RathError::Validation(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::Validation
     ));
 }
 
@@ -94,7 +94,7 @@ async fn invalid_execution_cap_never_dispatches() {
 fn limited_output_is_not_success() {
     let response = json!({"choices":[{"finish_reason":"length", "message":{"content":"PRIVATE-CONTENT-729{", "tool_calls":[{"function":{"arguments":"{"}}]}}]});
     let error = map_response(response, true).unwrap_err();
-    assert!(matches!(error, RathError::OutputLimitReached { .. }));
+    assert!(error.kind() == crate::core::ErrorKind::OutputLimitReached);
     assert!(!format!("{error:?} {error}").contains("PRIVATE-CONTENT-729"));
 }
 

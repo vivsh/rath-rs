@@ -1,3 +1,4 @@
+use crate::core::error::http;
 mod measurement;
 
 use std::borrow::Cow;
@@ -30,21 +31,21 @@ struct OllamaClient {
 
 impl OllamaClient {
     /// Sends JSON to the configured endpoint with optional bearer authentication.
-    async fn post_json<T: Serialize + ?Sized>(
+    async fn post_json<T: Serialize + ?Sized, R>(
         &self,
         endpoint: &str,
         payload: &T,
-    ) -> Result<Value, RathError> {
-        with_bearer_auth(self.http.post(endpoint), self.api_key.as_deref())
-            .json(payload)
-            .send()
-            .await
-            .map_err(|e| RathError::Provider(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| RathError::Provider(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| RathError::Provider(e.to_string()))
+        operation: &'static str,
+        decode: impl FnOnce(Value) -> Result<R, RathError>,
+    ) -> Result<R, RathError> {
+        http::mapped(
+            with_bearer_auth(self.http.post(endpoint), self.api_key.as_deref()).json(payload),
+            Provider::Ollama,
+            operation,
+            &self.api_key.as_deref().into_iter().collect::<Vec<_>>(),
+            decode,
+        )
+        .await
     }
 }
 
@@ -103,17 +104,41 @@ impl LlmClient for OllamaClient {
 
     fn estimate_tokens(&self, messages: &[Message]) -> Result<crate::llm::TokenCount, RathError> {
         self.estimate_request(&self.options, messages)
+            .map_err(|error| {
+                error
+                    .with_context(Provider::Ollama, "token estimation")
+                    .sanitized(&self.api_key.as_deref().into_iter().collect::<Vec<_>>())
+            })
     }
 
     fn estimate_content_tokens(&self, content: &str) -> Result<crate::llm::TokenCount, RathError> {
         self.estimate_request(&LlmOptions::default(), &[Message::user(content)])
+            .map_err(|error| {
+                error
+                    .with_context(Provider::Ollama, "token estimation")
+                    .sanitized(&self.api_key.as_deref().into_iter().collect::<Vec<_>>())
+            })
     }
 
     /// Dispatches a validated request and rejects token-limited output before interpreting it.
     async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
-        crate::llm::counting::validate_options(Provider::Ollama, &self.options)?;
-        validate_history(messages)?;
-        validate_tools(Provider::Ollama, &self.options.tools)?;
+        crate::llm::counting::validate_options(Provider::Ollama, &self.options).map_err(
+            |error| {
+                error
+                    .with_context(Provider::Ollama, "generation")
+                    .sanitized(&self.api_key.as_deref().into_iter().collect::<Vec<_>>())
+            },
+        )?;
+        validate_history(messages).map_err(|error| {
+            error
+                .with_context(Provider::Ollama, "generation")
+                .sanitized(&self.api_key.as_deref().into_iter().collect::<Vec<_>>())
+        })?;
+        validate_tools(Provider::Ollama, &self.options.tools).map_err(|error| {
+            error
+                .with_context(Provider::Ollama, "generation")
+                .sanitized(&self.api_key.as_deref().into_iter().collect::<Vec<_>>())
+        })?;
 
         let tools_enabled =
             !self.options.tools.is_empty() && self.options.tool_choice != ToolChoice::Disabled;
@@ -121,8 +146,11 @@ impl LlmClient for OllamaClient {
         let endpoint = chat_completions_endpoint(&self.base_url);
 
         let payload = build_payload(&self.model, &self.options, messages, tools_enabled);
-        let response = self.post_json(&endpoint, &payload).await?;
-        let result = map_response(response, wants_json_output)?;
+        let result = self
+            .post_json(&endpoint, &payload, "generation", |response| {
+                map_response(response, wants_json_output)
+            })
+            .await?;
 
         if let Some(ref name) = self.exit_tool_name
             && let LlmOutput::ToolCalls { calls, .. } = &result.output
@@ -144,14 +172,20 @@ impl EmbeddingClient for OllamaClient {
     async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, RathError> {
         let endpoint = embed_endpoint(&self.base_url);
         let payload = json!({ "model": self.model, "input": request.input });
-        let response = self.post_json(&endpoint, &payload).await?;
-        let values: Vec<f32> = response["embeddings"][0]
-            .as_array()
-            .ok_or_else(|| RathError::Provider("embeddings missing in response".into()))?
-            .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect();
-        Ok(EmbedResponse { values })
+        self.post_json(&endpoint, &payload, "embeddings", |response| {
+            let values: Vec<f32> = response["embeddings"][0]
+                .as_array()
+                .ok_or_else(|| RathError::invalid("missing embeddings[0]", &response))?
+                .iter()
+                .map(|v| {
+                    v.as_f64().map(|v| v as f32).ok_or_else(|| {
+                        RathError::invalid("embedding contains a non-number", &response)
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(EmbedResponse { values })
+        })
+        .await
     }
 }
 
@@ -176,14 +210,18 @@ fn with_bearer_auth(
 /// Rejects empty history and a final assistant tool call without subsequent results.
 fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     if messages.is_empty() {
-        return Err(RathError::Validation("messages must not be empty".into()));
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "messages must not be empty",
+        ));
     }
     if matches!(
         messages.last().map(|m| &m.role),
         Some(Role::AssistantToolCalls { .. })
     ) {
-        return Err(RathError::Validation(
-            "history ends with assistant tool calls without tool results".into(),
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "history ends with assistant tool calls without tool results",
         ));
     }
     Ok(())
@@ -409,11 +447,8 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         "id": response.get("id").cloned().unwrap_or(Value::Null),
     }));
     let message = response
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .ok_or(RathError::EmptyResponse)?;
+        .pointer("/choices/0/message")
+        .ok_or_else(|| RathError::invalid("missing choices[0].message", &response))?;
 
     let calls = collect_tool_calls(message)?;
     if !calls.is_empty() {
@@ -435,7 +470,10 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
     let text = message
         .get("content")
         .and_then(Value::as_str)
-        .ok_or(RathError::EmptyResponse)?;
+        .ok_or(RathError::new(
+            crate::core::ErrorKind::InvalidResponse,
+            "missing choices[0].message.content or tool_calls",
+        ))?;
     let text = strip_thinking(text);
     Ok(LlmResponse::new(
         Provider::Ollama,
@@ -634,27 +672,38 @@ fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, RathError> {
 fn parse_json_tool_calls(items: &[Value]) -> Result<Vec<ToolCall>, RathError> {
     let mut calls = Vec::with_capacity(items.len());
     for item in items {
-        let id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RathError::Validation("Ollama tool call missing id".into()))?;
-        let function = item
-            .get("function")
-            .ok_or_else(|| RathError::Validation("Ollama tool call missing function".into()))?;
+        let id = item.get("id").and_then(Value::as_str).ok_or_else(|| {
+            RathError::new(
+                crate::core::ErrorKind::InvalidResponse,
+                "Ollama tool call missing id",
+            )
+        })?;
+        let function = item.get("function").ok_or_else(|| {
+            RathError::new(
+                crate::core::ErrorKind::InvalidResponse,
+                "Ollama tool call missing function",
+            )
+        })?;
         let name = function
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                RathError::Validation("Ollama tool call missing function name".into())
+                RathError::new(
+                    crate::core::ErrorKind::InvalidResponse,
+                    "Ollama tool call missing function name",
+                )
             })?;
         let raw_args = function
             .get("arguments")
             .and_then(Value::as_str)
-            .unwrap_or("{}");
-        let args = serde_json::from_str(raw_args).map_err(|e| RathError::Deserialize {
-            source: e,
-            raw: raw_args.to_string(),
-        })?;
+            .ok_or_else(|| {
+                RathError::new(
+                    crate::core::ErrorKind::InvalidResponse,
+                    "function call missing string arguments",
+                )
+            })?;
+        let args =
+            serde_json::from_str(raw_args).map_err(|e| RathError::deserialize(&e, raw_args))?;
         calls.push(ToolCall {
             id: id.to_string(),
             name: name.to_string(),

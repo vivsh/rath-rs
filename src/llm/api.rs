@@ -3,7 +3,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use crate::core::{CacheControl, ModelUrl, Provider, RathError, ThinkingLevel, TokenUsage};
+pub use crate::core::{
+    CacheControl, ErrorBody, ErrorKind, ModelUrl, Provider, RathError, ThinkingLevel, TokenUsage,
+};
 
 pub use super::tool::ToolDefinition;
 use super::{TokenCount, counting};
@@ -235,10 +237,16 @@ impl LlmResponse {
 }
 
 pub(crate) fn required_api_key(url: &ModelUrl, default_env: &str) -> Result<String, RathError> {
-    url.api_key
-        .clone()
-        .or_else(|| std::env::var(default_env).ok())
-        .ok_or_else(|| RathError::Provider(format!("{default_env} is not set")))
+    if let Some(key) = &url.api_key {
+        return Ok(key.clone());
+    }
+    std::env::var(default_env).map_err(|error| {
+        RathError::new(
+            ErrorKind::Validation,
+            format!("cannot read credential environment variable {default_env}"),
+        )
+        .with_source(crate::core::error::credential_cause(&error))
+    })
 }
 
 pub(crate) fn optional_api_key(url: &ModelUrl, default_env: &str) -> Option<String> {
@@ -440,19 +448,22 @@ pub(crate) fn validate_tools(
     let mut seen = std::collections::HashSet::new();
     for tool in tools {
         if tool.name.trim().is_empty() {
-            return Err(RathError::Validation("tool name must not be empty".into()));
+            return Err(RathError::new(
+                crate::core::ErrorKind::Validation,
+                "tool name must not be empty",
+            ));
         }
         if !seen.insert(tool.name.as_str()) {
-            return Err(RathError::Validation(format!(
-                "duplicate tool name '{}'",
-                tool.name
-            )));
+            return Err(RathError::new(
+                crate::core::ErrorKind::Validation,
+                format!("duplicate tool name '{}'", tool.name),
+            ));
         }
         if !tool.parameters.is_object() {
-            return Err(RathError::UnsupportedCapability {
+            return Err(RathError::unsupported(
                 provider,
-                capability: format!("tool '{}' has a non-object JSON schema", tool.name),
-            });
+                format!("tool '{}' has a non-object JSON schema", tool.name),
+            ));
         }
     }
     Ok(())
@@ -494,13 +505,7 @@ pub(crate) fn extract_exit_tool_call(calls: &[ToolCall], name: &str) -> Option<V
 
 #[allow(dead_code)]
 pub(crate) fn parse_json_output(text: &str) -> Result<Value, RathError> {
-    serde_json::from_str(text).map_err(|e| {
-        tracing::error!(model_output = %text, parse_error = %e, "LLM output deserialization failed");
-        RathError::Deserialize {
-            source: e,
-            raw: text.to_string(),
-        }
-    })
+    serde_json::from_str(text).map_err(|e| RathError::deserialize(&e, text))
 }
 
 pub(crate) fn decode_output_text(text: &str, wants_json_output: bool) -> Result<Value, RathError> {

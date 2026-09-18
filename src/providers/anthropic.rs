@@ -47,17 +47,33 @@ impl LlmClient for AnthropicClient {
 
     fn estimate_tokens(&self, messages: &[Message]) -> Result<crate::llm::TokenCount, RathError> {
         self.estimate_request(&self.options, messages)
+            .map_err(|error| {
+                error
+                    .with_context(Provider::Anthropic, "token estimation")
+                    .sanitized(&[&self.api_key])
+            })
     }
 
     fn estimate_content_tokens(&self, content: &str) -> Result<crate::llm::TokenCount, RathError> {
         self.estimate_request(&LlmOptions::default(), &[Message::user(content)])
+            .map_err(|error| {
+                error
+                    .with_context(Provider::Anthropic, "token estimation")
+                    .sanitized(&[&self.api_key])
+            })
     }
 
     async fn count_tokens(
         &self,
         messages: &[Message],
     ) -> Result<crate::llm::TokenCount, RathError> {
-        self.count_request(&self.options, messages).await
+        self.count_request(&self.options, messages)
+            .await
+            .map_err(|error| {
+                error
+                    .with_context(Provider::Anthropic, "token counting")
+                    .sanitized(&[&self.api_key])
+            })
     }
 
     async fn count_content_tokens(
@@ -66,113 +82,78 @@ impl LlmClient for AnthropicClient {
     ) -> Result<crate::llm::TokenCount, RathError> {
         self.count_request(&LlmOptions::default(), &[Message::user(content)])
             .await
+            .map_err(|error| {
+                error
+                    .with_context(Provider::Anthropic, "token counting")
+                    .sanitized(&[&self.api_key])
+            })
     }
 
     /// Dispatches a validated request and rejects token-limited output before interpreting it.
     async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
-        crate::llm::counting::validate_options(Provider::Anthropic, &self.options)?;
-        validate_history(messages)?;
-        validate_tools(Provider::Anthropic, &self.options.tools)?;
+        crate::llm::counting::validate_options(Provider::Anthropic, &self.options).map_err(
+            |error| {
+                error
+                    .with_context(Provider::Anthropic, "generation")
+                    .sanitized(&[&self.api_key])
+            },
+        )?;
+        validate_history(messages).map_err(|error| {
+            error
+                .with_context(Provider::Anthropic, "generation")
+                .sanitized(&[&self.api_key])
+        })?;
+        validate_tools(Provider::Anthropic, &self.options.tools).map_err(|error| {
+            error
+                .with_context(Provider::Anthropic, "generation")
+                .sanitized(&[&self.api_key])
+        })?;
 
         if matches!(&self.options.thinking, Some(t) if *t != ThinkingLevel::Off) {
-            return Err(RathError::UnsupportedCapability {
-                provider: Provider::Anthropic,
-                capability: "thinking is not exposed by the Anthropic adapter yet".into(),
-            });
+            return Err(RathError::unsupported(
+                Provider::Anthropic,
+                "thinking is not exposed by the Anthropic adapter yet",
+            ));
         }
 
         let tools_enabled =
             !self.options.tools.is_empty() && self.options.tool_choice != ToolChoice::Disabled;
         let wants_json_output = self.options.wants_json_output();
         let payload = build_payload(&self.model, &self.options, messages, tools_enabled);
-        let response = send_messages_request(
-            &self.http,
-            messages_endpoint(&self.base_url),
-            &self.api_key,
-            &payload,
+        crate::core::error::http::mapped(
+            self.http
+                .post(messages_endpoint(&self.base_url))
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&payload),
+            Provider::Anthropic,
+            "generation",
+            &[&self.api_key],
+            |response| map_response(response, wants_json_output),
         )
-        .await?;
-
-        map_response(response, wants_json_output)
-    }
-}
-
-/// Sends a single Anthropic request without retrying or relaxing its output cap.
-async fn send_messages_request(
-    http: &HttpClient,
-    endpoint: String,
-    api_key: &str,
-    payload: &Value,
-) -> Result<Value, RathError> {
-    let response = http
-        .post(endpoint)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(payload)
-        .send()
         .await
-        .map_err(|e| RathError::Provider(e.to_string()))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| RathError::Provider(e.to_string()))?;
-    if !status.is_success() {
-        return Err(RathError::Provider(format_anthropic_http_error(
-            status.as_u16(),
-            &body,
-        )));
     }
-
-    serde_json::from_str(&body).map_err(|e| RathError::Deserialize {
-        source: e,
-        raw: body,
-    })
 }
 
 fn messages_endpoint(base_url: &str) -> String {
     format!("{}/messages", base_url.trim_end_matches('/'))
 }
 
-/// Formats the structured Anthropic error when present, otherwise retains the error body.
-fn format_anthropic_http_error(status: u16, body: &str) -> String {
-    let response: Value = match serde_json::from_str(body) {
-        Ok(value) => value,
-        Err(_) => {
-            let trimmed = body.trim();
-            if trimmed.is_empty() {
-                return format!("Anthropic API request failed with HTTP {status}");
-            }
-            return format!("Anthropic API request failed with HTTP {status}: {trimmed}");
-        }
-    };
-
-    let error = response.get("error").unwrap_or(&response);
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown Anthropic error");
-    let error_type = error.get("type").and_then(Value::as_str);
-    match error_type {
-        Some(error_type) => {
-            format!("Anthropic API request failed with HTTP {status} ({error_type}): {message}")
-        }
-        None => format!("Anthropic API request failed with HTTP {status}: {message}"),
-    }
-}
-
 /// Rejects empty history and a final assistant tool call without subsequent results.
 fn validate_history(messages: &[Message]) -> Result<(), RathError> {
     if messages.is_empty() {
-        return Err(RathError::Validation("messages must not be empty".into()));
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "messages must not be empty",
+        ));
     }
     if matches!(
         messages.last().map(|m| &m.role),
         Some(Role::AssistantToolCalls { .. })
     ) {
-        return Err(RathError::Validation(
-            "history ends with assistant tool calls without tool results".into(),
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "history ends with assistant tool calls without tool results",
         ));
     }
     Ok(())
@@ -369,7 +350,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         "stop_reason": response.get("stop_reason").cloned().unwrap_or(Value::Null),
     }));
 
-    let (text, calls) = collect_content(&response);
+    let (text, calls) = collect_content(&response)?;
     if !calls.is_empty() {
         return Ok(LlmResponse::new(
             Provider::Anthropic,
@@ -382,7 +363,10 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         .with_provider_model(provider_model)
         .with_raw_metadata(metadata));
     }
-    let text = text.ok_or(RathError::EmptyResponse)?;
+    let text = text.ok_or(RathError::new(
+        crate::core::ErrorKind::InvalidResponse,
+        "missing content[].text or content[].tool_use",
+    ))?;
     Ok(LlmResponse::new(
         Provider::Anthropic,
         LlmOutput::Output(decode_output_text(&text, wants_json_output)?),
@@ -393,7 +377,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
 }
 
 /// Collects provider text and function calls from returned content blocks.
-fn collect_content(response: &Value) -> (Option<String>, Vec<ToolCall>) {
+fn collect_content(response: &Value) -> Result<(Option<String>, Vec<ToolCall>), RathError> {
     let mut text = String::new();
     let mut calls = Vec::new();
     for part in response
@@ -409,22 +393,27 @@ fn collect_content(response: &Value) -> (Option<String>, Vec<ToolCall>) {
                 }
             }
             Some("tool_use") => {
-                if let (Some(id), Some(name)) = (
-                    part.get("id").and_then(Value::as_str),
-                    part.get("name").and_then(Value::as_str),
-                ) {
-                    calls.push(ToolCall {
-                        id: id.to_string(),
-                        name: name.to_string(),
-                        args: part.get("input").cloned().unwrap_or_else(|| json!({})),
-                        thought_signatures: None,
-                    });
-                }
+                let id = part
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RathError::invalid("content[].tool_use missing id", response))?;
+                let name = part.get("name").and_then(Value::as_str).ok_or_else(|| {
+                    RathError::invalid("content[].tool_use missing name", response)
+                })?;
+                let args = part.get("input").ok_or_else(|| {
+                    RathError::invalid("content[].tool_use missing input", response)
+                })?;
+                calls.push(ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    args: args.clone(),
+                    thought_signatures: None,
+                });
             }
             _ => {}
         }
     }
-    ((!text.is_empty()).then_some(text), calls)
+    Ok(((!text.is_empty()).then_some(text), calls))
 }
 
 /// Extracts provider-reported input/output usage when present.

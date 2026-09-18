@@ -35,7 +35,7 @@ fn constructors_validate_caps_before_credentials_or_dispatch() {
                 .with_provider_config(json!({"max_tokens":20})),
         ] {
             assert!(
-                matches!(client(provider, options), Err(RathError::Validation(_))),
+                matches!(client(provider, options), Err(error) if error.kind() == crate::core::ErrorKind::Validation),
                 "{provider}"
             );
         }

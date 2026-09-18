@@ -39,6 +39,7 @@ impl AnthropicClient {
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .json(&body),
+            &[&self.api_key],
         )
         .await
     }

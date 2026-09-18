@@ -3,10 +3,7 @@ use crate::llm::{Attachment, LlmOptions, Message, Provider, RathError, Role, val
 use serde_json::{Map, Value};
 
 pub(crate) fn unsupported(provider: Provider, capability: &str) -> RathError {
-    RathError::UnsupportedCapability {
-        provider,
-        capability: capability.into(),
-    }
+    RathError::unsupported(provider, capability)
 }
 
 /// Ensures measurement never silently drops unsupported input components.
@@ -24,8 +21,9 @@ pub(crate) fn validate_measurement(
             Some(Role::AssistantToolCalls { .. })
         )
     {
-        return Err(RathError::Validation(
-            "measurement requires nonempty history with resolved final tool calls".into(),
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "measurement requires nonempty history with resolved final tool calls",
         ));
     }
     for message in messages {
@@ -75,42 +73,30 @@ pub(crate) fn project(payload: &Value, fields: &[&str]) -> Value {
 pub(crate) async fn count_response(
     provider: Provider,
     request: reqwest::RequestBuilder,
+    secrets: &[&str],
 ) -> Result<TokenCount, RathError> {
-    let response = request
-        .send()
-        .await
-        .map_err(|e| RathError::Provider(e.to_string()))?;
-    if matches!(response.status().as_u16(), 404 | 405 | 501) {
-        let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| RathError::Provider(e.to_string()))?;
-        if status == 404 && missing_model(&body) {
-            return Err(RathError::Provider(
-                "token counting returned HTTP 404 for the selected model".into(),
-            ));
+    let result =
+        crate::core::error::http::mapped(request, provider, "token counting", secrets, |value| {
+            let input_tokens = value
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| RathError::invalid("missing valid input_tokens", &value))?;
+            Ok(TokenCount {
+                input_tokens,
+                source: TokenCountSource::ProviderReported,
+            })
+        })
+        .await;
+    result.map_err(|error| {
+        let missing_model = error.http_status() == Some(404)
+            && error
+                .response_body()
+                .is_some_and(|body| missing_model(&String::from_utf8_lossy(body.bytes())));
+        if matches!(error.http_status(), Some(404 | 405 | 501)) && !missing_model {
+            error.classified(crate::core::ErrorKind::UnsupportedCapability)
+        } else {
+            error
         }
-        return Err(unsupported(provider, "provider token counting endpoint"));
-    }
-    let response = response
-        .error_for_status()
-        .map_err(|e| RathError::Provider(e.to_string()))?;
-    let value: Value = response
-        .json()
-        .await
-        .map_err(|e| RathError::TokenCounting {
-            message: e.to_string(),
-        })?;
-    let input_tokens = value
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| RathError::TokenCounting {
-            message: "provider omitted a valid input_tokens count".into(),
-        })?;
-    Ok(TokenCount {
-        input_tokens,
-        source: TokenCountSource::ProviderReported,
     })
 }
 

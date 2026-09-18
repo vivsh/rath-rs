@@ -13,21 +13,30 @@ fn custom_base_url_builds_anthropic_messages_endpoint() {
 /// Anthropic HTTP errors keep the API's structured message and type.
 #[test]
 fn formats_structured_http_errors() {
-    let msg = format_anthropic_http_error(
+    let error = crate::core::error::sdk_http(
         404,
-        r#"{"type":"error","error":{"type":"not_found_error","message":"model claude-3-5-haiku-latest not found"}}"#,
+        Some(
+            r#"{"type":"error","error":{"type":"not_found_error","message":"model claude-3-5-haiku-latest not found"}}"#,
+        ),
+        &[],
     );
+    let msg = error.to_string();
     assert!(msg.contains("HTTP 404"));
     assert!(msg.contains("not_found_error"));
     assert!(msg.contains("model claude-3-5-haiku-latest not found"));
 }
 
-/// Anthropic HTTP errors fall back to the raw body when it is not valid JSON.
+/// Anthropic HTTP errors retain the raw body explicitly when it is not valid JSON.
 #[test]
 fn formats_unstructured_http_errors() {
-    let msg = format_anthropic_http_error(500, "upstream unavailable");
+    let error = crate::core::error::sdk_http(500, Some("upstream unavailable"), &[]);
+    let msg = error.to_string();
     assert!(msg.contains("HTTP 500"));
-    assert!(msg.contains("upstream unavailable"));
+    assert!(!msg.contains("upstream unavailable"));
+    assert_eq!(
+        error.response_body().unwrap().bytes(),
+        b"upstream unavailable"
+    );
 }
 
 /// Verifies messages encode tool exchange.

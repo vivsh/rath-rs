@@ -18,11 +18,9 @@ pub(crate) fn create_llm_client(
         Provider::OpenRouter => openrouter::new_client(url, options),
         Provider::Anthropic => anthropic::new_client(url, options),
         Provider::Ollama => ollama::new_client(url, options),
-        Provider::Fal => Err(RathError::UnsupportedCapability {
-            provider: url.provider.clone(),
-            capability: "llm".to_string(),
-        }),
+        Provider::Fal => Err(RathError::unsupported(url.provider.clone(), "llm")),
     }
+    .map_err(|error| construction_error(error, url))
 }
 
 /// Selects a supported embedding adapter or returns an unsupported capability error.
@@ -34,11 +32,9 @@ pub(crate) fn create_embedding_client(
         Provider::Gemini => gemini::new_embedding_client(url, options),
         Provider::OpenAi => openai::new_embedding_client(url, options),
         Provider::Ollama => ollama::new_embedding_client(url, options),
-        _ => Err(RathError::UnsupportedCapability {
-            provider: url.provider.clone(),
-            capability: "embeddings".to_string(),
-        }),
+        _ => Err(RathError::unsupported(url.provider.clone(), "embeddings")),
     }
+    .map_err(|error| construction_error(error, url))
 }
 
 /// Selects a supported image adapter or returns an unsupported capability error.
@@ -48,11 +44,9 @@ pub(crate) fn create_image_client(
 ) -> Result<Box<dyn ImageClient>, RathError> {
     match url.provider {
         Provider::Fal => fal::new_image_client(url, options),
-        _ => Err(RathError::UnsupportedCapability {
-            provider: url.provider.clone(),
-            capability: "image".to_string(),
-        }),
+        _ => Err(RathError::unsupported(url.provider.clone(), "image")),
     }
+    .map_err(|error| construction_error(error, url))
 }
 
 /// Selects a supported speech synthesis adapter or returns an unsupported capability error.
@@ -63,11 +57,12 @@ pub(crate) fn create_tts_client(
     match url.provider {
         Provider::OpenAi => openai::new_tts_client(url, options),
         Provider::Fal => fal::new_tts_client(url, options),
-        _ => Err(RathError::UnsupportedCapability {
-            provider: url.provider.clone(),
-            capability: "text-to-speech".to_string(),
-        }),
+        _ => Err(RathError::unsupported(
+            url.provider.clone(),
+            "text-to-speech",
+        )),
     }
+    .map_err(|error| construction_error(error, url))
 }
 
 /// Selects a supported speech transcription adapter or returns an unsupported capability error.
@@ -78,11 +73,12 @@ pub(crate) fn create_stt_client(
     match url.provider {
         Provider::OpenAi => openai::new_stt_client(url, options),
         Provider::Fal => fal::new_stt_client(url, options),
-        _ => Err(RathError::UnsupportedCapability {
-            provider: url.provider.clone(),
-            capability: "speech-to-text".to_string(),
-        }),
+        _ => Err(RathError::unsupported(
+            url.provider.clone(),
+            "speech-to-text",
+        )),
     }
+    .map_err(|error| construction_error(error, url))
 }
 
 /// Selects a supported video adapter or returns an unsupported capability error.
@@ -92,9 +88,29 @@ pub(crate) fn create_video_client(
 ) -> Result<Box<dyn VideoClient>, RathError> {
     match url.provider {
         Provider::Fal => fal::new_video_client(url, options),
-        _ => Err(RathError::UnsupportedCapability {
-            provider: url.provider.clone(),
-            capability: "video".to_string(),
-        }),
+        _ => Err(RathError::unsupported(url.provider.clone(), "video")),
     }
+    .map_err(|error| construction_error(error, url))
+}
+
+/// Adds construction context and sanitizes operation-local credentials at the common factory boundary.
+fn construction_error(error: RathError, url: &ModelUrl) -> RathError {
+    let env = match url.provider {
+        Provider::Gemini => "GEMINI_API_KEY",
+        Provider::OpenAi => "OPENAI_API_KEY",
+        Provider::OpenRouter => "OPENROUTER_API_KEY",
+        Provider::Anthropic => "ANTHROPIC_API_KEY",
+        Provider::Ollama => "OLLAMA_API_KEY",
+        Provider::Fal => "FAL_KEY",
+    };
+    let fallback = std::env::var(env).ok();
+    let secrets: Vec<_> = url
+        .api_key
+        .as_deref()
+        .or(fallback.as_deref())
+        .into_iter()
+        .collect();
+    error
+        .with_context(url.provider.clone(), "client construction")
+        .sanitized(&secrets)
 }

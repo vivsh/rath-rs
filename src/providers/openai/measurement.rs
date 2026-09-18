@@ -45,6 +45,7 @@ impl OpenAiClient {
                 ))
                 .bearer_auth(&self.api_key)
                 .json(&body),
+            &[&self.api_key],
         )
         .await
     }

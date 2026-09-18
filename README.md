@@ -246,11 +246,11 @@ endpoints do not expose format selection, so leave `format` unset.
 The default queue is `https://queue.fal.run`; a custom `base_url` is used as the
 queue base without rerouting to Fal. Status/result URLs must share that origin.
 Audio downloads never receive the API key. Redirects are rejected, so custom
-services must provide direct queue and download URLs. Fal HTTP errors retain status
-and original response bodies; failed jobs retain the returned error, and JSON decoding
-errors retain the original body. These errors and `raw_metadata` can contain private
-content: restrict diagnostic access and do not expose them directly to HTTP clients.
-Transport errors omit request URLs, and authorization headers are never added to errors.
+services must provide direct queue and download URLs. Fal failures use Rath's shared
+error contract: useful provider messages and status remain visible, while sanitized
+response bytes require explicit access through `response_body()`. Failed jobs retain
+their message and metadata. These diagnostics and `raw_metadata` can contain private
+content; they are not automatically suitable for public HTTP responses.
 
 ## LLM Usage
 
@@ -395,16 +395,16 @@ typed field is absent or contains the same value. Schema properties with those
 names are not treated as configuration. Rejected caps are never dropped or retried.
 
 When the provider reports token-limit termination, Rath returns
-`RathError::OutputLimitReached { provider, response }` before parsing JSON or
-exposing tool calls. Partial output is not successful structured output. The raw
-response remains explicitly accessible, while ordinary `Display`, `Debug` and
-tracing of the error omit it. Applications must avoid explicitly logging the
-`response` field if it contains private content.
+an error with `kind() == ErrorKind::OutputLimitReached` before parsing generated JSON
+or exposing tool calls. Partial output is not successful structured output. The
+sanitized response remains explicitly accessible through `response_body()`, while
+ordinary `Display`, `Debug` and tracing of Rath errors omit body contents.
 
-Existing custom `LlmClient` implementations keep compiling: the new measurement
-methods default to unsupported. Exhaustive `LlmOptions` literals must add
-`max_output_tokens: None` or use `..Default::default()`; exhaustive `RathError`
-matches must handle the new variants. `LlmResponse` and `TokenUsage` are unchanged.
+Measurement methods still default to unsupported for custom `LlmClient` implementations.
+Exhaustive `LlmOptions` literals must add `max_output_tokens: None` or use
+`..Default::default()`. The structured error redesign is a breaking API change;
+custom error construction and enum matches must migrate as described below.
+`LlmResponse` and `TokenUsage` are unchanged.
 
 For an offline comparison against sourced documentation examples, run
 `cargo test reports_published_count_comparison -- --nocapture`. Each fixture records
@@ -432,3 +432,101 @@ Keys are application metadata. Provider adapters omit them from generation and
 counting requests, so they consume no prompt tokens. They are separate from the
 tool-call IDs used to correlate calls and results. Exhaustive Rust `Message`
 literals must add `key: None` (or an application key).
+
+
+## Error reporting and migration
+
+`RathError` is now a structured diagnostic with private fields. Import `RathError`,
+`ErrorKind` and `ErrorBody` from `rath` (also available through `core` and `llm`).
+Replace enum-pattern matching with `kind()` and borrowing accessors:
+
+```rust
+use rath::{ErrorKind, RathError};
+
+fn inspect(error: &RathError) {
+    eprintln!("{error}"); // Context, provider message and distinct causes; never the body.
+    if error.kind() == ErrorKind::OutputLimitReached {
+        // Partial output is diagnostic data, never a successful result or tool call.
+        if let Some(body) = error.response_body() {
+            let bytes: &[u8] = body.bytes();
+            let complete = body.is_complete();
+            // Inspect bytes explicitly in an access-controlled diagnostic workflow.
+            // `complete` describes the transfer, not whether generation finished.
+            let _ = (bytes, complete);
+        }
+    }
+    let _metadata = (
+        error.provider(), error.operation(), error.http_status(),
+        error.provider_code(), error.request_id(), error.retry_after(),
+    );
+    let mut level = Some(error);
+    while let Some(cause) = level {
+        // Each message is separate; std::error::Error::source() also traverses this chain.
+        let _message = cause.message();
+        level = cause.source();
+    }
+}
+```
+
+`ErrorKind` classifies validation, invalid URLs, unsupported capabilities, transport,
+timeout, HTTP rejection, provider-reported failure, serialization/deserialization,
+invalid responses, output limits, token counting and otherwise unclassified causes.
+Network counting failures retain their HTTP/transport classification; endpoint absence
+uses `UnsupportedCapability` without discarding evidence. Model-not-found remains a
+provider HTTP failure rather than an unsupported endpoint. Do not parse display text
+to make retry decisions; Rath does not add retries or fallbacks because of diagnostics.
+
+`ErrorBody::Complete(Vec<u8>)` retains a complete response (or serialized SDK output).
+`Incomplete(Vec<u8>)` retains bytes received before a failed transfer. Neither is
+implicitly decoded to UTF-8. Old `Deserialize { raw, source }` access becomes
+`response_body()` and `source()`. Old `OutputLimitReached { provider, response }`
+access becomes `provider()` and `response_body()`; explicitly deserialize its bytes
+if the provider response is JSON. Native SDK/HTTP error downcasts are replaced by a
+stable chain of Rath errors. Body bytes reflect credential sanitization, and metadata
+unavailable at a provider/SDK boundary is represented by `None`.
+
+Custom clients create errors with the same contract:
+
+```rust
+use rath::{ErrorKind, Provider, RathError};
+
+let error = RathError::new(ErrorKind::Transport, "request dispatch failed")
+    .with_context(Provider::OpenAi, "generation")
+    .with_source(RathError::new(ErrorKind::Other, "connection refused"));
+assert_eq!(error.source().unwrap().message(), "connection refused");
+```
+
+`with_context` fills missing context; different existing operation context is retained
+as a cause rather than overwritten. `with_source` appends without dropping an existing
+chain. `Display` includes distinct messages in cause order; `Debug` includes metadata
+and body presence/completeness but never body contents. Rath no longer automatically
+logs raw model output on structured-output parse failures.
+
+Built-in adapters remove known credentials, common URL/JSON-escaped credential forms,
+authorization/cookie/secret fields and URL user information, query values and fragments
+before returning diagnostics. Replacements use `[REDACTED]`; remaining body bytes are
+not intentionally truncated. This is deterministic protection for known credentials
+and credential-bearing locations, not a detector of arbitrary private prose or unknown
+secrets. Provider messages can quote user content and remain visible. Custom clients
+must avoid passing credential values in arbitrary message text; `new` sanitizes known
+credential locations but cannot know a custom client's credentials.
+
+### Gemini SDK boundary
+
+Rath uses the official `gemini-rust` 2.1.0 release with its existing `generateContent`
+API. Rath retains everything that boundary exposes, but it cannot recover response
+headers, unknown decoded JSON fields or original bytes discarded by the SDK. HTTP
+failures expose status and an optional UTF-8 description; failed body reads and
+incomplete bytes are discarded internally, and text decoding can replace invalid
+UTF-8. Successful-response JSON decode failures expose causes without the raw body.
+Partial generation output is serialized from the SDK's typed response, not the
+original wire bytes.
+
+The SDK's `check_response` has tracing `err` instrumentation which can log its raw
+HTTP error description before Rath sanitizes it; request spans can also include URLs.
+Rath does not install global logging filters or modify the SDK. Therefore Rath's safe
+error-formatting guarantee does not cover the SDK's own logging. For default Gemini
+credentials Rath uses the current environment value when normalizing errors; if the
+environment changes after construction, the SDK does not expose its previously used
+credential for Rath to redact. Explicit `api_key_env` resolution stays available in
+the existing model URL. No extra credential copy is retained for diagnostics.

@@ -94,44 +94,39 @@ impl ModelUrl {
     /// unset `api_key_env` variable.
     pub fn parse(s: &str) -> Result<Self, RathError> {
         if s.contains('#') {
-            return Err(RathError::InvalidUrl(
-                "URL must not contain a fragment".into(),
+            return Err(RathError::new(
+                crate::core::ErrorKind::InvalidUrl,
+                "URL must not contain a fragment",
             ));
         }
-
         let (scheme_part, rest) = s.split_once("://").ok_or_else(|| {
-            RathError::InvalidUrl(format!(
-                "missing '://' in '{s}'; expected e.g. gemini:///model-name"
-            ))
+            RathError::new(
+                crate::core::ErrorKind::InvalidUrl,
+                format!("missing '://' in '{s}'; expected e.g. gemini:///model-name"),
+            )
         })?;
-
         // Reject inline credentials (user:pass@host) by checking the authority
         let authority_candidate = rest.split('/').next().unwrap_or("");
         if authority_candidate.contains('@') {
-            return Err(RathError::InvalidUrl(
-                "inline credentials are not allowed; use the api_key_env query parameter".into(),
+            return Err(RathError::new(
+                crate::core::ErrorKind::InvalidUrl,
+                "inline credentials are not allowed; use the api_key_env query parameter",
             ));
         }
-
         let provider = parse_provider_scheme(scheme_part, s)?;
-
         let (path_authority, query_str) = match rest.split_once('?') {
             Some((p, q)) => (p, Some(q)),
             None => (rest, None),
         };
-
         let segments = parse_model_path(path_authority, s)?;
-
         if segments.is_empty() {
-            return Err(RathError::InvalidUrl(format!(
-                "'{s}' must contain a model name as the final path segment"
-            )));
+            return Err(RathError::new(
+                crate::core::ErrorKind::InvalidUrl,
+                format!("'{s}' must contain a model name as the final path segment"),
+            ));
         }
-
         let model = segments.join("/");
-
         let (temperature, thinking, api_key, cache, base_url) = parse_query_str(query_str, s)?;
-
         Ok(ModelUrl {
             provider,
             model,
@@ -172,9 +167,12 @@ impl ModelUrl {
 
 fn parse_provider_scheme(scheme: &str, original: &str) -> Result<Provider, RathError> {
     if scheme.contains('+') {
-        return Err(RathError::InvalidUrl(format!(
-            "custom transports are not supported in '{original}'; use provider:///model?base_url=https://host/path"
-        )));
+        return Err(RathError::new(
+            crate::core::ErrorKind::InvalidUrl,
+            format!(
+                "custom transports are not supported in '{original}'; use provider:///model?base_url=https://host/path"
+            ),
+        ));
     }
 
     let provider = match scheme {
@@ -185,9 +183,12 @@ fn parse_provider_scheme(scheme: &str, original: &str) -> Result<Provider, RathE
         "anthropic" | "claude" => Provider::Anthropic,
         "ollama" => Provider::Ollama,
         other => {
-            return Err(RathError::InvalidUrl(format!(
-                "unknown provider '{other}' in '{original}'; expected gemini, openai, openrouter, fal, anthropic, claude, or ollama"
-            )));
+            return Err(RathError::new(
+                crate::core::ErrorKind::InvalidUrl,
+                format!(
+                    "unknown provider '{other}' in '{original}'; expected gemini, openai, openrouter, fal, anthropic, claude, or ollama"
+                ),
+            ));
         }
     };
 
@@ -205,14 +206,20 @@ fn parse_model_path(path_authority: &str, original: &str) -> Result<Vec<String>,
     }
 
     if path_authority.is_empty() {
-        return Err(RathError::InvalidUrl(format!(
-            "empty authority in '{original}'; use e.g. gemini:///model for no custom endpoint"
-        )));
+        return Err(RathError::new(
+            crate::core::ErrorKind::InvalidUrl,
+            format!(
+                "empty authority in '{original}'; use e.g. gemini:///model for no custom endpoint"
+            ),
+        ));
     }
 
-    Err(RathError::InvalidUrl(format!(
-        "non-empty authority is not supported in '{original}'; put the provider-native model id after /// and use base_url for custom endpoints"
-    )))
+    Err(RathError::new(
+        crate::core::ErrorKind::InvalidUrl,
+        format!(
+            "non-empty authority is not supported in '{original}'; put the provider-native model id after /// and use base_url for custom endpoints"
+        ),
+    ))
 }
 
 type ParsedQuery = (
@@ -223,313 +230,109 @@ type ParsedQuery = (
     Option<String>,
 );
 
+/// Validates query options and resolves credentials into operation-local parsing state.
 fn parse_query_str(query_str: Option<&str>, original: &str) -> Result<ParsedQuery, RathError> {
     let Some(query) = query_str else {
         return Ok((None, None, None, None, None));
     };
-
-    let mut temperature: Option<f32> = None;
-    let mut thinking: Option<ThinkingLevel> = None;
-    let mut api_key: Option<String> = None;
-    let mut cache: Option<CacheControl> = None;
-    let mut base_url: Option<String> = None;
-    let mut seen: HashSet<String> = HashSet::new();
-
+    let (mut temperature, mut thinking, mut api_key, mut cache, mut base_url) =
+        (None, None, None, None, None);
+    let mut seen = HashSet::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
-        let (key, value) = pair.split_once('=').ok_or_else(|| {
-            RathError::InvalidUrl(format!(
-                "query parameter '{pair}' in '{original}' must be key=value"
-            ))
-        })?;
-
-        if value.is_empty() {
-            return Err(RathError::InvalidUrl(format!(
-                "query parameter '{key}' must not be empty in '{original}'"
-            )));
-        }
-
-        if !seen.insert(key.to_string()) {
-            return Err(RathError::InvalidUrl(format!(
+        let (key, value) = parse_pair(pair, original)?;
+        if !seen.insert(key) {
+            return Err(invalid_url(format!(
                 "duplicate query parameter '{key}' in '{original}'"
             )));
         }
-
         match key {
-            "temperature" => {
-                let t: f32 = value.parse().map_err(|_| {
-                    RathError::InvalidUrl(format!(
-                        "temperature must be a number in '{original}', got '{value}'"
-                    ))
-                })?;
-                if !(0.0..=1.0).contains(&t) {
-                    return Err(RathError::InvalidUrl(format!(
-                        "temperature must be 0.0–1.0, got {t} in '{original}'"
-                    )));
-                }
-                temperature = Some(t);
-            }
+            "temperature" => temperature = Some(parse_temperature(value, original)?),
             "thinking" => {
-                let level = ThinkingLevel::from_str(value).map_err(|_| {
-                    RathError::InvalidUrl(format!(
+                thinking = Some(ThinkingLevel::from_str(value).map_err(|_| {
+                    invalid_url(format!(
                         "thinking must be off/low/medium/high/xhigh in '{original}', got '{value}'"
                     ))
-                })?;
-                thinking = Some(level);
+                })?)
             }
             "api_key_env" => {
-                let resolved = std::env::var(value).map_err(|_| {
-                    RathError::InvalidUrl(format!(
+                api_key = Some(std::env::var(value).map_err(|error| {
+                    invalid_url(format!(
                         "environment variable '{value}' referenced by api_key_env is not set"
                     ))
-                })?;
-                api_key = Some(resolved);
+                    .with_source(crate::core::error::credential_cause(&error))
+                })?)
             }
-            "cache" => {
-                cache = Some(match value {
-                    "5m" => CacheControl::Ephemeral5m,
-                    "1h" => CacheControl::Ephemeral1h,
-                    other => {
-                        return Err(RathError::InvalidUrl(format!(
-                            "cache must be 5m or 1h in '{original}', got '{other}'"
-                        )));
-                    }
-                });
-            }
-            "base_url" => {
-                if !(value.starts_with("https://") || value.starts_with("http://")) {
-                    return Err(RathError::InvalidUrl(format!(
-                        "base_url must start with http:// or https:// in '{original}'"
-                    )));
-                }
-                if value.contains('#') {
-                    return Err(RathError::InvalidUrl(format!(
-                        "base_url must not contain a fragment in '{original}'"
-                    )));
-                }
-                base_url = Some(value.trim_end_matches('/').to_string());
-            }
+            "cache" => cache = Some(parse_cache(value, original)?),
+            "base_url" => base_url = Some(parse_base_url(value, original)?),
             other => {
-                return Err(RathError::InvalidUrl(format!(
+                return Err(invalid_url(format!(
                     "unknown query parameter '{other}' in '{original}'; supported: temperature, thinking, api_key_env, cache, base_url"
                 )));
             }
         }
     }
-
     Ok((temperature, thinking, api_key, cache, base_url))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Parses a minimal gemini URL with empty authority; base_url is None.
-    #[test]
-    fn parse_gemini_empty_authority() {
-        let url = ModelUrl::parse("gemini:///gemini-2.5-flash-lite").unwrap();
-        assert_eq!(url.provider, Provider::Gemini);
-        assert_eq!(url.model, "gemini-2.5-flash-lite");
-        assert!(url.base_url.is_none());
-        assert!(url.api_key.is_none());
-        assert!(url.temperature.is_none());
-        assert!(url.thinking.is_none());
+/// Checks the syntax of one query pair without discarding the offending location.
+fn parse_pair<'a>(pair: &'a str, original: &str) -> Result<(&'a str, &'a str), RathError> {
+    let (key, value) = pair.split_once('=').ok_or_else(|| {
+        invalid_url(format!(
+            "query parameter '{pair}' in '{original}' must be key=value"
+        ))
+    })?;
+    if value.is_empty() {
+        return Err(invalid_url(format!(
+            "query parameter '{key}' must not be empty in '{original}'"
+        )));
     }
+    Ok((key, value))
+}
 
-    /// Custom endpoints use base_url instead of authority.
-    #[test]
-    fn parse_ollama_with_base_url() {
-        let url = ModelUrl::parse("ollama:///qwen3:8b?base_url=http://localhost:11434").unwrap();
-        assert_eq!(url.provider, Provider::Ollama);
-        assert_eq!(url.model, "qwen3:8b");
-        assert_eq!(url.base_url.as_deref(), Some("http://localhost:11434"));
-        assert!(url.api_key.is_none());
+/// Keeps numeric parsing causes separate from the model-URL context.
+fn parse_temperature(value: &str, original: &str) -> Result<f32, RathError> {
+    let temperature = value.parse::<f32>().map_err(|error| {
+        invalid_url(format!(
+            "temperature must be a number in '{original}', got '{value}'"
+        ))
+        .with_source(RathError::from_error(crate::core::ErrorKind::Other, &error))
+    })?;
+    if !(0.0..=1.0).contains(&temperature) {
+        return Err(invalid_url(format!(
+            "temperature must be 0.0–1.0, got {temperature} in '{original}'"
+        )));
     }
+    Ok(temperature)
+}
 
-    /// Slash-containing model identifiers are preserved for every provider.
-    #[test]
-    fn parse_openai_preserves_slash_model_id() {
-        let url =
-            ModelUrl::parse("openai:///models/gpt-4o?base_url=https://api.example.com/v1").unwrap();
-        assert_eq!(url.provider, Provider::OpenAi);
-        assert_eq!(url.model, "models/gpt-4o");
-        assert_eq!(url.base_url.as_deref(), Some("https://api.example.com/v1"));
-    }
-
-    #[test]
-    fn parse_openrouter_preserves_prefixed_model_slug() {
-        let url = ModelUrl::parse("openrouter:///openai/gpt-5.2").unwrap();
-        assert_eq!(url.provider, Provider::OpenRouter);
-        assert_eq!(url.model, "openai/gpt-5.2");
-        assert!(url.base_url.is_none());
-    }
-
-    #[test]
-    fn parse_fal_preserves_model_path() {
-        let url = ModelUrl::parse("fal:///fal-ai/flux/schnell").unwrap();
-        assert_eq!(url.provider, Provider::Fal);
-        assert_eq!(url.model, "fal-ai/flux/schnell");
-        assert!(url.base_url.is_none());
-    }
-
-    /// Temperature and thinking are extracted from query params.
-    #[test]
-    fn parse_query_params() {
-        let url =
-            ModelUrl::parse("gemini:///gemini-2.5-flash?temperature=0.7&thinking=medium").unwrap();
-        assert_eq!(url.temperature, Some(0.7));
-        assert_eq!(url.thinking, Some(ThinkingLevel::Medium));
-    }
-
-    /// api_key_env is resolved from the environment at parse time.
-    #[test]
-    fn parse_api_key_env() {
-        let expected = std::env::var("PATH").unwrap();
-        let url = ModelUrl::parse("openai:///gpt-4o?api_key_env=PATH").unwrap();
-        assert_eq!(url.api_key.as_deref(), Some(expected.as_str()));
-    }
-
-    /// anthropic and claude schemes both map to Provider::Anthropic.
-    #[test]
-    fn parse_anthropic_aliases() {
-        let a = ModelUrl::parse("anthropic:///claude-sonnet-4-5").unwrap();
-        let b = ModelUrl::parse("claude:///claude-sonnet-4-5").unwrap();
-        assert_eq!(a.provider, Provider::Anthropic);
-        assert_eq!(b.provider, Provider::Anthropic);
-    }
-
-    /// Explicit custom transport syntax is rejected; use base_url instead.
-    #[test]
-    fn reject_explicit_transport() {
-        assert!(matches!(
-            ModelUrl::parse("ollama+https:///llama3"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// Non-empty authority is rejected to avoid host/path/model ambiguity.
-    #[test]
-    fn reject_non_empty_authority() {
-        assert!(matches!(
-            ModelUrl::parse("ollama://localhost:11434/qwen3:8b"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// Inline credentials are rejected.
-    #[test]
-    fn reject_inline_credentials() {
-        assert!(matches!(
-            ModelUrl::parse("gemini://mykey@gemini-2.5-flash"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// Fragment is rejected.
-    #[test]
-    fn reject_fragment() {
-        assert!(matches!(
-            ModelUrl::parse("gemini:///model#section"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// base_url is supported for custom provider endpoints.
-    #[test]
-    fn parse_base_url_query_param() {
-        let url = ModelUrl::parse("openai:///gpt-4o?base_url=https://api.example.com/v1/").unwrap();
-        assert_eq!(url.base_url.as_deref(), Some("https://api.example.com/v1"));
-    }
-
-    /// Unknown query parameters are rejected.
-    #[test]
-    fn reject_unknown_query_param() {
-        assert!(matches!(
-            ModelUrl::parse("openai:///gpt-4o?unknown=value"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// Duplicate query parameters are rejected.
-    #[test]
-    fn reject_duplicate_query_param() {
-        assert!(matches!(
-            ModelUrl::parse("gemini:///model?temperature=0.5&temperature=0.7"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// Temperature outside [0.0, 1.0] is rejected.
-    #[test]
-    fn reject_temperature_out_of_range() {
-        assert!(matches!(
-            ModelUrl::parse("gemini:///model?temperature=1.5"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// Unknown provider scheme is rejected.
-    #[test]
-    fn reject_unknown_provider() {
-        assert!(matches!(
-            ModelUrl::parse("unknown:///model"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// Missing model name (empty path) is rejected.
-    #[test]
-    fn reject_missing_model() {
-        assert!(matches!(
-            ModelUrl::parse("gemini:///"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// Missing '://' is rejected.
-    #[test]
-    fn reject_missing_scheme_separator() {
-        assert!(matches!(
-            ModelUrl::parse("gemini-2.5-flash-lite"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// Unset api_key_env variable is rejected at parse time.
-    #[test]
-    fn reject_missing_api_key_env() {
-        assert!(matches!(
-            ModelUrl::parse("openai:///gpt-4o?api_key_env=__PRAVAH_MISSING_ENV__"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// cache=5m parses to Ephemeral5m.
-    #[test]
-    fn parse_cache_5m() {
-        let url = ModelUrl::parse("anthropic:///claude-sonnet-4-5?cache=5m").unwrap();
-        assert_eq!(url.cache, Some(CacheControl::Ephemeral5m));
-    }
-
-    /// cache=1h parses to Ephemeral1h.
-    #[test]
-    fn parse_cache_1h() {
-        let url = ModelUrl::parse("anthropic:///claude-sonnet-4-5?cache=1h").unwrap();
-        assert_eq!(url.cache, Some(CacheControl::Ephemeral1h));
-    }
-
-    /// Unknown cache value is rejected.
-    #[test]
-    fn reject_unknown_cache_value() {
-        assert!(matches!(
-            ModelUrl::parse("anthropic:///claude-sonnet-4-5?cache=30s"),
-            Err(RathError::InvalidUrl(_))
-        ));
-    }
-
-    /// Absent cache param leaves cache as None.
-    #[test]
-    fn no_cache_param_is_none() {
-        let url = ModelUrl::parse("anthropic:///claude-sonnet-4-5").unwrap();
-        assert_eq!(url.cache, None);
+fn parse_cache(value: &str, original: &str) -> Result<CacheControl, RathError> {
+    match value {
+        "5m" => Ok(CacheControl::Ephemeral5m),
+        "1h" => Ok(CacheControl::Ephemeral1h),
+        other => Err(invalid_url(format!(
+            "cache must be 5m or 1h in '{original}', got '{other}'"
+        ))),
     }
 }
+
+/// Validates a deployment URL without retaining credential-bearing URL components in errors.
+fn parse_base_url(value: &str, original: &str) -> Result<String, RathError> {
+    if !(value.starts_with("https://") || value.starts_with("http://")) {
+        return Err(invalid_url(format!(
+            "base_url must start with http:// or https:// in '{original}'"
+        )));
+    }
+    if value.contains('#') {
+        return Err(invalid_url(format!(
+            "base_url must not contain a fragment in '{original}'"
+        )));
+    }
+    Ok(value.trim_end_matches('/').to_owned())
+}
+
+fn invalid_url(message: String) -> RathError {
+    RathError::new(crate::core::ErrorKind::InvalidUrl, message)
+}
+
+#[cfg(test)]
+mod tests;

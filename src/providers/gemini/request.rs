@@ -92,8 +92,9 @@ fn validate_request(options: &LlmOptions, messages: &[Message]) -> Result<(), Ra
             Some(Role::AssistantToolCalls { .. })
         )
     {
-        return Err(RathError::Validation(
-            "messages must be nonempty and end without unresolved tool calls".into(),
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "messages must be nonempty and end without unresolved tool calls",
         ));
     }
     Ok(())

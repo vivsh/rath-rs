@@ -122,7 +122,7 @@ fn validate_tools_rejects_bad_definitions() {
     }];
     assert!(matches!(
         validate_tools(Provider::OpenAi, &non_object),
-        Err(RathError::UnsupportedCapability { .. })
+        Err(error) if error.kind() == crate::core::ErrorKind::UnsupportedCapability
     ));
 
     let duplicate = vec![
@@ -139,7 +139,7 @@ fn validate_tools_rejects_bad_definitions() {
     ];
     assert!(matches!(
         validate_tools(Provider::OpenAi, &duplicate),
-        Err(RathError::Validation(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::Validation
     ));
 }
 
@@ -148,7 +148,7 @@ fn validate_tools_rejects_bad_definitions() {
 fn parse_unknown_scheme_errors() {
     assert!(matches!(
         ModelUrl::parse("unknown:///model"),
-        Err(RathError::InvalidUrl(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::InvalidUrl
     ));
 }
 
@@ -157,7 +157,7 @@ fn parse_unknown_scheme_errors() {
 fn parse_missing_api_key_env_errors() {
     assert!(matches!(
         ModelUrl::parse("openai:///gpt-4o?api_key_env=__PRAVAH_MISSING_ENV__"),
-        Err(RathError::InvalidUrl(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::InvalidUrl
     ));
 }
 
@@ -166,7 +166,7 @@ fn parse_missing_api_key_env_errors() {
 fn parse_missing_scheme_errors() {
     assert!(matches!(
         ModelUrl::parse("gemini-2.5-flash-lite"),
-        Err(RathError::InvalidUrl(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::InvalidUrl
     ));
 }
 
@@ -278,18 +278,18 @@ async fn custom_client_defaults_are_unsupported() {
     let c = DummyClient::new();
     assert!(matches!(
         c.estimate_tokens(&[Message::user("x")]),
-        Err(RathError::UnsupportedCapability { .. })
+        Err(error) if error.kind() == crate::core::ErrorKind::UnsupportedCapability
     ));
     assert!(matches!(
         c.estimate_content_tokens("x"),
-        Err(RathError::UnsupportedCapability { .. })
+        Err(error) if error.kind() == crate::core::ErrorKind::UnsupportedCapability
     ));
     assert!(matches!(
         c.count_tokens(&[Message::user("x")]).await,
-        Err(RathError::UnsupportedCapability { .. })
+        Err(error) if error.kind() == crate::core::ErrorKind::UnsupportedCapability
     ));
     assert!(matches!(
         c.count_content_tokens("x").await,
-        Err(RathError::UnsupportedCapability { .. })
+        Err(error) if error.kind() == crate::core::ErrorKind::UnsupportedCapability
     ));
 }

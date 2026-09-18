@@ -6,8 +6,9 @@ pub(crate) fn validate_options(provider: Provider, options: &LlmOptions) -> Resu
     if let Some(cap) = options.max_output_tokens
         && (cap == 0 || (provider == Provider::Gemini && cap > i32::MAX as u32))
     {
-        return Err(RathError::Validation(
-            "max_output_tokens is zero or outside the provider's representable range".into(),
+        return Err(RathError::new(
+            crate::core::ErrorKind::Validation,
+            "max_output_tokens is zero or outside the provider's representable range",
         ));
     }
     let Some(config) = &options.provider_config else {
@@ -24,10 +25,13 @@ pub(crate) fn validate_options(provider: Provider, options: &LlmOptions) -> Resu
         "/options/num_predict",
     ] {
         if config.pointer(path).is_some() {
-            return Err(RathError::Validation(format!(
-                "provider_config{} is reserved; use typed max_output_tokens",
-                path.replace('/', ".")
-            )));
+            return Err(RathError::new(
+                crate::core::ErrorKind::Validation,
+                format!(
+                    "provider_config{} is reserved; use typed max_output_tokens",
+                    path.replace('/', ".")
+                ),
+            ));
         }
     }
     Ok(())
@@ -62,10 +66,12 @@ pub(crate) fn check_output_limit(provider: Provider, response: &Value) -> Result
         _ => false,
     };
     if limited {
-        return Err(RathError::OutputLimitReached {
-            provider,
-            response: response.clone(),
-        });
+        return Err(RathError::new(
+            crate::core::ErrorKind::OutputLimitReached,
+            "generation reached the output token limit",
+        )
+        .with_context(provider, "generation")
+        .with_response(response));
     }
     Ok(())
 }

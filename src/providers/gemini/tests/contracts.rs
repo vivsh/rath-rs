@@ -240,6 +240,6 @@ fn provider_config_rejects_malformed_safety_settings() {
     let error = gemini_safety_settings_from_provider_config(&config)
         .expect_err("invalid safety settings should fail before request execution");
 
-    assert!(matches!(error, RathError::Validation(_)));
+    assert!(error.kind() == crate::core::ErrorKind::Validation);
     assert!(error.to_string().contains("provider_config.safetySettings"));
 }

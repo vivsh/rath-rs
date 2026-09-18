@@ -126,7 +126,8 @@ async fn audio_deadline_stops_polling_without_resubmitting() {
     tokio::time::pause();
     tokio::time::advance(queue::AUDIO_TIMEOUT + Duration::from_secs(1)).await;
     let error = task.await.unwrap().unwrap_err();
-    assert!(error.to_string().contains("timeout"));
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(error.source().is_some());
     assert_eq!(wires.iter().filter(|r| r.starts_with("POST")).count(), 1);
 }
 
@@ -141,7 +142,7 @@ async fn queue_urls_cannot_redirect_credentials() {
         let (base, requests) = serve(vec![reply(json!({
             "status_url":url, "response_url":"BASE/result"
         }))]);
-        let error = queue::run(&client(base, WIZPER), WIZPER, json!({}))
+        let error = queue::run(&client(base, WIZPER), WIZPER, json!({}), Ok)
             .await
             .unwrap_err();
         assert!(!format!("{error} {error:?}").contains("SECRET"));
@@ -158,10 +159,13 @@ async fn submission_failures_are_preserved_and_not_retried() {
             "application/json",
             "DISTINCTIVE_SECRET".into(),
         )]);
-        let error = queue::run(&client(base, WIZPER), WIZPER, json!({}))
+        let error = queue::run(&client(base, WIZPER), WIZPER, json!({}), Ok)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("DISTINCTIVE_SECRET"));
+        assert!(
+            String::from_utf8_lossy(error.response_body().unwrap().bytes())
+                .contains("DISTINCTIVE_SECRET")
+        );
         assert!(!error.to_string().contains("secret-key"));
         assert_eq!(requests.try_iter().count(), 1);
     }
@@ -179,7 +183,7 @@ async fn failed_queue_status_does_not_fetch_result() {
             reply(json!({"status_url":"BASE/status", "response_url":"BASE/result"})),
             reply(status),
         ]);
-        let error = queue::run(&client(base, WIZPER), WIZPER, json!({}))
+        let error = queue::run(&client(base, WIZPER), WIZPER, json!({}), Ok)
             .await
             .unwrap_err();
         assert_eq!(error.to_string().contains("DISTINCTIVE_SECRET"), has_error);
@@ -196,11 +200,12 @@ async fn completed_result_preserves_original_error() {
         reply(json!({"status":"COMPLETED"})),
         reply(json!({"error":detail})),
     ]);
-    let error = queue::run(&client(base, ELEVENLABS), ELEVENLABS, json!({}))
+    let error = queue::run(&client(base, ELEVENLABS), ELEVENLABS, json!({}), Ok)
         .await
         .unwrap_err();
     let rendered = error.to_string();
-    assert!(rendered.contains(&detail.to_string()));
+    assert!(rendered.contains("Synthetic voice is unavailable"));
+    assert_eq!(error.provider_code(), Some("invalid_voice"));
     assert!(!rendered.contains("secret-key"));
     assert_eq!(requests.try_iter().count(), 3);
 }
@@ -222,7 +227,12 @@ async fn rejects_failed_or_non_audio_downloads() {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.to_string().contains("SECRET"), status == 403);
+        assert!(!error.to_string().contains("SECRET"));
+        if status == 403 {
+            assert!(
+                String::from_utf8_lossy(error.response_body().unwrap().bytes()).contains("SECRET")
+            );
+        }
         assert!(!error.to_string().contains("token=SECRET"));
         let wires: Vec<_> = requests.try_iter().collect();
         assert_eq!(wires.len(), 1);

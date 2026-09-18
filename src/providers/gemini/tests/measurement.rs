@@ -84,7 +84,7 @@ fn truncation_precedes_parsing() {
     let response: GenerationResponse = serde_json::from_value(json!({"candidates":[{"finishReason":"MAX_TOKENS","content":{"role":"model","parts":[{"text":"{"}]}}]})).unwrap();
     assert!(matches!(
         map_response(response, true),
-        Err(RathError::OutputLimitReached { .. })
+        Err(error) if error.kind() == crate::core::ErrorKind::OutputLimitReached
     ));
 }
 
@@ -95,11 +95,11 @@ async fn invalid_execution_cap_never_dispatches() {
     c.options.max_output_tokens = Some(0);
     assert!(matches!(
         c.execute(&[Message::user("x")]).await,
-        Err(RathError::Validation(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::Validation
     ));
     assert!(matches!(
         c.estimate_tokens(&[Message::user("x")]),
-        Err(RathError::Validation(_))
+        Err(error) if error.kind() == crate::core::ErrorKind::Validation
     ));
 }
 
@@ -167,9 +167,9 @@ async fn native_count_failure_is_explicit() {
             .unwrap();
         let error = c.count_content_tokens("summary").await.unwrap_err();
         if status == 404 {
-            assert!(matches!(error, RathError::UnsupportedCapability { .. }));
+            assert!(error.kind() == crate::core::ErrorKind::UnsupportedCapability);
         } else {
-            assert!(matches!(error, RathError::Provider(_)));
+            assert!(error.kind() == crate::core::ErrorKind::Http);
         }
         assert!(
             rx.recv()
