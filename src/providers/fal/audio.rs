@@ -194,9 +194,16 @@ async fn download(client: &FalClient, raw: &Value) -> Result<(String, Vec<u8>), 
         .get(queue::parse_url(url, "audio URL")?)
         .send()
         .await
-        .map_err(|_| queue::failed("download"))?;
+        .map_err(|error| queue::transport_error("download", error))?;
     if !response.status().is_success() {
-        return Err(queue::failed("download HTTP status"));
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| queue::transport_error("download body", error))?;
+        return Err(RathError::Provider(format!(
+            "Fal audio download failed (HTTP {status}): {body}"
+        )));
     }
     let header = response
         .headers()
@@ -207,7 +214,7 @@ async fn download(client: &FalClient, raw: &Value) -> Result<(String, Vec<u8>), 
     let data = response
         .bytes()
         .await
-        .map_err(|_| queue::failed("download body"))?
+        .map_err(|error| queue::transport_error("download body", error))?
         .to_vec();
     if data.is_empty() {
         return Err(queue::failed("empty audio"));

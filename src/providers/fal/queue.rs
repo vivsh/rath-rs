@@ -26,11 +26,17 @@ pub(super) async fn run(
             Some("IN_QUEUE" | "IN_PROGRESS") => tokio::time::sleep(client.poll_interval).await,
             Some("COMPLETED") => {
                 if status.get("error").is_some_and(|error| !error.is_null()) {
-                    return Err(failed("execution"));
+                    return Err(RathError::Provider(format!(
+                        "Fal audio execution failed: {}",
+                        status["error"]
+                    )));
                 }
                 let result = json(client.http.get(response_url), client, "result").await?;
                 if result.get("error").is_some_and(|error| !error.is_null()) {
-                    return Err(failed("execution"));
+                    return Err(RathError::Provider(format!(
+                        "Fal audio execution failed: {}",
+                        result["error"]
+                    )));
                 }
                 return Ok(result);
             }
@@ -66,7 +72,7 @@ pub(super) fn parse_url(value: &str, stage: &str) -> Result<Url, RathError> {
     Ok(url)
 }
 
-/// Reads queue JSON without exposing provider bodies, credentials or signed URLs in errors.
+/// Preserve Fal HTTP/decoding failures for callers; response details may contain private data.
 async fn json(
     request: reqwest::RequestBuilder,
     client: &FalClient,
@@ -76,14 +82,24 @@ async fn json(
         .header("Authorization", format!("Key {}", client.api_key))
         .send()
         .await
-        .map_err(|_| failed(stage))?;
-    if !response.status().is_success() {
+        .map_err(|error| transport_error(stage, error))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| transport_error(stage, error))?;
+    if !status.is_success() {
         return Err(RathError::Provider(format!(
-            "Fal audio {stage} failed (HTTP {})",
-            response.status().as_u16()
+            "Fal audio {stage} failed (HTTP {}): {body}",
+            status.as_u16()
         )));
     }
-    response.json().await.map_err(|_| failed(stage))
+    serde_json::from_str(&body).map_err(|source| RathError::Deserialize { source, raw: body })
+}
+
+/// Keep transport details without embedding potentially signed request URLs.
+pub(super) fn transport_error(stage: &str, error: reqwest::Error) -> RathError {
+    RathError::Provider(format!("Fal audio {stage} failed: {}", error.without_url()))
 }
 
 /// Produces a diagnostic containing only a static operation stage.

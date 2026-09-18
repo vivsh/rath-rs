@@ -151,7 +151,7 @@ async fn queue_urls_cannot_redirect_credentials() {
 
 /// Rejects redirects, authentication, validation, rate limits and malformed JSON without resubmission.
 #[tokio::test]
-async fn submission_failures_are_redacted_and_not_retried() {
+async fn submission_failures_are_preserved_and_not_retried() {
     for status in [302, 401, 422, 429, 500, 200] {
         let (base, requests) = serve(vec![(
             status,
@@ -161,7 +161,8 @@ async fn submission_failures_are_redacted_and_not_retried() {
         let error = queue::run(&client(base, WIZPER), WIZPER, json!({}))
             .await
             .unwrap_err();
-        assert!(!format!("{error} {error:?}").contains("DISTINCTIVE_SECRET"));
+        assert!(error.to_string().contains("DISTINCTIVE_SECRET"));
+        assert!(!error.to_string().contains("secret-key"));
         assert_eq!(requests.try_iter().count(), 1);
     }
 }
@@ -173,6 +174,7 @@ async fn failed_queue_status_does_not_fetch_result() {
         json!({"status":"COMPLETED", "error":"DISTINCTIVE_SECRET"}),
         json!({"status":"ALIEN"}),
     ] {
+        let has_error = status.get("error").is_some();
         let (base, requests) = serve(vec![
             reply(json!({"status_url":"BASE/status", "response_url":"BASE/result"})),
             reply(status),
@@ -180,9 +182,27 @@ async fn failed_queue_status_does_not_fetch_result() {
         let error = queue::run(&client(base, WIZPER), WIZPER, json!({}))
             .await
             .unwrap_err();
-        assert!(!format!("{error:?}").contains("DISTINCTIVE_SECRET"));
+        assert_eq!(error.to_string().contains("DISTINCTIVE_SECRET"), has_error);
         assert_eq!(requests.try_iter().count(), 2);
     }
+}
+
+/// Completed queue results preserve structured provider errors and never start an audio download.
+#[tokio::test]
+async fn completed_result_preserves_original_error() {
+    let detail = json!({"code":"invalid_voice", "message":"Synthetic voice is unavailable"});
+    let (base, requests) = serve(vec![
+        reply(json!({"status_url":"BASE/status", "response_url":"BASE/result"})),
+        reply(json!({"status":"COMPLETED"})),
+        reply(json!({"error":detail})),
+    ]);
+    let error = queue::run(&client(base, ELEVENLABS), ELEVENLABS, json!({}))
+        .await
+        .unwrap_err();
+    let rendered = error.to_string();
+    assert!(rendered.contains(&detail.to_string()));
+    assert!(!rendered.contains("secret-key"));
+    assert_eq!(requests.try_iter().count(), 3);
 }
 
 /// Output download failures and HTML bodies cannot masquerade as successful generated audio.
@@ -202,7 +222,8 @@ async fn rejects_failed_or_non_audio_downloads() {
         )
         .await
         .unwrap_err();
-        assert!(!format!("{error} {error:?}").contains("SECRET"));
+        assert_eq!(error.to_string().contains("SECRET"), status == 403);
+        assert!(!error.to_string().contains("token=SECRET"));
         let wires: Vec<_> = requests.try_iter().collect();
         assert_eq!(wires.len(), 1);
         assert!(!wires[0].to_lowercase().contains("authorization"));

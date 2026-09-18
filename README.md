@@ -246,9 +246,11 @@ endpoints do not expose format selection, so leave `format` unset.
 The default queue is `https://queue.fal.run`; a custom `base_url` is used as the
 queue base without rerouting to Fal. Status/result URLs must share that origin.
 Audio downloads never receive the API key. Redirects are rejected, so custom
-services must provide direct queue and download URLs. Normal audio errors omit
-provider bodies, transcripts, credentials and signed URLs; callers should treat
-explicit `raw_metadata` as potentially private.
+services must provide direct queue and download URLs. Fal HTTP errors retain status
+and original response bodies; failed jobs retain the returned error, and JSON decoding
+errors retain the original body. These errors and `raw_metadata` can contain private
+content: restrict diagnostic access and do not expose them directly to HTTP clients.
+Transport errors omit request URLs, and authorization headers are never added to errors.
 
 ## LLM Usage
 
