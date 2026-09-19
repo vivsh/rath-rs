@@ -1,5 +1,8 @@
 use crate::core::error::http;
 mod measurement;
+mod tool_calls;
+
+use tool_calls::{collect_tool_calls, validate_call_policy, validate_tool_request};
 
 use std::borrow::Cow;
 
@@ -65,6 +68,7 @@ pub fn new_client(
     } else {
         None
     };
+    validate_tool_request(&options)?;
     Ok(Box::new(OllamaClient {
         http: HttpClient::new(),
         api_key: optional_api_key(url, "OLLAMA_API_KEY"),
@@ -134,7 +138,7 @@ impl LlmClient for OllamaClient {
                 .with_context(Provider::Ollama, "generation")
                 .sanitized(&self.api_key.as_deref().into_iter().collect::<Vec<_>>())
         })?;
-        validate_tools(Provider::Ollama, &self.options.tools).map_err(|error| {
+        validate_tool_request(&self.options).map_err(|error| {
             error
                 .with_context(Provider::Ollama, "generation")
                 .sanitized(&self.api_key.as_deref().into_iter().collect::<Vec<_>>())
@@ -142,13 +146,12 @@ impl LlmClient for OllamaClient {
 
         let tools_enabled =
             !self.options.tools.is_empty() && self.options.tool_choice != ToolChoice::Disabled;
-        let wants_json_output = self.options.wants_json_output();
         let endpoint = chat_completions_endpoint(&self.base_url);
 
         let payload = build_payload(&self.model, &self.options, messages, tools_enabled);
         let result = self
             .post_json(&endpoint, &payload, "generation", |response| {
-                map_response(response, wants_json_output)
+                map_response(response, &self.options)
             })
             .await?;
 
@@ -431,71 +434,89 @@ fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 }
 
 /// Rejects token-limited output before normalizing content, calls and usage.
-fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, RathError> {
+fn map_response(response: Value, options: &LlmOptions) -> Result<LlmResponse, RathError> {
     crate::llm::counting::check_output_limit(Provider::Ollama, &response)?;
-    let usage = response.get("usage").map(usage_from_value);
-    let provider_model = response
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let metadata = Some(json!({
+    let message = response
+        .pointer("/choices/0/message")
+        .ok_or_else(|| RathError::invalid("missing choices[0].message", &response))?;
+    let enabled = !options.tools.is_empty() && options.tool_choice != ToolChoice::Disabled;
+    let calls = collect_tool_calls(message, enabled)?;
+    validate_call_policy(
+        &calls,
+        options,
+        response.pointer("/choices/0/finish_reason"),
+    )?;
+    let output = if calls.is_empty() {
+        let text = message
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RathError::invalid(
+                    "missing choices[0].message.content or tool_calls",
+                    &response,
+                )
+            })?;
+        LlmOutput::Output(decode_ollama_output(
+            strip_thinking(text),
+            options.wants_json_output(),
+        )?)
+    } else {
+        LlmOutput::ToolCalls {
+            thought: message
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            calls,
+        }
+    };
+    Ok(LlmResponse::new(Provider::Ollama, output)
+        .with_usage(response.get("usage").map(usage_from_value))
+        .with_provider_model(
+            response
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
+        .with_raw_metadata(Some(response_metadata(&response))))
+}
+
+/// Retains explicit provider completion evidence without inventing missing usage or reasoning.
+fn response_metadata(response: &Value) -> Value {
+    json!({
         "id": response.get("id"),
         "finish_reason": response.pointer("/choices/0/finish_reason"),
         "reasoning": response.pointer("/choices/0/message/reasoning"),
         "usage": response.get("usage"),
-    }));
-    let message = response
-        .pointer("/choices/0/message")
-        .ok_or_else(|| RathError::invalid("missing choices[0].message", &response))?;
-
-    let calls = collect_tool_calls(message)?;
-    if !calls.is_empty() {
-        return Ok(LlmResponse::new(
-            Provider::Ollama,
-            LlmOutput::ToolCalls {
-                thought: message
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                calls,
-            },
-        )
-        .with_usage(usage)
-        .with_provider_model(provider_model)
-        .with_raw_metadata(metadata));
-    }
-
-    let text = message
-        .get("content")
-        .and_then(Value::as_str)
-        .ok_or(RathError::new(
-            crate::core::ErrorKind::InvalidResponse,
-            "missing choices[0].message.content or tool_calls",
-        ))?;
-    let text = strip_thinking(text);
-    Ok(LlmResponse::new(
-        Provider::Ollama,
-        LlmOutput::Output(decode_ollama_output(text, wants_json_output)?),
-    )
-    .with_usage(usage)
-    .with_provider_model(provider_model)
-    .with_raw_metadata(metadata))
+    })
 }
 
+/// Preserves valid JSON verbatim in value form and explains failures after legacy markdown repair.
 fn decode_ollama_output(text: &str, wants_json_output: bool) -> Result<Value, RathError> {
     if !wants_json_output {
         return decode_output_text(text, false);
     }
+    if let Ok(value) = serde_json::from_str(strip_json_code_fence(text).unwrap_or(text)) {
+        return Ok(value);
+    }
 
     let sanitized = sanitize_json_markdown(text);
-    parse_json_output(sanitized.as_ref()).map(strip_markdown_json_keys)
+    parse_json_output(sanitized.as_ref())
+        .map(strip_markdown_json_keys)
+        .map_err(|cause| {
+            RathError::new(
+                crate::core::ErrorKind::Deserialize,
+                "Ollama returned invalid JSON output",
+            )
+            .with_source(cause)
+        })
 }
 
+/// Removes only a leading reasoning block, preserving delimiters inside ordinary text or JSON.
 fn strip_thinking(text: &str) -> &str {
-    // qwen3 models emit <think>...</think> before the final answer when thinking is enabled.
-    // Strip that block so callers receive only the answer/JSON.
-    if let Some(end) = text.find("</think>") {
-        text[end + "</think>".len()..].trim_start()
+    if text.trim_start().starts_with("<think>")
+        && let Some((_, answer)) = text.split_once("</think>")
+    {
+        answer.trim_start()
     } else {
         text
     }
@@ -654,120 +675,6 @@ fn strip_markdown_key(key: &str) -> &str {
         }
     }
     key
-}
-
-fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, RathError> {
-    if let Some(items) = message.get("tool_calls").and_then(Value::as_array) {
-        return parse_json_tool_calls(items);
-    }
-    if let Some(content) = message.get("content").and_then(Value::as_str) {
-        return parse_content_tool_calls(content);
-    }
-    Ok(Vec::new())
-}
-
-/// Parses tool-call JSON when the provider encodes calls inside response content.
-fn parse_json_tool_calls(items: &[Value]) -> Result<Vec<ToolCall>, RathError> {
-    let mut calls = Vec::with_capacity(items.len());
-    for item in items {
-        let id = item.get("id").and_then(Value::as_str).ok_or_else(|| {
-            RathError::new(
-                crate::core::ErrorKind::InvalidResponse,
-                "Ollama tool call missing id",
-            )
-        })?;
-        let function = item.get("function").ok_or_else(|| {
-            RathError::new(
-                crate::core::ErrorKind::InvalidResponse,
-                "Ollama tool call missing function",
-            )
-        })?;
-        let name = function
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                RathError::new(
-                    crate::core::ErrorKind::InvalidResponse,
-                    "Ollama tool call missing function name",
-                )
-            })?;
-        let raw_args = function
-            .get("arguments")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                RathError::new(
-                    crate::core::ErrorKind::InvalidResponse,
-                    "function call missing string arguments",
-                )
-            })?;
-        let args =
-            serde_json::from_str(raw_args).map_err(|e| RathError::deserialize(&e, raw_args))?;
-        calls.push(ToolCall {
-            id: id.to_string(),
-            name: name.to_string(),
-            args,
-            thought_signatures: None,
-        });
-    }
-    Ok(calls)
-}
-
-/// Parses tool calls from content text when the model emits them in the
-/// `<function=NAME><parameter=KEY>VALUE</parameter></function>` format
-/// instead of the standard `tool_calls` JSON field.
-fn parse_content_tool_calls(content: &str) -> Result<Vec<ToolCall>, RathError> {
-    let mut calls = Vec::new();
-    let mut remaining = content;
-    while let Some(tag_start) = remaining.find("<function=") {
-        let after_tag = &remaining[tag_start + "<function=".len()..];
-        let Some(name_end) = after_tag.find('>') else {
-            break;
-        };
-        let name = after_tag[..name_end].trim();
-        let body = &after_tag[name_end + 1..];
-        let body_end = body.find("</function>").unwrap_or(body.len());
-        let args = parse_function_params(&body[..body_end]);
-        calls.push(ToolCall {
-            id: uuid::Uuid::now_v7().to_string(),
-            name: name.to_string(),
-            args,
-            thought_signatures: None,
-        });
-        let consumed = tag_start + "<function=".len() + name_end + 1 + body_end;
-        let skip = consumed + "</function>".len();
-        remaining = if skip < remaining.len() {
-            &remaining[skip..]
-        } else {
-            ""
-        };
-    }
-    Ok(calls)
-}
-
-/// Decodes function arguments from the model-produced parameter representation.
-fn parse_function_params(text: &str) -> Value {
-    let mut map = serde_json::Map::new();
-    let mut remaining = text;
-    while let Some(tag_start) = remaining.find("<parameter=") {
-        let after_tag = &remaining[tag_start + "<parameter=".len()..];
-        let Some(key_end) = after_tag.find('>') else {
-            break;
-        };
-        let key = after_tag[..key_end].trim();
-        let value_text = &after_tag[key_end + 1..];
-        let end = value_text.find("</parameter>").unwrap_or(value_text.len());
-        let raw = value_text[..end].trim();
-        let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
-        map.insert(key.to_string(), value);
-        let consumed = tag_start + "<parameter=".len() + key_end + 1 + end;
-        let skip = consumed + "</parameter>".len();
-        remaining = if skip < remaining.len() {
-            &remaining[skip..]
-        } else {
-            ""
-        };
-    }
-    Value::Object(map)
 }
 
 fn usage_from_value(value: &Value) -> TokenUsage {

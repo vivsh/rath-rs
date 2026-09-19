@@ -2,6 +2,10 @@ use super::{ErrorBody, ErrorKind, RathError, redact};
 use crate::core::Provider;
 use serde_json::Value;
 
+#[cfg(test)]
+#[path = "tests/normalize.rs"]
+mod tests;
+
 impl RathError {
     /// Converts each native source level into a separately inspectable Rath diagnostic.
     pub(crate) fn from_error(kind: ErrorKind, error: &(dyn std::error::Error + 'static)) -> Self {
@@ -101,11 +105,9 @@ pub(super) fn details(error: &mut RathError, value: &Value) {
     } else if let Some(messages) = validation_messages(native) {
         error.inner.message = redact::text(&messages, &[]);
     }
-    error.inner.provider_code = native
-        .get("code")
-        .or_else(|| native.get("type"))
-        .or_else(|| native.get("status"))
-        .and_then(scalar);
+    error.inner.provider_code = ["code", "type", "status"]
+        .into_iter()
+        .find_map(|key| native.get(key).and_then(scalar));
     if error.inner.request_id.is_none() {
         error.inner.request_id = value
             .get("request_id")

@@ -28,6 +28,7 @@ fn measurement_payload(
 ) -> Result<Value, RathError> {
     counting::validate_measurement(Provider::Ollama, options, messages, remote)?;
     validate_history(messages)?;
+    validate_tool_request(options)?;
     let enabled = !options.tools.is_empty() && options.tool_choice != ToolChoice::Disabled;
     Ok(build_payload(model, options, messages, enabled))
 }

@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::llm::{
     Attachment, LlmClient, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl, Provider,
-    RathError, Role, TokenUsage, ToolCall, ToolChoice, ToolDefinition, configured_base_url,
-    decode_output_text, required_api_key, validate_tools,
+    RathError, Role, ThinkingLevel, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+    configured_base_url, decode_output_text, required_api_key, validate_tools,
 };
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -146,6 +146,9 @@ fn build_payload(
     if let Some(t) = options.temperature {
         payload["temperature"] = json!(t);
     }
+    if let Some(level) = &options.thinking {
+        payload["reasoning"] = json!({ "effort": reasoning_effort(level) });
+    }
 
     if tools_enabled {
         payload["tools"] = Value::Array(build_tools(&options.tools));
@@ -171,6 +174,17 @@ fn build_payload(
     }
 
     payload
+}
+
+/// Maps explicit levels to OpenRouter's unified reasoning control; omission remains provider default.
+fn reasoning_effort(level: &ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "none",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::XHigh => "xhigh",
+    }
 }
 
 /// Serializes retained history and adapter instructions into provider messages.
@@ -401,3 +415,7 @@ fn usage_from_value(value: &Value) -> TokenUsage {
 #[cfg(test)]
 #[path = "openrouter/tests/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/openrouter_thinking.rs"]
+mod thinking_tests;

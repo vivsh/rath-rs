@@ -170,7 +170,11 @@ fn reasoning_metadata_preserves_reported_evidence() {
             wire["usage"]["completion_tokens_details"] = json!({"reasoning_tokens":tokens});
             wire["choices"][0]["message"]["reasoning"] = json!("reported reasoning");
         }
-        let response = map_response(wire.clone(), true).unwrap();
+        let response = map_response(
+            wire.clone(),
+            &LlmOptions::default().with_response_format(crate::llm::ResponseFormat::Json),
+        )
+        .unwrap();
         let metadata = response.raw_metadata.unwrap();
         assert_eq!(metadata["finish_reason"], "stop");
         assert_eq!(metadata["usage"], wire["usage"]);

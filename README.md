@@ -58,6 +58,15 @@ compatibility alias.
 OpenRouter model slugs keep their provider prefix in the URL path, for example
 `openrouter:///anthropic/claude-sonnet-4.5`.
 
+OpenRouter accepts thinking through `.with_thinking(Some(ThinkingLevel::High))`
+or a URL such as `openrouter:///vendor/model?thinking=high`. An explicit URL value
+overrides the builder. Rath sends `reasoning.effort`: Off maps to `none`, and
+Low/Medium/High/XHigh map to `low`/`medium`/`high`/`xhigh`. Unspecified thinking
+omits the control and leaves the provider default intact. This requests generation
+behavior rather than merely hiding reasoning text. Supported levels depend on the
+selected model and upstream provider; rejections retain typed diagnostics, without
+a retry at a weaker setting. See [OpenRouter's reasoning documentation](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+
 Fal model slugs also keep the full path, for example
 `fal:///fal-ai/flux/schnell`.
 
@@ -302,6 +311,48 @@ The tests target `127.0.0.1:11434`, never download models, and report output,
 finish status, available reasoning evidence, token usage and elapsed time for
 three requests per model. Normal test runs skip them. Server support follows
 [Ollama's compatibility API](https://docs.ollama.com/api/openai-compatibility).
+
+## Ollama tool calls and JSON
+
+Use `with_tools(...)` to offer tools. `ToolChoice::Auto` permits a normal answer;
+`Required` needs at least one offered tool and rejects responses without a call.
+`Disabled` omits offered tools, preserves tool-like text as ordinary text, and
+rejects protocol-level calls. Rath returns calls for the application to execute.
+Returned calls must name an offered tool and have distinct nonempty IDs and
+JSON-object arguments. Complete legacy `<function=...>` blocks remain supported
+when tools are enabled; malformed blocks return errors.
+
+Use `Message::from_json(Role::User, &value)` for JSON input and
+`with_output_schema(...)` or `with_response_format(ResponseFormat::Json)` for
+JSON output. `with_input_schema(...)` adds model instructions; it does not parse
+or validate manually supplied message text. Schema options do not perform local
+JSON Schema validation. Validate application-specific shapes after decoding.
+Valid JSON values, including literal markup inside strings or keys, are preserved.
+
+Failures remain inspectable through `RathError`:
+
+- Provider-declared unsupported tools/JSON mode: `Http`, with status, provider
+  message and available code/type. Rath never removes the setting and retries.
+- Missing required calls, malformed call shapes or disallowed calls:
+  `InvalidResponse`. A missing call does not prove the model lacks tool support.
+- Invalid JSON output/arguments: `Deserialize`, with a useful explanation and
+  the original decoder cause, including line/column details when available.
+- Truncated output: `OutputLimitReached`, before parsing or tool extraction.
+
+Response bodies are explicitly accessible and absent from ordinary error
+formatting. `Message::from_json` retains its existing `serde_json::Error` return
+type for input serialization failures.
+
+Run installed-model checks with:
+
+```sh
+cargo test --test ollama_tools_json_live -- --ignored --nocapture --test-threads=1
+```
+
+The cases exercise JSON input, tool-call/result replay and JSON output on local
+Granite/Qwen models. Granite's case explicitly disables tools for the final JSON
+turn after the lookup; Qwen3 8B retains Auto. Mixed tool/JSON behavior varies by
+model and server. Invalid mixed output remains an error, never a partial success.
 
 ## LLM Provider Config
 

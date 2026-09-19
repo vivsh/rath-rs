@@ -93,7 +93,11 @@ async fn invalid_execution_cap_never_dispatches() {
 #[test]
 fn limited_output_is_not_success() {
     let response = json!({"choices":[{"finish_reason":"length", "message":{"content":"PRIVATE-CONTENT-729{", "tool_calls":[{"function":{"arguments":"{"}}]}}]});
-    let error = map_response(response, true).unwrap_err();
+    let error = map_response(
+        response,
+        &LlmOptions::default().with_response_format(crate::llm::ResponseFormat::Json),
+    )
+    .unwrap_err();
     assert!(error.kind() == crate::core::ErrorKind::OutputLimitReached);
     assert!(!format!("{error:?} {error}").contains("PRIVATE-CONTENT-729"));
 }
