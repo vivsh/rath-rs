@@ -269,6 +269,40 @@ match response.output {
 # }
 ```
 
+## Ollama thinking
+
+Use either `.with_thinking(Some(ThinkingLevel::Off))` or a model URL such as
+`ollama:///qwen3:8b?thinking=off`. An explicit URL `thinking` value overrides the
+programmatic option; without a URL value, the programmatic setting applies.
+Leaving both unspecified omits the control and preserves Ollama's default.
+
+On `/v1/chat/completions`, Rath maps `Off`, `Low`, `Medium`, `High`, and `XHigh` to
+`reasoning_effort` values `none`, `low`, `medium`, `high`, and `max`, respectively.
+Rath does not inject `/no_think` or send the native API's `think` field. Support
+depends on the model and Ollama version; provider rejections remain typed errors
+without retries or downgraded settings. Some models cannot disable thinking.
+
+Explicit Off supports the existing JSON-output mode. Unspecified thinking also
+retains that mode; JSON formatting itself does not disable reasoning. Explicit
+enabled levels retain schema instructions without forced JSON mode.
+
+Ollama responses expose `finish_reason`, `reasoning`, and raw `usage` alongside
+`id` in `LlmResponse::raw_metadata`. Missing fields are null. An absent reasoning
+trace or missing reasoning-token count does not establish zero reasoning tokens.
+These fields may contain private model output and are caller-controlled.
+
+Opt-in local tests use Rath's public client with a synthetic extraction task and
+explicit installed models (`qwen3:0.6b`, `granite4.2:3b`, `lfm2.5-thinking:1.2b`):
+
+```sh
+cargo test --test ollama_thinking_live -- --ignored --nocapture --test-threads=1
+```
+
+The tests target `127.0.0.1:11434`, never download models, and report output,
+finish status, available reasoning evidence, token usage and elapsed time for
+three requests per model. Normal test runs skip them. Server support follows
+[Ollama's compatibility API](https://docs.ollama.com/api/openai-compatibility).
+
 ## LLM Provider Config
 
 Use `provider_config` for provider-specific request knobs that Rath does not

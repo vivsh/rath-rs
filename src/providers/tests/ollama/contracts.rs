@@ -14,18 +14,6 @@ fn custom_base_url_builds_ollama_endpoints() {
     );
 }
 
-/// Verifies qwen no think is added to first user message.
-#[test]
-fn qwen_no_think_is_added_to_first_user_message() {
-    let messages = build_messages(&[Message::user("do it")], None, "qwen3:8b", false, None);
-    assert!(
-        messages[0]["content"]
-            .as_str()
-            .unwrap()
-            .starts_with("/no_think")
-    );
-}
-
 /// User attachments are emitted as OpenAI-compatible image_url parts.
 #[test]
 fn user_attachments_use_content_parts() {
@@ -41,12 +29,11 @@ fn user_attachments_use_content_parts() {
             usage: None,
         }],
         None,
-        "qwen3-vl:8b",
-        false,
         None,
     );
     assert_eq!(messages[0]["content"][0]["type"], "image_url");
     assert_eq!(messages[0]["content"][1]["type"], "text");
+    assert_eq!(messages[0]["content"][1]["text"], "describe this");
 }
 
 /// Tool-result attachments are replayed as synthetic user image turns.
@@ -66,8 +53,6 @@ fn tool_attachments_become_synthetic_user_images() {
             usage: None,
         }],
         None,
-        "qwen3-vl:8b",
-        false,
         None,
     );
     assert_eq!(messages.len(), 2);
@@ -98,8 +83,6 @@ fn build_messages_keep_tool_result_and_reminder_separate() {
             Message::user("FINAL TURN: call final_answer"),
         ],
         None,
-        "llama3.1",
-        false,
         None,
     );
 

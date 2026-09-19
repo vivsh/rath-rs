@@ -295,7 +295,7 @@ pub struct LlmOptions {
     pub preamble: Option<String>,
     /// Tools available to the model.
     pub tools: Vec<ToolDefinition>,
-    /// Reasoning depth. `None` means no thinking mode.
+    /// Reasoning depth. `None` leaves the adapter/provider default unspecified.
     pub thinking: Option<ThinkingLevel>,
     /// Tool-call policy.
     pub tool_choice: ToolChoice,
@@ -343,7 +343,8 @@ impl LlmOptions {
         self
     }
 
-    /// Enables extended thinking. `None` disables it.
+    /// Requests a reasoning level; `None` leaves the adapter/provider default unspecified.
+    /// Use `Some(ThinkingLevel::Off)` to explicitly request disabling reasoning.
     pub fn with_thinking(mut self, thinking: Option<ThinkingLevel>) -> Self {
         self.thinking = thinking;
         self
@@ -423,7 +424,7 @@ impl LlmOptions {
         self
     }
 
-    /// Builds a provider client for the given model URL.
+    /// Builds a provider client; explicit URL temperature, thinking and cache override these options.
     pub fn create(mut self, llm_url: &str) -> Result<Box<dyn LlmClient>, RathError> {
         let url = ModelUrl::parse(llm_url)?;
         if url.temperature.is_some() {

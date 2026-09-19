@@ -234,7 +234,7 @@ fn build_payload(
     messages: &[Message],
     tools_enabled: bool,
 ) -> Value {
-    let thinking_enabled = options
+    let thinking_requested = options
         .thinking
         .as_ref()
         .is_some_and(|t| *t != ThinkingLevel::Off);
@@ -249,13 +249,14 @@ fn build_payload(
         "messages": build_messages(
             messages,
             options.effective_preamble().as_deref(),
-            model,
-            thinking_enabled,
             schema_hint,
         ),
         "stream": false,
     });
 
+    if let Some(level) = &options.thinking {
+        payload["reasoning_effort"] = json!(reasoning_effort(level));
+    }
     if let Some(cap) = options.max_output_tokens {
         payload["max_tokens"] = json!(cap);
     }
@@ -269,19 +270,29 @@ fn build_payload(
             payload["tool_choice"] = Value::String("required".into());
         }
     }
-    if options.wants_json_output() && !thinking_enabled {
+    // Preserve JSON-mode selection without treating an unspecified setting as Off.
+    if options.wants_json_output() && !thinking_requested {
         payload["response_format"] = json!({ "type": "json_object" });
     }
 
     payload
 }
 
+/// Maps every typed level to Ollama's compatibility API; deployment rejection stays an error.
+fn reasoning_effort(level: &ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "none",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::XHigh => "max",
+    }
+}
+
 /// Serializes retained history and adapter instructions into provider messages.
 fn build_messages(
     history: &[Message],
     preamble: Option<&str>,
-    model: &str,
-    thinking: bool,
     schema_hint: Option<&Value>,
 ) -> Vec<Value> {
     let mut out = Vec::with_capacity(
@@ -296,11 +307,10 @@ fn build_messages(
         out.push(json!({ "role": "system", "content": system }));
     }
 
-    let mut first_user = true;
     for msg in history {
         match &msg.role {
             Role::System => out.push(json!({ "role": "system", "content": msg.content })),
-            Role::User => out.push(build_user_message(msg, &mut first_user, model, thinking)),
+            Role::User => out.push(build_user_message(msg)),
             Role::Assistant => out.push(json!({ "role": "assistant", "content": msg.content })),
             Role::AssistantToolCalls { calls } => {
                 let tool_calls = build_call_history(calls);
@@ -355,13 +365,8 @@ fn combined_system_message(preamble: Option<&str>, schema_hint: Option<&Value>) 
 }
 
 /// Serializes user text and supported attachments in provider content format.
-fn build_user_message(
-    message: &Message,
-    first_user: &mut bool,
-    model: &str,
-    thinking: bool,
-) -> Value {
-    let content = user_content(message, first_user, model, thinking);
+fn build_user_message(message: &Message) -> Value {
+    let content = &message.content;
     if message.attachments.is_empty() {
         return json!({ "role": "user", "content": content });
     }
@@ -381,16 +386,6 @@ fn push_tool_attachment_messages(out: &mut Vec<Value>, attachments: &[Attachment
             "role": "user",
             "content": [part]
         }));
-    }
-}
-
-fn user_content(message: &Message, first_user: &mut bool, model: &str, thinking: bool) -> String {
-    if *first_user && !thinking && model.starts_with("qwen3") {
-        *first_user = false;
-        format!("/no_think\n\n{}", message.content)
-    } else {
-        *first_user = false;
-        message.content.clone()
     }
 }
 
@@ -444,7 +439,10 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         .and_then(Value::as_str)
         .map(str::to_string);
     let metadata = Some(json!({
-        "id": response.get("id").cloned().unwrap_or(Value::Null),
+        "id": response.get("id"),
+        "finish_reason": response.pointer("/choices/0/finish_reason"),
+        "reasoning": response.pointer("/choices/0/message/reasoning"),
+        "usage": response.get("usage"),
     }));
     let message = response
         .pointer("/choices/0/message")
@@ -787,5 +785,5 @@ fn token_count(value: &Value, key: &str) -> Option<u32> {
 }
 
 #[cfg(test)]
-#[path = "ollama/tests/mod.rs"]
+#[path = "tests/ollama.rs"]
 mod tests;
