@@ -9,6 +9,15 @@ pub(in crate::providers) fn serve(
     status: u16,
     body: serde_json::Value,
 ) -> (String, Receiver<String>) {
+    serve_content(status, "application/json", body.to_string())
+}
+
+/// Serves a bounded binary or text response for media adapters without contacting a provider.
+pub(in crate::providers) fn serve_content(
+    status: u16,
+    mime: &'static str,
+    body: String,
+) -> (String, Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
@@ -23,8 +32,7 @@ pub(in crate::providers) fn serve(
                     .unwrap();
                 let request = read_request(&mut stream);
                 tx.send(request).unwrap();
-                let body = body.to_string();
-                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 return;
             }
             thread::sleep(Duration::from_millis(5));

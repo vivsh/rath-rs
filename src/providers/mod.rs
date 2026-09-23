@@ -1,4 +1,5 @@
 mod anthropic;
+mod elevenlabs;
 mod fal;
 mod gemini;
 mod ollama;

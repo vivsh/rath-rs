@@ -1,11 +1,42 @@
-use super::{anthropic, fal, gemini, ollama, openai, openrouter};
+use super::{anthropic, elevenlabs, fal, gemini, ollama, openai, openrouter};
 use crate::audio::stt::{SttClient, SttOptions};
 use crate::audio::tts::{TtsClient, TtsOptions};
+use crate::audio::voice_clone::{VoiceCloneClient, VoiceCloneOptions};
+use crate::audio::voice_design::{VoiceDesignClient, VoiceDesignOptions};
 use crate::core::{ModelUrl, Provider};
 use crate::embeddings::{EmbeddingClient, EmbeddingOptions};
 use crate::images::{ImageClient, ImageOptions};
 use crate::llm::{LlmClient, LlmOptions, RathError};
 use crate::video::{VideoClient, VideoOptions};
+
+/// Constructs an independent voice-design adapter without invoking generation.
+pub(crate) fn create_voice_design_client(
+    url: &ModelUrl,
+    options: VoiceDesignOptions,
+) -> Result<Box<dyn VoiceDesignClient>, RathError> {
+    match url.provider {
+        Provider::Fal => fal::new_voice_design_client(url, options),
+        Provider::ElevenLabs => elevenlabs::new_design(url, options),
+        _ => Err(RathError::unsupported(url.provider.clone(), "voice design")),
+    }
+    .map_err(|error| construction_error(error, url))
+}
+
+/// Constructs an independent cloning adapter without creating any voice resources.
+pub(crate) fn create_voice_clone_client(
+    url: &ModelUrl,
+    options: VoiceCloneOptions,
+) -> Result<Box<dyn VoiceCloneClient>, RathError> {
+    match url.provider {
+        Provider::Fal => fal::new_voice_clone_client(url, options),
+        Provider::ElevenLabs => elevenlabs::new_clone(url, options),
+        _ => Err(RathError::unsupported(
+            url.provider.clone(),
+            "voice cloning",
+        )),
+    }
+    .map_err(|error| construction_error(error, url))
+}
 
 /// Selects a supported LLM adapter using the configured model URL and options.
 pub(crate) fn create_llm_client(
@@ -18,7 +49,9 @@ pub(crate) fn create_llm_client(
         Provider::OpenRouter => openrouter::new_client(url, options),
         Provider::Anthropic => anthropic::new_client(url, options),
         Provider::Ollama => ollama::new_client(url, options),
-        Provider::Fal => Err(RathError::unsupported(url.provider.clone(), "llm")),
+        Provider::Fal | Provider::ElevenLabs => {
+            Err(RathError::unsupported(url.provider.clone(), "llm"))
+        }
     }
     .map_err(|error| construction_error(error, url))
 }
@@ -57,6 +90,7 @@ pub(crate) fn create_tts_client(
     match url.provider {
         Provider::OpenAi => openai::new_tts_client(url, options),
         Provider::Fal => fal::new_tts_client(url, options),
+        Provider::ElevenLabs => elevenlabs::new_tts(url, options),
         _ => Err(RathError::unsupported(
             url.provider.clone(),
             "text-to-speech",
@@ -102,6 +136,7 @@ fn construction_error(error: RathError, url: &ModelUrl) -> RathError {
         Provider::Anthropic => "ANTHROPIC_API_KEY",
         Provider::Ollama => "OLLAMA_API_KEY",
         Provider::Fal => "FAL_KEY",
+        Provider::ElevenLabs => "ELEVENLABS_API_KEY",
     };
     let fallback = std::env::var(env).ok();
     let secrets: Vec<_> = url

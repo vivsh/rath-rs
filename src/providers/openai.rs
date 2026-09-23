@@ -217,20 +217,7 @@ impl EmbeddingClient for OpenAiClient {
 impl TtsClient for OpenAiClient {
     /// Sends speech synthesis input and returns audio bytes or a provider error.
     async fn synthesize_speech(&self, request: &TtsRequest) -> Result<TtsResponse, RathError> {
-        let mut payload = json_object_from(&self.provider_config);
-        merge_json_object(&mut payload, &request.provider_config);
-        payload.insert(
-            "model".to_string(),
-            Value::String(request.model.clone().unwrap_or_else(|| self.model.clone())),
-        );
-        payload.insert("input".to_string(), Value::String(request.input.clone()));
-        if let Some(voice) = &request.voice {
-            payload.insert("voice".to_string(), Value::String(voice.clone()));
-        }
-        if let Some(format) = &request.format {
-            payload.insert("response_format".to_string(), Value::String(format.clone()));
-        }
-
+        let payload = speech_payload(self, request)?;
         let response = http::send(
             self.http
                 .post(speech_endpoint(&self.base_url))
@@ -260,6 +247,47 @@ impl TtsClient for OpenAiClient {
             raw_metadata: None,
         })
     }
+}
+
+/// Preserves preset synthesis while rejecting incompatible custom voices and unsupported controls.
+fn speech_payload(
+    client: &OpenAiClient,
+    request: &TtsRequest,
+) -> Result<serde_json::Map<String, Value>, RathError> {
+    crate::audio::voice::validate_config(client.provider_config.as_ref())?;
+    crate::audio::voice::validate_config(request.provider_config.as_ref())?;
+    if request.input.trim().is_empty() {
+        return Err(crate::audio::voice::invalid(
+            "speech input must not be blank",
+        ));
+    }
+    if request.language.is_some() || request.instructions.is_some() {
+        return Err(RathError::unsupported(
+            Provider::OpenAi,
+            "typed TTS language/instructions",
+        ));
+    }
+    let mut payload = json_object_from(&client.provider_config);
+    merge_json_object(&mut payload, &request.provider_config);
+    payload.insert(
+        "model".into(),
+        json!(request.model.as_deref().unwrap_or(&client.model)),
+    );
+    payload.insert("input".into(), json!(request.input));
+    if let Some(voice) = &request.voice {
+        voice.validate("openai")?;
+        let crate::audio::voice::VoiceData::Id(id) = &voice.data else {
+            return Err(RathError::unsupported(
+                Provider::OpenAi,
+                "selected voice representation",
+            ));
+        };
+        payload.insert("voice".into(), json!(id));
+    }
+    if let Some(format) = &request.format {
+        payload.insert("response_format".into(), json!(format));
+    }
+    Ok(payload)
 }
 
 #[async_trait]

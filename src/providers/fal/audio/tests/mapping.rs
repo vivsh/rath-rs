@@ -2,13 +2,28 @@ use serde_json::json;
 
 use super::super::*;
 
+/// Explicit identity takes precedence over conflicting native embedding fields and reference text.
+#[test]
+fn typed_voice_removes_competing_native_identity() {
+    let payload=tts_payload(super::super::super::voice::SPEECH, &None, &TtsRequest {
+        input:"Hello".into(), voice:Some(crate::audio::voice::Voice::id("fal/qwen3-tts-1.7b","Ryan")),
+        provider_config:Some(json!({"speaker_voice_embedding_file_url":"bad", "reference_text":"bad", "voice":"bad"})),
+        language:Some("en".into()), instructions:Some("Speak softly".into()),..Default::default()
+    }).unwrap();
+    assert_eq!(payload["voice"], "Ryan");
+    assert_eq!(payload["language"], "English");
+    assert_eq!(payload["prompt"], "Speak softly");
+    assert!(!payload.contains_key("speaker_voice_embedding_file_url"));
+    assert!(!payload.contains_key("reference_text"));
+}
+
 /// Eleven v3 preserves inline delivery cues and typed text/voice precedence without extra defaults.
 #[test]
 fn eleven_v3_preserves_audio_tags_and_settings() {
     let input = "[whispers] Stay close. [laughs] I was only teasing.";
     let request = TtsRequest {
         input: input.into(),
-        voice: Some("Rachel".into()),
+        voice: Some(crate::audio::voice::Voice::id("fal/elevenlabs", "Rachel")),
         provider_config: Some(json!({"stability":0.5,"text":"ignored","voice":"ignored"})),
         ..Default::default()
     };
@@ -36,7 +51,7 @@ fn tts_configuration_precedence() {
     let config = Some(json!({"speed":0.9,"stability":0.2,"text":"old", "voice":"old"}));
     let request = TtsRequest {
         input: "Hello".into(),
-        voice: Some("Aria".into()),
+        voice: Some(crate::audio::voice::Voice::id("fal/elevenlabs", "Aria")),
         provider_config: Some(json!({"speed":1.1,"text":"override","voice":"override"})),
         ..Default::default()
     };

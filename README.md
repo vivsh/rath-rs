@@ -149,35 +149,195 @@ println!("{} image(s)", response.images.len());
 
 ## Video Usage
 
-```rust
-use rath::video::{VideoJobStatus, VideoOptions, VideoRequest};
+`VideoOptions::create(url)` selects the provider and native endpoint just like
+the LLM and voice APIs. Fal is currently the only video adapter. Construction
+does not discover models or start generation.
 
-# async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let client = VideoOptions::default().create("fal:///fal-ai/wan/v2.2-a14b/text-to-video")?;
+Typed inputs have verified mappings for these endpoints:
+
+| Input | Fal endpoint |
+| --- | --- |
+| `TextToVideo` | `fal-ai/kling-video/v3/pro/text-to-video` |
+| `TextToVideo` | `fal-ai/wan/v2.2-a14b/text-to-video` |
+| `ImageToVideo` | `fal-ai/kling-video/v3/pro/image-to-video` |
+| `MotionTransfer` | `fal-ai/kling-video/v3/pro/motion-control` |
+
+A mismatched typed operation returns `UnsupportedCapability` before submission.
+Other Fal queue endpoints require explicit `VideoInput::Native`.
+
+### Typed generation and polling
+
+```rust,no_run
+use rath::images::ImageData;
+use rath::video::{VideoInput, VideoOptions, VideoRequest};
+
+# async fn run() -> Result<(), rath::RathError> {
+let client = VideoOptions::default()
+    .create("fal:///fal-ai/kling-video/v3/pro/image-to-video")?;
 let job = client.submit_video(&VideoRequest {
-    prompt: "A slow cinematic push-in on a brass astrolabe".to_string(),
-    ..VideoRequest::default()
+    prompt: "The character turns and waves.".into(),
+    input: VideoInput::ImageToVideo {
+        start_image: ImageData::Url {
+            url: "https://assets.example/approved-scene.png".into(),
+        },
+        end_image: None,
+    },
+    ..Default::default()
 }).await?;
 
-match client.get_video(&job.id).await? {
-    VideoJobStatus::Succeeded { response } => println!("{} video(s)", response.videos.len()),
-    VideoJobStatus::Failed { message, .. } => println!("video failed: {message}"),
-    VideoJobStatus::Queued { .. } | VideoJobStatus::Running { .. } => println!("still rendering"),
-}
-# Ok(())
-# }
+// Persist the receipt and provider/model/account association in your application.
+let status = client.get_video(&job.id).await?;
+let response = client.wait_video(&job.id).await?;
+# Ok(()) }
 ```
+
+For T2V, use `VideoInput::TextToVideo` (the default) and a compatible T2V endpoint.
+Typed T2V/I2V require a nonblank prompt. The I2V image establishes the opening
+shot; it is not interchangeable with a plain-background character reference.
+
+`generate_video(&request)` submits once and waits. Polling defaults to five-second
+intervals. Each Fal video HTTP request has a 60-second timeout, but total waiting
+has no deadline. Apply your own async deadline if needed. Dropping a future does
+not cancel the remote job, and an uncertain submission must not be blindly retried.
+
+### Motion transfer
+
+```rust,no_run
+use rath::images::ImageData;
+use rath::video::{VideoData, VideoInput, VideoOptions, VideoRequest};
+
+# async fn run() -> Result<(), rath::RathError> {
+let client = VideoOptions::default()
+    .create("fal:///fal-ai/kling-video/v3/pro/motion-control")?;
+let response = client.generate_video(&VideoRequest {
+    input: VideoInput::MotionTransfer {
+        character_image: ImageData::Url {
+            url: "https://assets.example/character.png".into(),
+        },
+        driving_video: VideoData::Url {
+            url: "https://assets.example/performance.mp4".into(),
+        },
+    },
+    provider_config: Some(serde_json::json!({
+        "character_orientation": "video",
+        "keep_original_sound": false
+    })),
+    ..Default::default()
+}).await?;
+# Ok(()) }
+```
+
+The motion prompt is optional. Kling requires an explicit `character_orientation`
+of `"image"` or `"video"`; Rath does not invent that choice. Model-specific controls
+such as duration, audio generation, and identity elements remain native settings.
+
+Inputs may also use `ImageData::Base64` or `VideoData::Base64` with a matching,
+parameter-free MIME type and nonempty standard base64. Rath validates and encodes
+data URIs without uploading or downloading input files. The provider validates
+actual media dimensions, duration, and content.
+
+### Explicit native input
+
+```rust,no_run
+use rath::video::{VideoInput, VideoOptions, VideoRequest};
+
+# async fn run() -> Result<(), rath::RathError> {
+let client = VideoOptions::default()
+    .create("fal:///fal-ai/kling-video/v3/pro/image-to-video")?;
+let job = client.submit_video(&VideoRequest {
+    input: VideoInput::Native {
+        payload: serde_json::json!({
+            "start_image_url": "https://assets.example/scene.png",
+            "multi_prompt": [
+                { "prompt": "A slow push-in.", "duration": "3" },
+                { "prompt": "The character smiles.", "duration": "3" }
+            ],
+            "duration": "6"
+        }),
+    },
+    ..Default::default()
+}).await?;
+# Ok(()) }
+```
+
+Native mode also accepts arbitrary/custom Fal video endpoint paths. Its payload
+must be an object, and the top-level request prompt must be empty. Rath performs
+no model-specific input validation or field translation in this mode.
+
+Merge order is client defaults → request `provider_config` → explicit typed inputs
+or Native payload. Typed inputs clear competing native prompt/media aliases;
+typed T2V/I2V reject `multi_prompt`. Native mode preserves its supplied fields.
+Both paths require results matching Rath's existing video URL/base64 shapes;
+arbitrary non-video output is not a successful video response.
+
+### Authenticated webhooks
+
+Set `VideoRequest.webhook_url` to a final HTTPS destination without embedded
+credentials or a fragment. Rath sends it as Fal's `fal_webhook` query parameter,
+not a model input. Polling is still available for the same job.
+
+```rust,no_run
+use rath::video::{VideoClient, VideoEvent};
+
+async fn decode_callback(
+    client: &dyn VideoClient,
+    headers: &http::HeaderMap,
+    original_body: &[u8],
+) -> Result<VideoEvent, rath::RathError> {
+    client.parse_webhook(headers, original_body).await
+}
+```
+
+Pass the original request bytes, not reserialized JSON. Fal verification rejects
+missing/duplicate/malformed signed headers, invalid signatures, and timestamps
+outside ±300 seconds. It fetches public keys from Fal's fixed JWKS endpoint per
+call with a ten-second timeout, no credentials, no redirects, and no key cache.
+Unsupported adapters return `UnsupportedCapability`.
+
+After successful parsing, the application must:
+
+1. Match `event.job_id` against its stored provider/model/account and owning user.
+2. Durably accept the event and apply idempotent state transitions.
+3. Acknowledge delivery only after durable acceptance; expect duplicate callbacks.
+
+Authentication alone does not authorize a job for an application user. Rath owns
+neither the HTTP receiver nor durable replay/deduplication state. Keep existing
+terminal results from being overwritten by stale polling or callbacks.
+
+Both polling and callbacks return `VideoJobStatus`. A valid Fal `ERROR` notification
+is `Failed`; malformed or incomplete `OK` output, including `payload_error`, returns
+an error rather than a fabricated generation failure. The parser does not follow
+result URLs or resubmit; reconcile the already-submitted job through `get_video`
+using your stored receipt. Results are provider-retained only temporarily.
+
+Returned metadata/error bodies may contain private inputs or signed media URLs.
+Rath does not log those bodies. Download and persist any required media in your
+application; Rath has no file store, job registry, or background worker.
+
+### Video API migration
+
+`VideoRequest.image_url` is removed. Replace it with
+`VideoInput::ImageToVideo { start_image: ImageData::Url { url }, end_image: None }`.
+Use `Native { payload }` for previously untyped endpoints instead of silently
+assuming typed support. Existing prompt-only Rust construction using
+`..VideoRequest::default()` still works on the documented Wan T2V endpoint.
+Serialized requests must include the new tagged `input` field.
+
+Existing job/response types and polling method signatures are unchanged.
+`parse_webhook` has a default unsupported implementation, so existing downstream
+`VideoClient` implementations do not need a new required method.
 
 ## Audio Usage
 
 ```rust
 use rath::audio::tts::{TtsOptions, TtsRequest};
+use rath::audio::voice::Voice;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let client = TtsOptions::default().create("openai:///tts-1")?;
 let response = client.synthesize_speech(&TtsRequest {
     input: "Rath is a stable capability layer for AI applications.".to_string(),
-    voice: Some("alloy".to_string()),
+    voice: Some(Voice::id("openai", "alloy")),
     format: Some("mp3".to_string()),
     ..TtsRequest::default()
 }).await?;
@@ -196,14 +356,22 @@ Fal supports these explicitly mapped endpoints:
 | TTS | `fal:///fal-ai/kokoro/american-english` |
 | TTS | `fal:///fal-ai/elevenlabs/tts/turbo-v2.5` |
 | TTS | `fal:///fal-ai/elevenlabs/tts/eleven-v3` |
+| Voice design | `fal:///fal-ai/qwen-3-tts/voice-design/1.7b` |
+| Speaker embedding | `fal:///fal-ai/qwen-3-tts/clone-voice/1.7b` |
+| Custom voice TTS | `fal:///fal-ai/qwen-3-tts/text-to-speech/1.7b` |
 | STT | `fal:///fal-ai/wizper` |
 | STT | `fal:///fal-ai/elevenlabs/speech-to-text/scribe-v2` |
 
 Set `FAL_KEY`, or select another credential variable with `api_key_env`.
 
+Custom voices use the independent design and cloning APIs below. Design and clone
+endpoints are no longer accepted by `TtsOptions`; cloning is no longer a method on
+`TtsClient`. Every operation has the Fal audio deadline. Rath does not persist files
+or play audio.
+
 Eleven v3 accepts inline audio tags in `TtsRequest.input`, for example
 `[whispers] Stay close. [laughs] I was only teasing.` Rath passes these unchanged;
-it does not generate delivery cues. Use `voice: Some("Rachel".into())` for an
+it does not generate delivery cues. Use `voice: Some(Voice::id("fal/elevenlabs", "Rachel"))` for an
 explicit female voice, or omit it for the endpoint default. Native v3 settings
 such as `stability` go in `provider_config`; no settings are added implicitly.
 Audio tags are model-specific and should not be assumed to work with Turbo.
@@ -211,12 +379,13 @@ Audio tags are model-specific and should not be assumed to work with Turbo.
 ```rust
 use rath::audio::tts::{TtsOptions, TtsRequest};
 use rath::audio::stt::{SttOptions, SttRequest};
+use rath::audio::voice::Voice;
 
 # async fn run() -> Result<(), rath::core::RathError> {
 let tts = TtsOptions::default().create("fal:///fal-ai/kokoro/american-english")?;
 let speech = tts.synthesize_speech(&TtsRequest {
     input: "Hello from Rath.".into(),
-    voice: Some("af_heart".into()),
+    voice: Some(Voice::id("fal/kokoro/american-english", "af_heart")),
     ..Default::default()
 }).await?;
 
@@ -260,6 +429,107 @@ error contract: useful provider messages and status remain visible, while saniti
 response bytes require explicit access through `response_body()`. Failed jobs retain
 their message and metadata. These diagnostics and `raw_metadata` can contain private
 content; they are not automatically suitable for public HTTP responses.
+
+### Storage-free custom voices
+
+`VoiceDesignClient`, `VoiceCloneClient` and `TtsClient` are independent capabilities.
+Each has an `Options { provider_config }` factory taking a model URL. Factory creation
+does not generate media or register a remote voice. Inputs and results are caller-owned.
+There are no file paths, persistence callbacks, registries, caches or automatic pipelines.
+
+```rust
+use rath::audio::{
+    voice_design::{VoiceDesignOptions, VoiceDesignRequest},
+    voice_clone::{VoiceCloneOptions, VoiceCloneRequest},
+    tts::{TtsOptions, TtsRequest},
+};
+
+# async fn run() -> Result<(), rath::core::RathError> {
+let designer = VoiceDesignOptions::default()
+    .create("fal:///fal-ai/qwen-3-tts/voice-design/1.7b")?;
+let previews = designer.design_voice(&VoiceDesignRequest {
+    description: "A warm adult voice with a natural Indian English accent.".into(),
+    text: "Hello. It is good to hear from you. What would you like to talk about?".into(),
+    language: Some("en".into()),
+    ..Default::default()
+}).await?;
+
+// The application selects/auditions a sample. Rath never selects one automatically.
+let sample = previews.previews.into_iter().next().ok_or_else(||
+    rath::core::RathError::new(rath::core::ErrorKind::InvalidResponse, "no previews"))?.sample;
+let cloner = VoiceCloneOptions::default()
+    .create("fal:///fal-ai/qwen-3-tts/clone-voice/1.7b")?;
+let voice = cloner.clone_voice(&VoiceCloneRequest {
+    samples: vec![sample], ..Default::default()
+}).await?;
+
+// Save voice in the application if desired. It is serializable, not stored by Rath.
+let tts = TtsOptions::default()
+    .create("fal:///fal-ai/qwen-3-tts/text-to-speech/1.7b")?;
+let audio = tts.synthesize_speech(&TtsRequest {
+    input: "Welcome back.".into(), voice: Some(voice), ..Default::default()
+}).await?;
+# Ok(())
+# }
+```
+
+`Voice { scope, data }` distinguishes an `Id`, an opaque `Embedding { format, data,
+reference_text }`, and `ReferenceAudio { samples }`. A scope is a compatibility
+namespace, never a credential or routing URL. It must match the selected adapter/model;
+provider IDs may additionally be account-specific. Reference-audio identities are
+representable, but current adapters reject them rather than pretending to support them.
+Changing a scope string does not convert an embedding or transfer a remote voice.
+
+Qwen clones accept exactly one recording with an exact nonblank transcript and no
+`name`. Returned embeddings use scope `fal/qwen3-tts-1.7b` and format
+`qwen3-tts-1.7b/safetensors`. Native embedding fields and data-URI encoding belong to
+the Fal adapter, not the application. Default `max_new_tokens` is 2048 for design
+and 4096 for synthesis; native client/request settings can override these defaults.
+Typed `language` accepts `en`, `zh`, `es`, `fr`, `de`, `it`, `ja`, `ko`, `pt`, `ru`.
+Regional tags are not silently reduced to a base language. Typed `instructions`
+work with Qwen presets, but fail for embeddings because that endpoint ignores them.
+Accent descriptions are requests, not guarantees of audible accuracy.
+
+### Native ElevenLabs voices
+
+Set `ELEVENLABS_API_KEY`. Native endpoints are separate from Fal's ElevenLabs gateway:
+
+| Capability | Model URLs |
+| --- | --- |
+| Design / explicit registration | `elevenlabs:///eleven_ttv_v3`, `elevenlabs:///eleven_multilingual_ttv_v2` |
+| Instant cloning | `elevenlabs:///ivc` |
+| TTS | `elevenlabs:///eleven_v3`, `elevenlabs:///eleven_multilingual_v2`, `elevenlabs:///eleven_turbo_v2_5` |
+
+Design requires a 20–1000 character description and 100–1000 character sample text.
+All returned previews include audio, transcript, scope `elevenlabs/voice-design`,
+and a `registration_token`. That token is **not** a TTS ID and may expire.
+Calling `designer.register_voice(&preview, "Nadia", Some(&json!({
+"voice_description": "A warm and softly spoken adult voice"})))` explicitly registers
+the selected preview. The native description is required; Rath neither remembers
+the earlier request nor manufactures missing metadata.
+
+Alternatively, `VoiceCloneOptions::default().create("elevenlabs:///ivc")` accepts
+one or more `VoiceSample` recordings, an explicit nonblank `name`, and native
+settings. Transcripts are optional for this adapter. Both cloning and registration
+return `Voice::id("elevenlabs", ...)` for use in native TTS. A verification-required
+result is an error with retained response evidence, not a ready voice.
+
+Native TTS accepts MP3 formats `mp3_44100_128` (default) and `mp3_22050_32`.
+Typed language/instructions are currently unsupported for native ElevenLabs and
+the existing OpenAI adapter; explicit requests fail locally. Native settings remain
+available through `provider_config`. Fal Kokoro/ElevenLabs also reject these typed
+controls. Rath does not translate arbitrary descriptions into audio tags.
+
+Remote registration/cloning can create provider-owned resources. Rath performs no
+automatic registration, retries, deletion, verification, training or local storage.
+The application owns remote cleanup decisions. Calls have a five-minute HTTP deadline;
+a timeout/cancellation may leave a remote resource created. Inspect retained error
+evidence before retrying. No credentials are serialized into Voice/VoicePreview.
+
+Migration: replace string `TtsRequest.voice` values with scoped `Voice::id(...)`;
+move old `TtsClient::clone_voice` calls to `VoiceCloneClient`; pass returned `Voice`
+to TTS instead of constructing model-specific JSON. Public request changes are
+breaking; no automatic conversion or provider fallback is performed.
 
 ## LLM Usage
 

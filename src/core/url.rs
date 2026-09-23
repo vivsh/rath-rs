@@ -180,6 +180,7 @@ fn parse_provider_scheme(scheme: &str, original: &str) -> Result<Provider, RathE
         "openai" => Provider::OpenAi,
         "openrouter" => Provider::OpenRouter,
         "fal" => Provider::Fal,
+        "elevenlabs" => Provider::ElevenLabs,
         "anthropic" | "claude" => Provider::Anthropic,
         "ollama" => Provider::Ollama,
         other => {

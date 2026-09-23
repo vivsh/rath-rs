@@ -35,7 +35,7 @@ pub(crate) fn new_stt_client(
 }
 
 /// Reuses the Fal client without changing redirect behavior for existing image/video clients.
-fn audio_client(url: &ModelUrl, config: Option<Value>) -> Result<FalClient, RathError> {
+pub(super) fn audio_client(url: &ModelUrl, config: Option<Value>) -> Result<FalClient, RathError> {
     validate_config(&config)?;
     let mut client = FalClient::new(url, config, "audio")?;
     queue::parse_url(&client.queue_base_url, "queue configuration")?;
@@ -139,9 +139,7 @@ fn tts_payload(
     }
     let mut payload = merged_config(config, &request.provider_config);
     payload.insert(input_field.into(), Value::String(request.input.clone()));
-    if let Some(voice) = &request.voice {
-        payload.insert("voice".into(), Value::String(voice.clone()));
-    }
+    super::voice::condition(model, request, &mut payload)?;
     Ok(payload)
 }
 
@@ -149,7 +147,7 @@ fn tts_payload(
 fn tts_input_field(model: &str) -> Result<&'static str, RathError> {
     match model {
         KOKORO => Ok("prompt"),
-        ELEVENLABS | ELEVENLABS_V3 => Ok("text"),
+        ELEVENLABS | ELEVENLABS_V3 | super::voice::SPEECH => Ok("text"),
         _ => Err(unsupported("text-to-speech")),
     }
 }
@@ -222,7 +220,10 @@ fn audio_url(raw: &Value) -> Result<&str, RathError> {
 }
 
 /// Downloads output without authorization headers and requires an identifiable audio MIME type.
-async fn download(client: &FalClient, raw: &Value) -> Result<(String, Vec<u8>), RathError> {
+pub(super) async fn download(
+    client: &FalClient,
+    raw: &Value,
+) -> Result<(String, Vec<u8>), RathError> {
     let url = audio_url(raw).map_err(|error| error.sanitized(&[&client.api_key]))?;
     let response = http::send(
         client.http.get(

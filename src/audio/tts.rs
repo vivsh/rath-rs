@@ -7,7 +7,7 @@ use crate::core::RathError;
 /// Options used when constructing a text-to-speech client.
 #[derive(Debug, Clone, Default)]
 pub struct TtsOptions {
-    /// Native provider defaults; Fal requires a JSON object and request settings take precedence.
+    /// Native provider defaults; must be an object and request settings take precedence.
     pub provider_config: Option<Value>,
 }
 
@@ -24,12 +24,16 @@ impl TtsOptions {
 pub struct TtsRequest {
     /// Text to synthesize; Fal rejects empty or whitespace-only input.
     pub input: String,
-    /// Native voice identifier; omitted values use the provider's configured default.
-    pub voice: Option<String>,
+    /// Scoped voice identity; omission uses a provider default only where supported.
+    pub voice: Option<super::voice::Voice>,
     /// Per-request model override; Fal accepts only supported synthesis endpoint slugs.
     pub model: Option<String>,
     /// Requested output format; the supported Fal endpoints reject explicit format selection.
     pub format: Option<String>,
+    /// Optional BCP-47 language tag; unsupported explicit selections fail.
+    pub language: Option<String>,
+    /// Per-utterance delivery instructions; unsupported explicit controls fail.
+    pub instructions: Option<String>,
     /// Native request settings, overriding client defaults; supplied typed fields take precedence.
     pub provider_config: Option<serde_json::Value>,
 }

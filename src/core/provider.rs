@@ -13,6 +13,8 @@ pub enum Provider {
     Fal,
     /// Anthropic Claude.
     Anthropic,
+    /// ElevenLabs native voice and speech APIs.
+    ElevenLabs,
 }
 
 impl Provider {
@@ -25,6 +27,7 @@ impl Provider {
             Provider::OpenRouter => "openrouter",
             Provider::Fal => "fal",
             Provider::Anthropic => "anthropic",
+            Provider::ElevenLabs => "elevenlabs",
         }
     }
 }
