@@ -13,8 +13,8 @@ pub(crate) fn validate_measurement(
     messages: &[Message],
     remote: bool,
 ) -> Result<(), RathError> {
-    validate_options(provider.clone(), options)?;
-    validate_tools(provider.clone(), &options.tools)?;
+    validate_measurement_options(&provider, options)?;
+    validate_native_measurement(&provider, options)?;
     if messages.is_empty()
         || matches!(
             messages.last().map(|m| &m.role),
@@ -114,4 +114,42 @@ pub(crate) fn missing_model(body: &str) -> bool {
         ]
         .iter()
         .any(|marker| body.contains(marker))
+}
+
+/// Unknown native settings may carry prompts, so estimates cannot omit them silently.
+fn validate_native_measurement(provider: &Provider, options: &LlmOptions) -> Result<(), RathError> {
+    if let Some(config) = options.provider_config.as_ref().and_then(Value::as_object)
+        && let Some(key) = config.keys().find(|k| {
+            !matches!(
+                k.as_str(),
+                "top_p"
+                    | "top_k"
+                    | "seed"
+                    | "stop"
+                    | "frequency_penalty"
+                    | "presence_penalty"
+                    | "metadata"
+                    | "store"
+                    | "user"
+                    | "service_tier"
+                    | "safetySettings"
+                    | "parallel_tool_calls"
+            )
+        })
+    {
+        return Err(unsupported(
+            provider.clone(),
+            &format!("measurement of provider_config.{key}; prompt effects are not known"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates shared options and tools before projecting any request content.
+fn validate_measurement_options(
+    provider: &Provider,
+    options: &LlmOptions,
+) -> Result<(), RathError> {
+    validate_options(provider.clone(), options)?;
+    validate_tools(provider.clone(), &options.tools)
 }

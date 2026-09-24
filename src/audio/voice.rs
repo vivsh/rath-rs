@@ -18,6 +18,7 @@ pub struct VoiceSample {
 
 /// Serializable voice identity. Credentials and persistence belong to the caller.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Voice {
     /// Adapter-defined provider/model compatibility namespace, not a routing URL.
     pub scope: String,
@@ -28,6 +29,7 @@ pub struct Voice {
 /// Distinguishes provider-owned identities from caller-owned conditioning material.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum VoiceData {
     /// Preset or custom provider identifier; access may be account-specific.
     Id(String),
@@ -124,8 +126,16 @@ pub(crate) fn invalid(message: &str) -> RathError {
 
 /// Validates object-shaped provider configuration before any paid operation.
 pub(crate) fn validate_config(config: Option<&serde_json::Value>) -> Result<(), RathError> {
+    crate::registry::prepare::native(config)?;
     if config.is_some_and(|value| !value.is_object()) {
         return Err(invalid("provider_config must be an object"));
     }
     Ok(())
+}
+
+impl Voice {
+    /// Constructs required values; optional controls start unset.
+    pub fn new(scope: String, data: VoiceData) -> Self {
+        Self { scope, data }
+    }
 }

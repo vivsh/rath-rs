@@ -40,7 +40,7 @@ async fn parse_at(
     decode(client, body).map_err(|error| {
         error
             .with_context(Provider::Fal, OPERATION)
-            .with_body(ErrorBody::Complete(body.to_vec()))
+            .with_raw_body(ErrorBody::Complete(body.to_vec()))
             .sanitized(&[&client.api_key])
     })
 }
@@ -167,7 +167,7 @@ fn verify(keys: &[VerifyingKey], message: &[u8], signature: &Signature) -> Resul
 fn decode(client: &FalClient, body: &[u8]) -> Result<VideoEvent, RathError> {
     let raw: Value = serde_json::from_slice(body).map_err(|cause| {
         RathError::new(ErrorKind::Deserialize, "invalid authenticated webhook JSON")
-            .with_source(RathError::from_error(ErrorKind::Deserialize, &cause))
+            .with_source(RathError::from_native_error(ErrorKind::Deserialize, &cause))
     })?;
     let job_id = raw
         .get("request_id")

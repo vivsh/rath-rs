@@ -1,7 +1,7 @@
 use crate::core::error::http;
+use crate::llm::LlmBackend;
 mod measurement;
 
-use async_trait::async_trait;
 use reqwest::Client as HttpClient;
 use serde_json::{Value, json};
 
@@ -23,10 +23,10 @@ struct OpenRouterClient {
 }
 
 /// Creates an LLM client after validating output caps and resolving credentials.
-pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, RathError> {
+pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<LlmClient, RathError> {
     crate::llm::counting::validate_options(Provider::OpenRouter, &options)?;
     let api_key = required_api_key(url, "OPENROUTER_API_KEY")?;
-    Ok(Box::new(OpenRouterClient {
+    Ok(LlmClient::from_backend(OpenRouterClient {
         http: HttpClient::new(),
         api_key,
         base_url: configured_base_url(url, DEFAULT_BASE_URL),
@@ -36,8 +36,7 @@ pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClie
     }))
 }
 
-#[async_trait]
-impl LlmClient for OpenRouterClient {
+impl LlmBackend for OpenRouterClient {
     fn model_url(&self) -> &ModelUrl {
         &self.url
     }
@@ -140,6 +139,7 @@ fn build_payload(
         "stream": false,
     });
 
+    payload = crate::llm::native_defaults(payload, options.provider_config.as_ref());
     if let Some(cap) = options.max_output_tokens {
         payload["max_tokens"] = json!(cap);
     }
@@ -160,7 +160,7 @@ fn build_payload(
     }
 
     if options.wants_json_output() {
-        payload["response_format"] = match &options.output_schema {
+        payload["response_format"] = match options.output_schema() {
             Some(schema) => json!({
                 "type": "json_schema",
                 "json_schema": {
@@ -319,7 +319,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         return Ok(LlmResponse::new(
             Provider::OpenRouter,
             LlmOutput::ToolCalls {
-                thought: message
+                text: message
                     .get("content")
                     .and_then(Value::as_str)
                     .map(str::to_string),

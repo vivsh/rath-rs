@@ -17,6 +17,7 @@ async fn thinking_levels_reach_wire() {
         let client = LlmOptions::default()
             .with_thinking(level)
             .create(&url(&base, ""))
+            .await
             .unwrap();
         let message = Message::user("  Original Ω\n");
         client
@@ -49,6 +50,7 @@ async fn url_precedence_reaches_wire() {
         let client = LlmOptions::default()
             .with_thinking(level)
             .create(&url(&base, query))
+            .await
             .unwrap();
         client.execute(&[Message::user("hello")]).await.unwrap();
         assert_eq!(
@@ -98,6 +100,7 @@ async fn rejected_effort_preserves_error() {
         let client = LlmOptions::default()
             .with_thinking(Some(level.clone()))
             .create(&url(&base, ""))
+            .await
             .unwrap();
         let error = client.execute(&[Message::user("hello")]).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Http);

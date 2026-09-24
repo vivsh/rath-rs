@@ -15,6 +15,7 @@ async fn json_input_and_output_round_trip() {
         .with_input_schema(json!({"type":"object","properties":{"name":{"type":"string"}}}))
         .with_output_schema(json!({"type":"object","properties":{"city":{"type":"string"}}}))
         .create(&format!("ollama:///model?base_url={base}"))
+        .await
         .unwrap();
     let input_message = Message::from_json(Role::User, &input).unwrap();
     let result = client
@@ -56,6 +57,7 @@ async fn malformed_json_has_useful_private_diagnostics() {
         let client = LlmOptions::default()
             .with_response_format(ResponseFormat::Json)
             .create(&format!("ollama:///model?base_url={base}"))
+            .await
             .unwrap();
         let error = client
             .execute(&[Message::user("extract")])
@@ -85,6 +87,7 @@ async fn malformed_tool_argument_json_is_an_error() {
     let (base, _requests) = serve(200, wire.clone());
     let client = options(ToolChoice::Required)
         .create(&format!("ollama:///model?base_url={base}"))
+        .await
         .unwrap();
     let error = client
         .execute(&[Message::user("lookup")])
@@ -111,6 +114,7 @@ async fn unsupported_json_mode_keeps_provider_rejection() {
     let client = LlmOptions::default()
         .with_response_format(ResponseFormat::Json)
         .create(&format!("ollama:///model?base_url={base}"))
+        .await
         .unwrap();
     let error = client
         .execute(&[Message::user("extract")])
@@ -125,8 +129,8 @@ async fn unsupported_json_mode_keeps_provider_rejection() {
 }
 
 /// Output-limit signals take precedence over malformed JSON, tool-call policy and exit extraction.
-#[test]
-fn truncation_precedes_structured_parsing() {
+#[tokio::test]
+async fn truncation_precedes_structured_parsing() {
     let opts = options(ToolChoice::Required).with_response_format(ResponseFormat::Json);
     for message in [json!({"content":"{"}), json!({"tool_calls":[{}]})] {
         assert_eq!(
@@ -142,12 +146,13 @@ fn truncation_precedes_structured_parsing() {
 #[tokio::test]
 async fn exit_tool_json_output_survives_validation() {
     let mut tool = call();
-    tool["function"] = json!({"name":"final_answer","arguments":"{\"answer\":42}"});
+    tool["function"] = json!({"name":"__rath_final_output","arguments":"{\"answer\":42}"});
     let (base, _requests) = serve(200, response(json!({"tool_calls":[tool]}), "tool_calls"));
-    let mut opts = options(ToolChoice::Auto).with_output_schema(json!({"type":"object"}));
-    opts.output_type_name = "final_answer".into();
+    let opts = options(ToolChoice::Auto).with_output_schema(json!({"type":"object"}));
+
     let client = opts
         .create(&format!("ollama:///model?base_url={base}"))
+        .await
         .unwrap();
     let result = client.execute(&[Message::user("answer")]).await.unwrap();
     assert!(matches!(result.output,LlmOutput::Output(v) if v==json!({"answer":42})));

@@ -6,6 +6,7 @@ use serde_json::Value;
 /// Explicit operation inputs; typed variants require compatible endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum VideoInput {
     /// Generate a shot from the required request prompt.
     #[default]
@@ -33,6 +34,7 @@ pub enum VideoInput {
 
 /// Caller-owned generation request; Rath does not upload files or retain inputs.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct VideoRequest {
     /// Required for typed T2V/I2V, optional for motion, and empty in Native mode.
     pub prompt: String,
@@ -47,6 +49,7 @@ pub struct VideoRequest {
 /// Encoded video or remote location, usable as input or caller-owned output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum VideoData {
     /// HTTP(S) location; input media is not downloaded by Rath.
     Url {
@@ -64,6 +67,7 @@ pub enum VideoData {
 
 /// Generated media; downloading and persistence belong to the caller.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct VideoResponse {
     /// Nonempty media for a successful adapter result.
     pub videos: Vec<VideoData>,
@@ -73,6 +77,7 @@ pub struct VideoResponse {
 
 /// Caller-owned submission receipt, not a mutable registry entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct VideoJob {
     /// Stable queue identifier.
     pub id: String,
@@ -93,6 +98,7 @@ pub struct VideoJob {
 /// Remote state snapshot; the caller owns transitions and reconciliation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum VideoJobStatus {
     /// Accepted but not executing.
     Queued {
@@ -122,9 +128,94 @@ pub enum VideoJobStatus {
 
 /// Authenticated notification; authorization and deduplication remain caller-owned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct VideoEvent {
     /// Stable ID to match against the caller's provider/model/account record.
     pub job_id: String,
     /// Same status representation as polling.
     pub status: VideoJobStatus,
+}
+
+impl VideoRequest {
+    /// Constructs required values; optional controls start unset.
+    pub fn new(prompt: String, input: VideoInput) -> Self {
+        Self {
+            prompt,
+            input,
+            webhook_url: None,
+            provider_config: None,
+        }
+    }
+    /// Sets `webhook_url` for this value.
+    pub fn with_webhook_url(mut self, value: String) -> Self {
+        self.webhook_url = Some(value);
+        self
+    }
+    /// Sets `provider_config` for this value.
+    pub fn with_provider_config(mut self, value: Value) -> Self {
+        self.provider_config = Some(value);
+        self
+    }
+}
+
+impl VideoResponse {
+    /// Constructs required values; optional controls start unset.
+    pub fn new(videos: Vec<VideoData>) -> Self {
+        Self {
+            videos,
+            raw_metadata: None,
+        }
+    }
+    /// Sets `raw_metadata` for this value.
+    pub fn with_raw_metadata(mut self, value: Value) -> Self {
+        self.raw_metadata = Some(value);
+        self
+    }
+}
+
+impl VideoJob {
+    /// Constructs required values; optional controls start unset.
+    pub fn new(id: String, provider: Provider) -> Self {
+        Self {
+            id,
+            provider,
+            provider_model: None,
+            status_url: None,
+            response_url: None,
+            cancel_url: None,
+            raw_metadata: None,
+        }
+    }
+    /// Sets `provider_model` for this value.
+    pub fn with_provider_model(mut self, value: String) -> Self {
+        self.provider_model = Some(value);
+        self
+    }
+    /// Sets `status_url` for this value.
+    pub fn with_status_url(mut self, value: String) -> Self {
+        self.status_url = Some(value);
+        self
+    }
+    /// Sets `response_url` for this value.
+    pub fn with_response_url(mut self, value: String) -> Self {
+        self.response_url = Some(value);
+        self
+    }
+    /// Sets `cancel_url` for this value.
+    pub fn with_cancel_url(mut self, value: String) -> Self {
+        self.cancel_url = Some(value);
+        self
+    }
+    /// Sets `raw_metadata` for this value.
+    pub fn with_raw_metadata(mut self, value: Value) -> Self {
+        self.raw_metadata = Some(value);
+        self
+    }
+}
+
+impl VideoEvent {
+    /// Constructs required values; optional controls start unset.
+    pub fn new(job_id: String, status: VideoJobStatus) -> Self {
+        Self { job_id, status }
+    }
 }

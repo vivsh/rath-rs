@@ -2,11 +2,13 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use super::{Provider, RathError};
+use crate::ErrorKind;
 
 /// Reasoning depth requested from the model.
 ///
 /// Maps to a provider-specific token budget or reasoning flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ThinkingLevel {
     /// Disable thinking (budget = 0).
     Off,
@@ -53,6 +55,7 @@ impl std::fmt::Display for ThinkingLevel {
 /// Currently only used by Anthropic. Other providers handle caching
 /// automatically and ignore this setting.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CacheControl {
     /// Ephemeral 5-minute cache (default Anthropic TTL).
     Ephemeral5m,
@@ -69,21 +72,21 @@ pub enum CacheControl {
 /// - Whitelisted query params: `temperature`, `thinking`, `api_key_env`, `cache`, `base_url`
 ///
 /// Rejected: fragments, inline credentials, non-empty authority, unknown/duplicate query params.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModelUrl {
-    pub provider: Provider,
+    pub(crate) provider: Provider,
     /// Provider-native model id or endpoint slug.
-    pub model: String,
+    pub(crate) model: String,
     /// API key resolved from `api_key_env` at parse time, or `None`.
-    pub api_key: Option<String>,
+    pub(crate) api_key: Option<String>,
     /// Custom endpoint URL. `None` means use the provider default.
-    pub base_url: Option<String>,
+    pub(crate) base_url: Option<String>,
     /// Sampling temperature in `[0.0, 1.0]`.
-    pub temperature: Option<f32>,
+    pub(crate) temperature: Option<f32>,
     /// Reasoning depth. `None` means use the provider default.
-    pub thinking: Option<ThinkingLevel>,
+    pub(crate) thinking: Option<ThinkingLevel>,
     /// Prompt caching policy. `None` means no explicit cache control.
-    pub cache: Option<CacheControl>,
+    pub(crate) cache: Option<CacheControl>,
 }
 
 impl ModelUrl {
@@ -93,50 +96,62 @@ impl ModelUrl {
     /// name, out-of-range temperature, unknown/duplicate query params, or
     /// unset `api_key_env` variable.
     pub fn parse(s: &str) -> Result<Self, RathError> {
-        if s.contains('#') {
-            return Err(RathError::new(
-                crate::core::ErrorKind::InvalidUrl,
-                "URL must not contain a fragment",
-            ));
-        }
-        let (scheme_part, rest) = s.split_once("://").ok_or_else(|| {
-            RathError::new(
-                crate::core::ErrorKind::InvalidUrl,
-                format!("missing '://' in '{s}'; expected e.g. gemini:///model-name"),
-            )
-        })?;
-        // Reject inline credentials (user:pass@host) by checking the authority
-        let authority_candidate = rest.split('/').next().unwrap_or("");
-        if authority_candidate.contains('@') {
-            return Err(RathError::new(
-                crate::core::ErrorKind::InvalidUrl,
-                "inline credentials are not allowed; use the api_key_env query parameter",
-            ));
-        }
-        let provider = parse_provider_scheme(scheme_part, s)?;
-        let (path_authority, query_str) = match rest.split_once('?') {
-            Some((p, q)) => (p, Some(q)),
-            None => (rest, None),
-        };
-        let segments = parse_model_path(path_authority, s)?;
-        if segments.is_empty() {
-            return Err(RathError::new(
-                crate::core::ErrorKind::InvalidUrl,
-                format!("'{s}' must contain a model name as the final path segment"),
-            ));
-        }
-        let model = segments.join("/");
-        let (temperature, thinking, api_key, cache, base_url) = parse_query_str(query_str, s)?;
-        Ok(ModelUrl {
-            provider,
-            model,
-            api_key,
-            base_url,
-            temperature,
-            thinking,
-            cache,
-        })
+        let (scheme, rest) = split_locator(s)?;
+        parse_parts(parse_provider_scheme(scheme, s)?, rest, s)
     }
+}
+
+/// Splits a locator and rejects credentials, authorities handled later, and fragments.
+pub(crate) fn split_locator(s: &str) -> Result<(&str, &str), RathError> {
+    if s.contains('#') {
+        return Err(RathError::new(
+            crate::core::ErrorKind::InvalidUrl,
+            "URL must not contain a fragment",
+        ));
+    }
+    let (scheme_part, rest) = s.split_once("://").ok_or_else(|| {
+        RathError::new(
+            crate::core::ErrorKind::InvalidUrl,
+            format!("missing '://' in '{s}'; expected e.g. gemini:///model-name"),
+        )
+    })?;
+    // Reject inline credentials (user:pass@host) by checking the authority
+    let authority_candidate = rest.split('/').next().unwrap_or("");
+    if authority_candidate.contains('@') {
+        return Err(RathError::new(
+            crate::core::ErrorKind::InvalidUrl,
+            "inline credentials are not allowed; use the api_key_env query parameter",
+        ));
+    }
+    Ok((scheme_part, rest))
+}
+
+/// Builds an operation-local URL after its provider has been resolved by the caller.
+pub(crate) fn parse_parts(provider: Provider, rest: &str, s: &str) -> Result<ModelUrl, RathError> {
+    let (path_authority, query_str) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    let segments = parse_model_path(path_authority, s)?;
+    if segments.is_empty() {
+        return Err(RathError::new(
+            crate::core::ErrorKind::InvalidUrl,
+            format!("'{s}' must contain a model name as the final path segment"),
+        ));
+    }
+    let model = segments.join("/");
+    let (temperature, thinking, api_key, cache, base_url) = parse_query_str(query_str, s)?;
+    let url = ModelUrl {
+        provider,
+        model,
+        api_key,
+        base_url,
+        temperature,
+        thinking,
+        cache,
+    };
+    validate_endpoint(&url)?;
+    Ok(url)
 }
 
 /// Returns `true` when Gemini models below version 3.1 need an exit-tool workaround.
@@ -153,18 +168,6 @@ pub(crate) fn gemini_needs_exit_tool(model: &str) -> bool {
     (major, minor) < (3, 1)
 }
 
-impl ModelUrl {
-    /// Returns `true` when this URL's provider uses an exit-tool strategy to
-    /// collect structured output (Ollama always; Gemini before version 3.1).
-    pub fn needs_exit_tool(&self) -> bool {
-        match self.provider {
-            Provider::Ollama => true,
-            Provider::Gemini => gemini_needs_exit_tool(&self.model),
-            _ => false,
-        }
-    }
-}
-
 fn parse_provider_scheme(scheme: &str, original: &str) -> Result<Provider, RathError> {
     if scheme.contains('+') {
         return Err(RathError::new(
@@ -175,25 +178,12 @@ fn parse_provider_scheme(scheme: &str, original: &str) -> Result<Provider, RathE
         ));
     }
 
-    let provider = match scheme {
-        "gemini" => Provider::Gemini,
-        "openai" => Provider::OpenAi,
-        "openrouter" => Provider::OpenRouter,
-        "fal" => Provider::Fal,
-        "elevenlabs" => Provider::ElevenLabs,
-        "anthropic" | "claude" => Provider::Anthropic,
-        "ollama" => Provider::Ollama,
-        other => {
-            return Err(RathError::new(
-                crate::core::ErrorKind::InvalidUrl,
-                format!(
-                    "unknown provider '{other}' in '{original}'; expected gemini, openai, openrouter, fal, anthropic, claude, or ollama"
-                ),
-            ));
-        }
-    };
-
-    Ok(provider)
+    super::builtin(scheme).ok_or_else(|| {
+        RathError::new(
+            crate::core::ErrorKind::InvalidUrl,
+            format!("unknown provider '{scheme}' in '{original}'; expected gemini, openai, openrouter, fal, anthropic, claude, or ollama"),
+        )
+    })
 }
 
 fn parse_model_path(path_authority: &str, original: &str) -> Result<Vec<String>, RathError> {
@@ -276,7 +266,10 @@ fn parse_query_str(query_str: Option<&str>, original: &str) -> Result<ParsedQuer
 }
 
 /// Checks the syntax of one query pair without discarding the offending location.
-fn parse_pair<'a>(pair: &'a str, original: &str) -> Result<(&'a str, &'a str), RathError> {
+pub(crate) fn parse_pair<'a>(
+    pair: &'a str,
+    original: &str,
+) -> Result<(&'a str, &'a str), RathError> {
     let (key, value) = pair.split_once('=').ok_or_else(|| {
         invalid_url(format!(
             "query parameter '{pair}' in '{original}' must be key=value"
@@ -296,7 +289,10 @@ fn parse_temperature(value: &str, original: &str) -> Result<f32, RathError> {
         invalid_url(format!(
             "temperature must be a number in '{original}', got '{value}'"
         ))
-        .with_source(RathError::from_error(crate::core::ErrorKind::Other, &error))
+        .with_source(RathError::from_native_error(
+            crate::core::ErrorKind::Other,
+            &error,
+        ))
     })?;
     if !(0.0..=1.0).contains(&temperature) {
         return Err(invalid_url(format!(
@@ -337,3 +333,74 @@ fn invalid_url(message: String) -> RathError {
 
 #[cfg(test)]
 mod tests;
+
+impl ModelUrl {
+    /// Provider identity resolved by the locator.
+    pub fn provider(&self) -> &Provider {
+        &self.provider
+    }
+    /// Bound provider-native model identifier.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+    /// Resolved credential for extension factories; never log this value.
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+    /// Explicit validated endpoint override.
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+    /// Explicit URL sampling control.
+    pub fn temperature(&self) -> Option<f32> {
+        self.temperature
+    }
+    /// Explicit URL thinking control.
+    pub fn thinking(&self) -> Option<&ThinkingLevel> {
+        self.thinking.as_ref()
+    }
+    /// Explicit URL cache policy.
+    pub fn cache(&self) -> Option<&CacheControl> {
+        self.cache.as_ref()
+    }
+}
+impl std::fmt::Debug for ModelUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let diagnostic = RathError::new(
+            crate::ErrorKind::Other,
+            format!(
+                "{:?}:{} endpoint={:?}",
+                self.provider, self.model, self.base_url
+            ),
+        )
+        .sanitized(&self.api_key.as_deref().into_iter().collect::<Vec<_>>());
+        f.debug_struct("ModelUrl")
+            .field("locator", &diagnostic.message())
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("temperature", &self.temperature)
+            .field("thinking", &self.thinking)
+            .field("cache", &self.cache)
+            .finish()
+    }
+}
+
+/// External deployments must have a valid HTTP(S) endpoint without embedded credentials.
+pub(crate) fn validate_endpoint(url: &ModelUrl) -> Result<(), RathError> {
+    let Some(base) = &url.base_url else {
+        return Ok(());
+    };
+    let parsed = reqwest::Url::parse(base)
+        .map_err(|cause| RathError::from_error(ErrorKind::InvalidUrl, &cause, &[]))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(RathError::new(
+            ErrorKind::InvalidUrl,
+            "base_url must be HTTP(S) with a host and without credentials or fragments",
+        ));
+    }
+    Ok(())
+}

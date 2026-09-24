@@ -17,6 +17,7 @@ async fn exact_thinking_wire_mapping() {
         let client = LlmOptions::default()
             .with_thinking(level)
             .create(&format!("ollama:///qwen3:8b?base_url={base}"))
+            .await
             .unwrap();
         let messages = [
             Message::user("  Original Ω\n"),
@@ -56,6 +57,7 @@ async fn url_thinking_precedence_reaches_wire() {
         let client = LlmOptions::default()
             .with_thinking(programmatic)
             .create(&format!("ollama:///model?base_url={base}{query}"))
+            .await
             .unwrap();
         client.execute(&[Message::user("hello")]).await.unwrap();
         let request = requests.try_recv().unwrap();
@@ -74,6 +76,7 @@ async fn off_with_structured_output() {
         .with_output_schema(json!({"type":"object", "properties":{"name":{"type":"string"}}}))
         .with_max_output_tokens(256)
         .create(&format!("ollama:///granite4.2:3b?base_url={base}"))
+        .await
         .unwrap();
     let response = client
         .execute(&[Message::user("Extract Ada's name.")])
@@ -129,6 +132,7 @@ async fn unsupported_effort_keeps_provider_error() {
         let client = LlmOptions::default()
             .with_thinking(Some(level.clone()))
             .create(&format!("ollama:///model?base_url={base}"))
+            .await
             .unwrap();
         let error = client.execute(&[Message::user("hello")]).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Http);
@@ -151,10 +155,11 @@ async fn unsupported_effort_keeps_provider_error() {
 }
 
 /// Invalid URL levels remain typed validation failures before any provider dispatch.
-#[test]
-fn unknown_url_effort_is_rejected() {
+#[tokio::test]
+async fn unknown_url_effort_is_rejected() {
     let error = LlmOptions::default()
         .create("ollama:///model?thinking=unsupported")
+        .await
         .err()
         .unwrap();
     assert_eq!(error.kind(), ErrorKind::InvalidUrl);

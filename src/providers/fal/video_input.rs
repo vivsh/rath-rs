@@ -14,6 +14,7 @@ pub(super) fn invalid(message: &str) -> RathError {
 }
 
 pub(super) fn validate_config(config: &Option<Value>) -> Result<(), RathError> {
+    crate::registry::prepare::native(config.as_ref())?;
     if config.as_ref().is_some_and(|value| !value.is_object()) {
         return Err(invalid("provider_config must be an object"));
     }

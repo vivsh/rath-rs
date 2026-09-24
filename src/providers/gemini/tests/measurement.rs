@@ -7,7 +7,6 @@ fn client(options: LlmOptions) -> GeminiClient {
             .unwrap(),
         options,
         url: ModelUrl::parse("gemini:///selected-model").unwrap(),
-        exit_tool_name: None,
     }
 }
 
@@ -79,8 +78,8 @@ async fn provider_count_uses_full_request_envelope() {
 }
 
 /// Limit signals win over empty/invalid JSON and partial function-call handling.
-#[test]
-fn truncation_precedes_parsing() {
+#[tokio::test]
+async fn truncation_precedes_parsing() {
     let response: GenerationResponse = serde_json::from_value(json!({"candidates":[{"finishReason":"MAX_TOKENS","content":{"role":"model","parts":[{"text":"{"}]}}]})).unwrap();
     assert!(matches!(
         map_response(response, true),
@@ -207,3 +206,5 @@ fn message_keys_never_enter_provider_payloads() {
         serde_json::to_value(keyed).unwrap()
     );
 }
+
+use crate::llm::LlmBackend;

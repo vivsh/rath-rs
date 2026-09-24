@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,29 +7,46 @@ pub use crate::core::{
 };
 
 pub use super::tool::ToolDefinition;
-use super::{TokenCount, counting};
 
 /// A binary or URL attachment that can accompany a message.
 /// Attachments are carried through the history layer and translated into
 /// provider-specific wire formats by each LLM adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Attachment {
     /// Inline binary data (e.g. a screenshot).
     /// `data` must be base64-encoded.
-    Inline { mime_type: String, data: String },
+    Inline {
+        /// Media MIME type.
+        mime_type: String,
+        /// Standard base64-encoded bytes.
+        data: String,
+    },
     /// File path that should be materialized by the caller before dispatch.
-    File { mime_type: String, path: String },
+    File {
+        /// Media MIME type.
+        mime_type: String,
+        /// Caller-owned path, requiring materialization before provider dispatch.
+        path: String,
+    },
     /// Reference to a publicly accessible URL.
-    Url { mime_type: String, url: String },
+    Url {
+        /// Media MIME type.
+        mime_type: String,
+        /// Provider-accessible URL.
+        url: String,
+    },
 }
 
+/// Legacy alias for the shared model locator.
 #[deprecated(note = "use rath::core::ModelUrl")]
 pub type LlmUrl = ModelUrl;
 
 /// Role of a message in provider-facing history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Role {
     /// System-level instructions prepended before user history.
     System,
@@ -40,16 +56,23 @@ pub enum Role {
     Assistant,
     /// Assistant turn that carries tool calls.
     /// The enclosing [`Message`] keeps any accompanying text in `content`.
-    AssistantToolCalls { calls: Vec<ToolCall> },
+    AssistantToolCalls {
+        /// Calls emitted in this assistant turn.
+        calls: Vec<ToolCall>,
+    },
     /// Tool result fed back to the model.
     /// `call_id` must match the originating [`ToolCall`].
-    Tool { call_id: String },
+    Tool {
+        /// Identifier of the originating tool call.
+        call_id: String,
+    },
 }
 
 /// One history message prepared for provider dispatch.
 /// File attachments should be converted to inline or URL attachments before
 /// calling a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Message {
     /// Opaque application identity, assigned and interpreted by the caller.
     /// Preserved in storage serialization; excluded from provider requests and token counts.
@@ -110,11 +133,12 @@ impl Message {
     }
 
     /// Builds a message by JSON-encoding `value`.
-    pub fn from_json(role: Role, value: &impl serde::Serialize) -> Result<Self, serde_json::Error> {
+    pub fn from_json(role: Role, value: &impl serde::Serialize) -> Result<Self, RathError> {
         Ok(Message {
             key: None,
             role,
-            content: serde_json::to_string(value)?,
+            content: serde_json::to_string(value)
+                .map_err(|e| RathError::from_native_error(ErrorKind::Serialize, &e))?,
             attachments: Vec::new(),
             usage: None,
         })
@@ -164,6 +188,7 @@ impl Message {
 
 /// Tool call requested by the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolCall {
     /// Correlation id that must be echoed back in [`Role::Tool`].
     pub id: String,
@@ -185,13 +210,15 @@ pub enum LlmOutput {
     /// Tool calls requested by the model.
     ToolCalls {
         /// Accompanying text emitted with the tool calls.
-        thought: Option<String>,
+        text: Option<String>,
+        /// Calls to dispatch, subject to the application tool policy.
         calls: Vec<ToolCall>,
     },
 }
 
 /// Provider-normalized result from one model call.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct LlmResponse {
     /// Parsed model output.
     pub output: LlmOutput,
@@ -274,17 +301,23 @@ pub enum ToolChoice {
 }
 
 /// Controls how providers should format assistant output.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ResponseFormat {
     /// Return plain text.
     #[default]
     Text,
     /// Return JSON content.
     Json,
+    /// Requests JSON conforming to this schema; parsing is not full schema validation.
+    JsonSchema {
+        /// Schema used by the adapter to request structured output.
+        schema: Value,
+    },
 }
 
 /// Per-call client settings.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct LlmOptions {
     /// Provider generation-token cap, including reasoning where applicable.
     /// Zero, unrepresentable values, and provider_config cap aliases are rejected.
@@ -299,10 +332,8 @@ pub struct LlmOptions {
     pub thinking: Option<ThinkingLevel>,
     /// Tool-call policy.
     pub tool_choice: ToolChoice,
-    /// JSON Schema for the user payload.
+    /// Prompt hint describing user JSON; Rath does not validate input against this schema.
     pub input_schema: Option<Value>,
-    /// JSON Schema for structured output.
-    pub output_schema: Option<Value>,
     /// Preferred assistant output format.
     pub response_format: ResponseFormat,
     /// Sampling temperature.
@@ -312,16 +343,6 @@ pub struct LlmOptions {
     /// Prompt caching policy. `None` means no explicit cache control.
     /// Currently only used by Anthropic; other providers cache automatically.
     pub cache: Option<CacheControl>,
-    /// Maximum LLM dispatch turns. When `Some(n)`, a last-turn reminder is
-    /// injected on the final turn. A factory layer may override the value set
-    /// by `AgentConfig` by writing to this field before returning the client.
-    pub turn_budget: Option<u32>,
-    /// Overrides the default last-turn reminder injected when `turn_budget` is
-    /// reached. `None` uses the provider-appropriate default.
-    pub turn_budget_message: Option<String>,
-    /// Name of the output type expected from this agent run.
-    /// Used by clients that need to inject an exit tool.
-    pub output_type_name: String,
 }
 
 impl LlmOptions {
@@ -384,13 +405,12 @@ impl LlmOptions {
     }
 
     pub(crate) fn wants_json_output(&self) -> bool {
-        self.response_format == ResponseFormat::Json
+        !matches!(self.response_format, ResponseFormat::Text)
     }
 
     /// Sets the structured-output schema and enables JSON output mode.
     pub fn with_output_schema(mut self, schema: Value) -> Self {
-        self.output_schema = Some(schema);
-        self.response_format = ResponseFormat::Json;
+        self.response_format = ResponseFormat::JsonSchema { schema };
         self
     }
 
@@ -425,18 +445,10 @@ impl LlmOptions {
     }
 
     /// Builds a provider client; explicit URL temperature, thinking and cache override these options.
-    pub fn create(mut self, llm_url: &str) -> Result<Box<dyn LlmClient>, RathError> {
-        let url = ModelUrl::parse(llm_url)?;
-        if url.temperature.is_some() {
-            self.temperature = url.temperature;
-        }
-        if url.thinking.is_some() {
-            self.thinking = url.thinking.clone();
-        }
-        if url.cache.is_some() {
-            self.cache = url.cache.clone();
-        }
-        crate::providers::create_llm_client(&url, self)
+    pub async fn create(self, model_url: &str) -> Result<LlmClient, RathError> {
+        crate::registry::ProviderRegistry::with_builtins()
+            .llm(model_url, self)
+            .await
     }
 }
 
@@ -470,40 +482,6 @@ pub(crate) fn validate_tools(
     Ok(())
 }
 
-/// Injects a synthetic exit-tool into `options`, converting structured-output
-/// delivery into a required tool call.
-///
-/// Moves `output_schema` into a [`ToolDefinition`], sets `tool_choice` to
-/// [`ToolChoice::Required`], clears `output_schema`, and resets
-/// `response_format` to [`ResponseFormat::Text`].
-pub(crate) fn inject_exit_tool(options: &mut LlmOptions) {
-    if options.output_type_name.is_empty() {
-        return;
-    }
-    let name = options.output_type_name.clone();
-    let parameters = options
-        .output_schema
-        .take()
-        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-    options.tools.push(ToolDefinition {
-        name,
-        description: "Submit your final answer.".to_string(),
-        parameters,
-    });
-    options.tool_choice = ToolChoice::Required;
-    options.response_format = ResponseFormat::Text;
-}
-
-/// Searches `calls` for a tool call whose name matches `name`.
-///
-/// Returns the call's argument payload when found.
-pub(crate) fn extract_exit_tool_call(calls: &[ToolCall], name: &str) -> Option<Value> {
-    calls
-        .iter()
-        .find(|c| c.name == name)
-        .map(|c| c.args.clone())
-}
-
 #[allow(dead_code)]
 pub(crate) fn parse_json_output(text: &str) -> Result<Value, RathError> {
     serde_json::from_str(text).map_err(|e| RathError::deserialize(&e, text))
@@ -524,157 +502,64 @@ pub(crate) fn decode_output_text(text: &str, wants_json_output: bool) -> Result<
 /// Options are fixed at construction time and owned by the implementation.
 /// Callers push input messages to history before calling `execute`, and
 /// push tool-result messages after dispatch.
-#[async_trait]
-pub trait LlmClient: Send + Sync {
-    /// The parsed model URL used to construct this client.
-    fn model_url(&self) -> &ModelUrl;
+use super::client::LlmClient;
 
-    /// The options this client was constructed with.
-    ///
-    /// Factory layers may override fields such as `turn_budget` or
-    /// `turn_budget_message` on the `LlmOptions` passed to `create`, and
-    /// the runtime reads them back through this accessor.
-    fn options(&self) -> &LlmOptions;
-
-    /// Estimates the full request locally, including adapter instructions and tools.
-    /// This padded estimate supports monitoring, not strict context admission.
-    /// Media or unsupported request components return an error.
-    ///
-    /// ```no_run
-    /// use rath::llm::{LlmClient, Message, RathError};
-    /// fn monitor(client: &dyn LlmClient, messages: &[Message]) -> Result<u64, RathError> {
-    ///     Ok(client.estimate_tokens(messages)?.input_tokens)
-    /// }
-    /// ```
-    fn estimate_tokens(&self, _messages: &[Message]) -> Result<TokenCount, RathError> {
-        Err(counting::unsupported(
-            self.provider(),
-            "local token estimation",
-        ))
-    }
-
-    /// Requests the provider's full input count without generation or fallback.
-    /// Provider counts may differ from subsequent generation usage.
-    async fn count_tokens(&self, _messages: &[Message]) -> Result<TokenCount, RathError> {
-        Err(counting::unsupported(
-            self.provider(),
-            "provider token counting",
-        ))
-    }
-
-    /// Estimates one user message on this model, excluding client instructions/options.
-    /// Includes minimal-request framing; compare directly to a summary budget.
-    /// Never subtract padded request estimates to measure standalone content.
-    fn estimate_content_tokens(&self, _content: &str) -> Result<TokenCount, RathError> {
-        Err(counting::unsupported(
-            self.provider(),
-            "standalone token estimation",
-        ))
-    }
-
-    /// Counts a minimal one-user-message request using this model and endpoint.
-    /// Excludes client instructions/options but includes provider framing overhead.
-    async fn count_content_tokens(&self, _content: &str) -> Result<TokenCount, RathError> {
-        Err(counting::unsupported(
-            self.provider(),
-            "standalone provider counting",
-        ))
-    }
-
-    /// The provider backing this client instance.
-    fn provider(&self) -> Provider {
-        self.model_url().provider.clone()
-    }
-
-    /// Returns `true` when this client uses an exit-tool strategy to collect
-    /// structured output (Ollama always; Gemini before version 3.1).
-    fn uses_exit_tool(&self) -> bool {
-        self.model_url().needs_exit_tool()
-    }
-
-    /// Wraps a reminder message in a provider-appropriate envelope.
-    ///
-    /// Anthropic and Gemini use an XML `<system-reminder>` wrapper; all other
-    /// providers return the text unchanged.
-    fn wrap_system_reminder(&self, text: &str) -> String {
-        match self.provider() {
-            Provider::Anthropic | Provider::Gemini => {
-                format!("<system-reminder><critical>{text}</critical></system-reminder>")
-            }
-            _ => text.to_string(),
+impl LlmOptions {
+    /// Returns the schema from the sole authoritative response format.
+    pub(crate) fn output_schema(&self) -> Option<&Value> {
+        match &self.response_format {
+            ResponseFormat::JsonSchema { schema } => Some(schema),
+            _ => None,
         }
-    }
-
-    /// Returns a default turn-budget reminder message for this provider.
-    ///
-    /// When `exit_tool_name` is `Some`, the message names the exit tool to call.
-    fn default_turn_budget_message(&self, exit_tool_name: Option<&str>) -> String {
-        if let Some(name) = exit_tool_name {
-            let msg = format!(
-                "This is your final response turn. \
-                 Call the `{name}` tool with your final answer now."
-            );
-            return self.wrap_system_reminder(&msg);
-        }
-        match self.provider() {
-            Provider::Anthropic | Provider::Gemini => {
-                "<system-reminder>\
-                 <critical>TURN LIMIT REACHED</critical>\
-                 <constraint>This is your final response turn. \
-                 Do not call any more tools. \
-                 Provide your best answer now, following the output format already specified.</constraint>\
-                 </system-reminder>"
-                    .to_string()
-            }
-            _ => {
-                "FINAL TURN: do not call any more tools. \
-                 Provide your best answer now, following the output format already specified."
-                    .to_string()
-            }
-        }
-    }
-
-    /// Dispatches a validated request and rejects token-limited output before interpreting it.
-    /// Generates once using fixed client options; token-limited output is an error.
-    async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError>;
-}
-
-/// Creates a [`LlmClient`] from a model URL and call-time options.
-///
-/// Implement this trait to inject alternative backends (e.g. mocks) into a
-/// application pipeline. The default implementation delegates to
-/// [`LlmOptions::create`].
-pub trait LlmClientFactory: Send + Sync + 'static {
-    fn create(&self, model_url: &str, options: LlmOptions)
-    -> Result<Box<dyn LlmClient>, RathError>;
-
-    /// Wraps this factory with `layer`.
-    /// The most recently added layer becomes the outermost wrapper.
-    fn layer<L>(self, layer: L) -> L::Factory
-    where
-        Self: Sized,
-        L: LlmClientFactoryLayer<Self>,
-    {
-        layer.layer(self)
     }
 }
 
-/// Decorates one [`LlmClientFactory`] with another.
-pub trait LlmClientFactoryLayer<F> {
-    type Factory: LlmClientFactory;
-
-    fn layer(self, inner: F) -> Self::Factory;
+impl Message {
+    /// Constructs required values; optional controls start unset.
+    pub fn new(role: Role, content: String) -> Self {
+        Self {
+            key: None,
+            role,
+            content,
+            attachments: Vec::new(),
+            usage: None,
+        }
+    }
 }
 
-/// Default factory — creates real provider clients via [`LlmOptions::create`].
-pub struct DefaultLlmClientFactory;
-
-impl LlmClientFactory for DefaultLlmClientFactory {
-    fn create(
-        &self,
-        model_url: &str,
-        options: LlmOptions,
-    ) -> Result<Box<dyn LlmClient>, RathError> {
-        options.create(model_url)
+impl ToolCall {
+    /// Constructs required values; optional controls start unset.
+    pub fn new(id: String, name: String, args: Value) -> Self {
+        Self {
+            id,
+            name,
+            args,
+            thought_signatures: None,
+        }
     }
+    /// Sets `thought_signatures` for this value.
+    pub fn with_thought_signatures(mut self, value: Vec<String>) -> Self {
+        self.thought_signatures = Some(value);
+        self
+    }
+}
+
+impl LlmOptions {
+    /// Sets `cache` for this value.
+    pub fn with_cache(mut self, value: CacheControl) -> Self {
+        self.cache = Some(value);
+        self
+    }
+}
+
+/// Merges native defaults underneath explicitly constructed wire fields; callers validate first.
+pub(crate) fn native_defaults(payload: Value, native: Option<&Value>) -> Value {
+    let mut merged = native
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Value::Object(fields) = payload {
+        merged.extend(fields);
+    }
+    Value::Object(merged)
 }

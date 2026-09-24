@@ -1,4 +1,5 @@
 use crate::core::error::http;
+use crate::llm::LlmBackend;
 mod measurement;
 mod tool_calls;
 
@@ -6,18 +7,18 @@ use tool_calls::{collect_tool_calls, validate_call_policy, validate_tool_request
 
 use std::borrow::Cow;
 
-use async_trait::async_trait;
 use reqwest::Client as HttpClient;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::embeddings::{EmbedRequest, EmbedResponse, EmbeddingClient, EmbeddingOptions};
+use crate::embeddings::{
+    EmbedRequest, EmbedResponse, EmbeddingBackend, EmbeddingClient, EmbeddingOptions,
+};
 
 use crate::llm::{
     Attachment, LlmClient, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl, Provider,
     RathError, Role, ThinkingLevel, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
-    configured_base_url, decode_output_text, extract_exit_tool_call, inject_exit_tool,
-    optional_api_key, parse_json_output, validate_tools,
+    configured_base_url, decode_output_text, optional_api_key, parse_json_output, validate_tools,
 };
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
@@ -29,7 +30,6 @@ struct OllamaClient {
     model: String,
     options: LlmOptions,
     url: ModelUrl,
-    exit_tool_name: Option<String>,
 }
 
 impl OllamaClient {
@@ -53,51 +53,37 @@ impl OllamaClient {
 }
 
 /// Creates an LLM client after validating output caps and resolving credentials.
-pub fn new_client(
-    url: &ModelUrl,
-    mut options: LlmOptions,
-) -> Result<Box<dyn LlmClient>, RathError> {
+pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<LlmClient, RathError> {
     crate::llm::counting::validate_options(Provider::Ollama, &options)?;
-    let exit_tool_name = if url.needs_exit_tool()
-        && !options.output_type_name.is_empty()
-        && !options.tools.is_empty()
-    {
-        let name = options.output_type_name.clone();
-        inject_exit_tool(&mut options);
-        Some(name)
-    } else {
-        None
-    };
+    crate::llm::output::prepare(url.provider.clone(), &url.model, &options)?;
     validate_tool_request(&options)?;
-    Ok(Box::new(OllamaClient {
+    Ok(LlmClient::from_backend(OllamaClient {
         http: HttpClient::new(),
         api_key: optional_api_key(url, "OLLAMA_API_KEY"),
         base_url: configured_base_url(url, DEFAULT_BASE_URL),
         model: url.model.clone(),
         options,
         url: url.clone(),
-        exit_tool_name,
     }))
 }
 
 /// Creates the provider embedding client or returns a configuration error.
 pub fn new_embedding_client(
     url: &ModelUrl,
-    _options: EmbeddingOptions,
-) -> Result<Box<dyn EmbeddingClient>, RathError> {
-    Ok(Box::new(OllamaClient {
+    options: EmbeddingOptions,
+) -> Result<EmbeddingClient, RathError> {
+    crate::embeddings::contract::remote_options(&options, &["keep_alive", "options"])?;
+    Ok(EmbeddingClient::from_backend(OllamaClient {
         http: HttpClient::new(),
         api_key: optional_api_key(url, "OLLAMA_API_KEY"),
         base_url: configured_base_url(url, DEFAULT_BASE_URL),
         model: url.model.clone(),
-        options: LlmOptions::default(),
+        options: LlmOptions::default().with_provider_config_opt(options.provider_config),
         url: url.clone(),
-        exit_tool_name: None,
     }))
 }
 
-#[async_trait]
-impl LlmClient for OllamaClient {
+impl LlmBackend for OllamaClient {
     fn model_url(&self) -> &ModelUrl {
         &self.url
     }
@@ -144,50 +130,65 @@ impl LlmClient for OllamaClient {
                 .sanitized(&self.api_key.as_deref().into_iter().collect::<Vec<_>>())
         })?;
 
+        let options = crate::llm::output::prepare(Provider::Ollama, &self.model, &self.options)?;
         let tools_enabled =
-            !self.options.tools.is_empty() && self.options.tool_choice != ToolChoice::Disabled;
+            !options.tools.is_empty() && options.tool_choice != ToolChoice::Disabled;
         let endpoint = chat_completions_endpoint(&self.base_url);
 
-        let payload = build_payload(&self.model, &self.options, messages, tools_enabled);
+        let payload = build_payload(&self.model, &options, messages, tools_enabled);
         let result = self
             .post_json(&endpoint, &payload, "generation", |response| {
-                map_response(response, &self.options)
+                map_response(response, &options)
             })
             .await?;
 
-        if let Some(ref name) = self.exit_tool_name
-            && let LlmOutput::ToolCalls { calls, .. } = &result.output
-            && let Some(args) = extract_exit_tool_call(calls, name)
-        {
-            return Ok(LlmResponse::new(Provider::Ollama, LlmOutput::Output(args))
-                .with_usage(result.usage)
-                .with_provider_model(result.provider_model)
-                .with_raw_metadata(result.raw_metadata));
-        }
-
-        Ok(result)
+        crate::llm::output::finish(&self.options, result).map_err(|error| {
+            error
+                .with_context(Provider::Ollama, "generation")
+                .sanitized(&self.api_key.as_deref().into_iter().collect::<Vec<_>>())
+        })
     }
 }
 
-#[async_trait]
-impl EmbeddingClient for OllamaClient {
-    /// Sends the embedding request to the configured provider and normalizes its result.
+impl EmbeddingBackend for OllamaClient {
     async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, RathError> {
-        let endpoint = embed_endpoint(&self.base_url);
-        let payload = json!({ "model": self.model, "input": request.input });
-        self.post_json(&endpoint, &payload, "embeddings", |response| {
-            let values: Vec<f32> = response["embeddings"][0]
-                .as_array()
-                .ok_or_else(|| RathError::invalid("missing embeddings[0]", &response))?
-                .iter()
-                .map(|v| {
-                    v.as_f64().map(|v| v as f32).ok_or_else(|| {
-                        RathError::invalid("embedding contains a non-number", &response)
-                    })
-                })
-                .collect::<Result<_, _>>()?;
-            Ok(EmbedResponse { values })
-        })
+        use crate::embeddings::contract as embedding;
+        let input = embedding::ollama_input(&self.model, request)?;
+        let mut payload = embedding::config(
+            self.options.provider_config.as_ref(),
+            request.provider_config.as_ref(),
+            &["keep_alive", "options"],
+        )?;
+        payload.insert("model".into(), json!(self.model));
+        payload.insert("input".into(), json!(input));
+        if let Some(d) = request.output_dimensionality {
+            payload.insert("dimensions".into(), json!(d));
+        }
+        if let Some(t) = request.truncate {
+            payload.insert("truncate".into(), json!(t));
+        }
+        self.post_json(
+            &embed_endpoint(&self.base_url),
+            &payload,
+            "embeddings",
+            |raw| {
+                let data = raw["embeddings"]
+                    .as_array()
+                    .ok_or_else(|| RathError::invalid("missing embeddings", &raw))?;
+                let vectors = data
+                    .iter()
+                    .map(|v| embedding::vector(v, &raw))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let usage = raw["prompt_eval_count"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .map(|input| TokenUsage {
+                        input: Some(input),
+                        output: None,
+                    });
+                embedding::response(Provider::Ollama, raw, vectors, request, usage)
+            },
+        )
         .await
     }
 }
@@ -242,7 +243,7 @@ fn build_payload(
         .as_ref()
         .is_some_and(|t| *t != ThinkingLevel::Off);
     let schema_hint = if options.wants_json_output() {
-        options.output_schema.as_ref()
+        options.output_schema()
     } else {
         None
     };
@@ -257,6 +258,7 @@ fn build_payload(
         "stream": false,
     });
 
+    payload = crate::llm::native_defaults(payload, options.provider_config.as_ref());
     if let Some(level) = &options.thinking {
         payload["reasoning_effort"] = json!(reasoning_effort(level));
     }
@@ -462,7 +464,7 @@ fn map_response(response: Value, options: &LlmOptions) -> Result<LlmResponse, Ra
         )?)
     } else {
         LlmOutput::ToolCalls {
-            thought: message
+            text: message
                 .get("content")
                 .and_then(Value::as_str)
                 .map(str::to_owned),

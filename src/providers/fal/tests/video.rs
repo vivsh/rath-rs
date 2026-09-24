@@ -24,6 +24,7 @@ async fn image_to_video_end_to_end() {
         "fal:///{}?base_url={base}&api_key_env=PATH",
         video_input::KLING_I2V
     ))
+    .await
     .unwrap();
     let result = client
         .generate_video(&VideoRequest {
@@ -55,7 +56,7 @@ async fn image_to_video_end_to_end() {
     );
 }
 
-fn local_client(base: &str, model: &str) -> Box<dyn VideoClient> {
+fn local_client(base: &str, model: &str) -> VideoClient {
     let mut url = ModelUrl::parse(&format!("fal:///{model}")).unwrap();
     url.base_url = Some(base.into());
     url.api_key = Some("FAKE-SECRET".into());
@@ -139,10 +140,11 @@ async fn invalid_submissions_fail_before_network() {
 }
 
 /// Non-Fal video schemes fail instead of silently selecting an available adapter.
-#[test]
-fn unsupported_providers_and_config_fail_at_construction() {
+#[tokio::test]
+async fn unsupported_providers_and_config_fail_at_construction() {
     let err = VideoOptions::default()
         .create("elevenlabs:///video")
+        .await
         .err()
         .unwrap();
     assert_eq!(err.kind(), ErrorKind::UnsupportedCapability);

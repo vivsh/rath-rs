@@ -2,7 +2,7 @@ use crate::core::{ModelUrl, RathError};
 use crate::llm::{LlmClient, LlmOptions, Message, Role, ToolCall, ToolDefinition};
 use serde_json::json;
 
-fn client(provider: &str, options: LlmOptions) -> Result<Box<dyn LlmClient>, RathError> {
+fn client(provider: &str, options: LlmOptions) -> Result<LlmClient, RathError> {
     let mut url = ModelUrl::parse(&format!("{provider}:///test-model"))?;
     url.api_key = Some("test-key".into());
     super::super::create_llm_client(&url, options)
@@ -96,25 +96,26 @@ fn all_adapters_measure_complete_history() {
     }
 }
 
-/// Effective options expose injected exit tools, and their schemas are included in estimates.
+/// Effective options remain unchanged by injected exit tools, and their schemas are included in estimates.
 #[test]
 fn injected_exit_tool_is_measured_once_as_effective_request_state() {
     for model_url in ["ollama:///qwen3:8b", "gemini:///gemini-2.5-flash"] {
         let mut url = ModelUrl::parse(model_url).unwrap();
         url.api_key = Some("test".into());
         let mut opts = options();
-        opts.output_type_name = "final_answer".into();
-        opts.output_schema =
-            Some(json!({"type":"object", "description":"output schema ".repeat(300)}));
+
+        opts = opts.with_output_schema(
+            json!({"type":"object", "description":"output schema ".repeat(300)}),
+        );
         let c = super::super::create_llm_client(&url, opts).unwrap();
-        assert!(c.options().output_schema.is_none());
+        assert!(c.options().output_schema().is_some());
         assert_eq!(
             c.options()
                 .tools
                 .iter()
-                .filter(|t| t.name == "final_answer")
+                .filter(|t| t.name == "__rath_final_output")
                 .count(),
-            1
+            0
         );
         let full = c
             .estimate_tokens(&[Message::user("x")])

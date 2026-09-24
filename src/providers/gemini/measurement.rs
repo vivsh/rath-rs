@@ -13,8 +13,9 @@ impl GeminiClient {
         let request =
             request::build_request(&self.client, &self.url.model, options, messages, minimal)?
                 .build();
-        let payload = serde_json::to_value(request)
-            .map_err(|error| RathError::from_error(crate::core::ErrorKind::Serialize, &error))?;
+        let payload = serde_json::to_value(request).map_err(|error| {
+            RathError::from_native_error(crate::core::ErrorKind::Serialize, &error)
+        })?;
         let mut prompt = counting::project(
             &payload,
             &["contents", "systemInstruction", "tools", "toolConfig"],

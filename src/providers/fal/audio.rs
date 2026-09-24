@@ -1,6 +1,7 @@
 //! Model-specific Fal speech synthesis and transcription mappings.
+use crate::audio::stt::SttBackend;
+use crate::audio::tts::TtsBackend;
 
-use async_trait::async_trait;
 use base64::Engine;
 use serde_json::{Map, Value};
 
@@ -17,21 +18,21 @@ const WIZPER: &str = "fal-ai/wizper";
 const SCRIBE: &str = "fal-ai/elevenlabs/speech-to-text/scribe-v2";
 
 /// Constructs a speech client with immutable options and credential-safe redirect behavior.
-pub(crate) fn new_tts_client(
-    url: &ModelUrl,
-    options: TtsOptions,
-) -> Result<Box<dyn TtsClient>, RathError> {
+pub(crate) fn new_tts_client(url: &ModelUrl, options: TtsOptions) -> Result<TtsClient, RathError> {
     tts_input_field(&url.model)?;
-    Ok(Box::new(audio_client(url, options.provider_config)?))
+    Ok(TtsClient::from_backend(audio_client(
+        url,
+        options.provider_config,
+    )?))
 }
 
 /// Constructs a transcription client for an explicitly supported Fal endpoint.
-pub(crate) fn new_stt_client(
-    url: &ModelUrl,
-    options: SttOptions,
-) -> Result<Box<dyn SttClient>, RathError> {
+pub(crate) fn new_stt_client(url: &ModelUrl, options: SttOptions) -> Result<SttClient, RathError> {
     validate_stt_model(&url.model)?;
-    Ok(Box::new(audio_client(url, options.provider_config)?))
+    Ok(SttClient::from_backend(audio_client(
+        url,
+        options.provider_config,
+    )?))
 }
 
 /// Reuses the Fal client without changing redirect behavior for existing image/video clients.
@@ -53,11 +54,10 @@ pub(super) fn audio_client(url: &ModelUrl, config: Option<Value>) -> Result<FalC
     Ok(client)
 }
 
-#[async_trait]
-impl TtsClient for FalClient {
+impl TtsBackend for FalClient {
     /// Synthesizes and downloads audio within a five-minute overall deadline.
     async fn synthesize_speech(&self, request: &TtsRequest) -> Result<TtsResponse, RathError> {
-        let model = request.model.as_deref().unwrap_or(&self.model);
+        let model = &self.model;
         let payload = tts_payload(model, &self.provider_config, request)?;
         tokio::time::timeout(queue::AUDIO_TIMEOUT, async {
             let raw = queue::run(self, model, Value::Object(payload), |raw| {
@@ -79,16 +79,15 @@ impl TtsClient for FalClient {
                 "audio deadline elapsed; remote job may still run",
             )
             .with_context(Provider::Fal, "audio wait")
-            .with_source(RathError::from_error(ErrorKind::Timeout, &error))
+            .with_source(RathError::from_native_error(ErrorKind::Timeout, &error))
         })?
     }
 }
 
-#[async_trait]
-impl SttClient for FalClient {
+impl SttBackend for FalClient {
     /// Sends audio as a data URI and waits up to five minutes for transcription.
     async fn transcribe_audio(&self, request: &SttRequest) -> Result<SttResponse, RathError> {
-        let model = request.model.as_deref().unwrap_or(&self.model);
+        let model = &self.model;
         let payload = stt_payload(model, &self.provider_config, request)?;
         tokio::time::timeout(
             queue::AUDIO_TIMEOUT,
@@ -111,7 +110,7 @@ impl SttClient for FalClient {
                 "audio deadline elapsed; remote job may still run",
             )
             .with_context(Provider::Fal, "audio wait")
-            .with_source(RathError::from_error(ErrorKind::Timeout, &error))
+            .with_source(RathError::from_native_error(ErrorKind::Timeout, &error))
         })?
     }
 }
@@ -199,6 +198,7 @@ fn stt_payload(
 
 /// Rejects non-object configuration rather than silently discarding it.
 fn validate_config(config: &Option<Value>) -> Result<(), RathError> {
+    crate::registry::prepare::native(config.as_ref())?;
     if config.as_ref().is_some_and(|value| !value.is_object()) {
         return Err(RathError::new(
             crate::core::ErrorKind::Validation,

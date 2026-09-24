@@ -15,7 +15,7 @@ fn client(base: String, model: &str) -> FalClient {
     client
 }
 
-/// Exercises pending states, native endpoint override and empty-transcript success for both STT models.
+/// Exercises pending states, model-bound endpoints and empty-transcript success for both STT models.
 #[tokio::test]
 async fn transcribes_both_models_and_keeps_metadata() {
     for model in [WIZPER, SCRIBE] {
@@ -26,19 +26,18 @@ async fn transcribes_both_models_and_keeps_metadata() {
             reply(json!({"status":"COMPLETED"})),
             reply(json!({"text":"", "words":[{"speaker_id":"speaker_0"}]})),
         ]);
-        let client = client(base, WIZPER);
+        let client = client(base, model);
         let response = client
             .transcribe_audio(&SttRequest {
                 mime_type: "audio/wav".into(),
                 data: vec![0, 255],
-                model: Some(model.into()),
                 provider_config: Some(json!({"language_code":"hi"})),
             })
             .await
             .unwrap();
         assert_eq!(response.text, "");
         assert!(response.raw_metadata.unwrap().get("words").is_some());
-        assert_eq!(client.model, WIZPER);
+        assert_eq!(client.model, model);
         let wires: Vec<_> = requests.try_iter().collect();
         assert_eq!(wires.len(), 5);
         assert!(wires[0].starts_with(&format!("POST /{model} ")));
@@ -47,7 +46,7 @@ async fn transcribes_both_models_and_keeps_metadata() {
     }
 }
 
-/// Confirms model override changes the endpoint and text mapping without mutating the client.
+/// Confirms model selection binds the endpoint and its text mapping.
 #[tokio::test]
 async fn elevenlabs_override_downloads_audio() {
     let (base, requests) = serve(vec![
@@ -56,18 +55,17 @@ async fn elevenlabs_override_downloads_audio() {
         reply(json!({"audio":{"url":"BASE/audio", "content_type":"audio/mpeg"}})),
         (200, "application/octet-stream", "MP3".into()),
     ]);
-    let client = client(base, KOKORO);
+    let client = client(base, ELEVENLABS);
     let result = client
         .synthesize_speech(&TtsRequest {
             input: "Hello".into(),
-            model: Some(ELEVENLABS.into()),
             ..Default::default()
         })
         .await
         .unwrap();
     assert_eq!(result.mime_type, "audio/mpeg");
     assert_eq!(result.data, b"MP3");
-    assert_eq!(client.model, KOKORO);
+    assert_eq!(client.model, ELEVENLABS);
     let wires: Vec<_> = requests.try_iter().collect();
     assert!(wires[0].starts_with(&format!("POST /{ELEVENLABS} ")));
     assert!(wires[0].contains("\"text\":\"Hello\""));
@@ -86,7 +84,7 @@ async fn missing_transcript_is_redacted_error() {
         .transcribe_audio(&SttRequest {
             mime_type: "audio/wav".into(),
             data: vec![1],
-            model: None,
+
             provider_config: None,
         })
         .await
@@ -109,7 +107,7 @@ async fn audio_deadline_stops_polling_without_resubmitting() {
             .transcribe_audio(&SttRequest {
                 mime_type: "audio/wav".into(),
                 data: vec![1],
-                model: None,
+
                 provider_config: None,
             })
             .await
@@ -269,3 +267,5 @@ fn factory_validation() {
         .is_err()
     );
 }
+
+use crate::audio::{stt::SttBackend, tts::TtsBackend};

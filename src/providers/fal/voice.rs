@@ -1,4 +1,6 @@
 //! Qwen speaker-embedding extraction using the existing Fal queue and credential boundaries.
+use crate::audio::voice_clone::VoiceCloneBackend;
+use crate::audio::voice_design::VoiceDesignBackend;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::json;
@@ -14,7 +16,6 @@ use crate::audio::{
     },
 };
 use crate::core::{ErrorKind, Provider, RathError, error::http};
-use async_trait::async_trait;
 use serde_json::{Map, Value};
 
 pub(super) const DESIGN: &str = "fal-ai/qwen-3-tts/voice-design/1.7b";
@@ -27,14 +28,14 @@ const FORMAT: &str = "qwen3-tts-1.7b/safetensors";
 pub(crate) fn new_design(
     url: &crate::core::ModelUrl,
     options: VoiceDesignOptions,
-) -> Result<Box<dyn VoiceDesignClient>, RathError> {
+) -> Result<VoiceDesignClient, RathError> {
     if url.model != DESIGN {
         return Err(RathError::unsupported(
             Provider::Fal,
             "voice design endpoint",
         ));
     }
-    Ok(Box::new(super::audio::audio_client(
+    Ok(VoiceDesignClient::from_backend(super::audio::audio_client(
         url,
         options.provider_config,
     )?))
@@ -44,21 +45,20 @@ pub(crate) fn new_design(
 pub(crate) fn new_clone(
     url: &crate::core::ModelUrl,
     options: VoiceCloneOptions,
-) -> Result<Box<dyn VoiceCloneClient>, RathError> {
+) -> Result<VoiceCloneClient, RathError> {
     if url.model != CLONE {
         return Err(RathError::unsupported(
             Provider::Fal,
             "voice clone endpoint",
         ));
     }
-    Ok(Box::new(super::audio::audio_client(
+    Ok(VoiceCloneClient::from_backend(super::audio::audio_client(
         url,
         options.provider_config,
     )?))
 }
 
-#[async_trait]
-impl VoiceDesignClient for FalClient {
+impl VoiceDesignBackend for FalClient {
     async fn design_voice(
         &self,
         request: &VoiceDesignRequest,
@@ -100,7 +100,7 @@ impl VoiceDesignClient for FalClient {
         })
         .await
         .map_err(|error| {
-            RathError::from_error(ErrorKind::Timeout, &error).with_context(
+            RathError::from_native_error(ErrorKind::Timeout, &error).with_context(
                 Provider::Fal,
                 "voice design deadline; remote job may still run",
             )
@@ -108,8 +108,7 @@ impl VoiceDesignClient for FalClient {
     }
 }
 
-#[async_trait]
-impl VoiceCloneClient for FalClient {
+impl VoiceCloneBackend for FalClient {
     async fn clone_voice(&self, request: &VoiceCloneRequest) -> Result<Voice, RathError> {
         validate_samples(&request.samples)?;
         validate_config(request.provider_config.as_ref())?;
@@ -271,7 +270,7 @@ pub(super) async fn clone(
     })
     .await
     .map_err(|error| {
-        RathError::from_error(ErrorKind::Timeout, &error).with_context(
+        RathError::from_native_error(ErrorKind::Timeout, &error).with_context(
             Provider::Fal,
             "voice cloning deadline; remote job may still run",
         )

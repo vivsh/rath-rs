@@ -25,7 +25,7 @@ fn binary_body_is_explicit() {
         ErrorBody::Incomplete(bytes.clone()),
     ] {
         let complete = body.is_complete();
-        let error = RathError::new(ErrorKind::Deserialize, "bad response").with_body(body);
+        let error = RathError::new(ErrorKind::Deserialize, "bad response").with_raw_body(body);
         assert_eq!(error.response_body().unwrap().bytes(), bytes);
         assert_eq!(error.response_body().unwrap().is_complete(), complete);
         assert!(!format!("{error:?}").contains("128"));
@@ -86,7 +86,7 @@ fn escaped_and_structured_secrets_are_removed() {
     let key = "UPPER/a+b c\"";
     let raw = r#"{"details":"UPPER%2fa%2bb+c%22 UPPER/a+b c\"","cookie":{"a":"COOKIE","b":["SECOND"]},"safe":{"count":2}}"#;
     let error = RathError::new(ErrorKind::Http, "unavailable")
-        .with_body(ErrorBody::Complete(raw.as_bytes().to_vec()))
+        .with_raw_body(ErrorBody::Complete(raw.as_bytes().to_vec()))
         .sanitized(&[key]);
     let body = std::str::from_utf8(error.response_body().unwrap().bytes()).unwrap();
     for marker in ["UPPER", "COOKIE", "SECOND"] {
@@ -104,7 +104,7 @@ fn native_context_is_not_flattened() {
     #[error("dispatch failed: {0}")]
     struct Native(#[source] std::io::Error);
     let native = Native(std::io::Error::other("connection refused"));
-    let error = RathError::from_error(ErrorKind::Transport, &native);
+    let error = RathError::from_native_error(ErrorKind::Transport, &native);
     assert_eq!(error.message(), "dispatch failed");
     assert_eq!(error.source().unwrap().message(), "connection refused");
     assert_eq!(error.to_string(), "dispatch failed: connection refused");
@@ -115,7 +115,7 @@ fn native_context_is_not_flattened() {
 fn escaped_json_locations_are_redacted() {
     let raw = r#"{"api\u005fkey":"HIDDENKEY","url":"https:\/\/user:PASS@host.test\/path?signature=VALUE#FRAGMENT","other":3}"#;
     let error = RathError::new(ErrorKind::Http, "rejected")
-        .with_body(ErrorBody::Complete(raw.as_bytes().to_vec()));
+        .with_raw_body(ErrorBody::Complete(raw.as_bytes().to_vec()));
     let body = std::str::from_utf8(error.response_body().unwrap().bytes()).unwrap();
     for marker in ["HIDDENKEY", "PASS", "VALUE", "FRAGMENT"] {
         assert!(!body.contains(marker), "{body}");
@@ -132,8 +132,8 @@ fn escaped_json_locations_are_redacted() {
 #[test]
 fn binary_secret_field_is_redacted_as_a_whole() {
     let raw = b"{\"password\":\"HIDDEN-PREFIX \xff HIDDEN-TAIL\",\"other\":\"\xfe KEEP\"}";
-    let error =
-        RathError::new(ErrorKind::Http, "rejected").with_body(ErrorBody::Complete(raw.to_vec()));
+    let error = RathError::new(ErrorKind::Http, "rejected")
+        .with_raw_body(ErrorBody::Complete(raw.to_vec()));
     let body = error.response_body().unwrap().bytes();
     assert_eq!(
         body,

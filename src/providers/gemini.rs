@@ -1,27 +1,25 @@
-// Keep the existing generateContent wire contract while using the official SDK.
 #![allow(deprecated)]
+use crate::llm::LlmBackend;
+// Keep the existing generateContent wire contract while using the official SDK.
+mod embedding;
 mod errors;
 mod measurement;
+pub(crate) use embedding::new_embedding_client;
 mod request;
 
-use async_trait::async_trait;
 use gemini_rust::{
     Blob, Content, FileData as GeminiFileData, FunctionCall as GeminiFunctionCall,
     FunctionCallingMode, FunctionDeclaration, FunctionResponse as GeminiFunctionResponse, Gemini,
     GenerationResponse, Message as GeminiMessage, Part, Role as GeminiRole, SafetySetting,
-    TaskType, Tool as GeminiTool, client::Model as GeminiModel,
+    Tool as GeminiTool, client::Model as GeminiModel,
 };
 use serde_json::Value;
-
-use crate::embeddings::{
-    EmbedRequest, EmbedResponse, EmbedTaskType, EmbeddingClient, EmbeddingOptions,
-};
 
 use crate::llm::schema;
 use crate::llm::{
     Attachment, LlmClient, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl, Provider,
     RathError, Role, ThinkingLevel, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
-    decode_output_text, extract_exit_tool_call, inject_exit_tool, validate_tools,
+    decode_output_text, validate_tools,
 };
 
 /// Constructs the provider client with resolved credentials and endpoint settings.
@@ -54,7 +52,6 @@ struct GeminiClient {
     client: Gemini,
     options: LlmOptions,
     url: ModelUrl,
-    exit_tool_name: Option<String>,
 }
 
 /// Builds Gemini messages from history.
@@ -241,14 +238,14 @@ fn resolve_call_name<'a>(history: &'a [Message], call_id: &'a str) -> &'a str {
 
 /// Converts a `ToolDefinition` into a Gemini function declaration.
 fn build_fn_decl(tool: &ToolDefinition) -> Result<FunctionDeclaration, RathError> {
-    let sanitized = schema::sanitize_strict(tool.parameters.clone());
+    let sanitized = schema::sanitize_strict(tool.parameters.clone())?;
     let json = serde_json::json!({
         "name": tool.name,
         "description": tool.description,
         "parameters": sanitized,
     });
     serde_json::from_value(json)
-        .map_err(|error| RathError::from_error(crate::core::ErrorKind::Serialize, &error))
+        .map_err(|error| RathError::from_native_error(crate::core::ErrorKind::Serialize, &error))
 }
 
 /// Maps the raw Gemini response into a [`LlmOutput`].
@@ -279,23 +276,21 @@ fn map_response(
                 thought_signatures: sig.map(|s| vec![s.to_string()]),
             })
             .collect();
-        return Ok(
-            LlmResponse::new(Provider::Gemini, LlmOutput::ToolCalls { thought, calls })
-                .with_usage(usage)
-                .with_provider_model(provider_model)
-                .with_raw_metadata(raw_metadata),
-        );
+        return Ok(LlmResponse::new(
+            Provider::Gemini,
+            LlmOutput::ToolCalls {
+                text: thought,
+                calls,
+            },
+        )
+        .with_usage(usage)
+        .with_provider_model(provider_model)
+        .with_raw_metadata(raw_metadata));
     }
     let text = response.text();
-    if text.is_empty() {
-        return Err(RathError::new(
-            crate::core::ErrorKind::InvalidResponse,
-            "missing nonempty candidates[].content.parts[].text or functionCall",
-        ));
-    }
     Ok(LlmResponse::new(
         Provider::Gemini,
-        LlmOutput::Output(decode_output_text(&text, wants_json_output)?),
+        LlmOutput::Output(decode_nonempty(&text, wants_json_output)?),
     )
     .with_usage(usage)
     .with_provider_model(provider_model)
@@ -306,14 +301,14 @@ fn wants_json_output(options: &LlmOptions) -> bool {
     options.wants_json_output()
 }
 
-fn response_schema(options: &LlmOptions) -> Option<Value> {
+fn response_schema(options: &LlmOptions) -> Result<Option<Value>, RathError> {
     if !wants_json_output(options) {
-        return None;
+        return Ok(None);
     }
     options
-        .output_schema
-        .as_ref()
+        .output_schema()
         .map(|value| schema::sanitize_strict(value.clone()))
+        .transpose()
 }
 
 /// Validates and decodes the Gemini safety settings supported by this adapter.
@@ -344,7 +339,7 @@ fn gemini_safety_settings_from_provider_config(
                     crate::core::ErrorKind::Validation,
                     "invalid Gemini provider_config.safetySettings",
                 )
-                .with_source(RathError::from_error(
+                .with_source(RathError::from_native_error(
                     crate::core::ErrorKind::Deserialize,
                     &e,
                 ))
@@ -353,8 +348,7 @@ fn gemini_safety_settings_from_provider_config(
         .transpose()
 }
 
-#[async_trait]
-impl LlmClient for GeminiClient {
+impl LlmBackend for GeminiClient {
     fn model_url(&self) -> &ModelUrl {
         &self.url
     }
@@ -410,7 +404,7 @@ impl LlmClient for GeminiClient {
         .await
         .map_err(|e| errors::normalize(&e, "generation", self.url.api_key.as_deref()))?;
         let raw = serde_json::to_value(&response)
-            .map_err(|e| RathError::from_error(crate::core::ErrorKind::Serialize, &e))?;
+            .map_err(|e| RathError::from_native_error(crate::core::ErrorKind::Serialize, &e))?;
         let result = map_response(response, wants_json_output).map_err(|error| {
             errors::context(
                 error.with_response(&raw),
@@ -419,90 +413,23 @@ impl LlmClient for GeminiClient {
             )
         })?;
 
-        if let Some(ref name) = self.exit_tool_name
-            && let LlmOutput::ToolCalls { calls, .. } = &result.output
-            && let Some(args) = extract_exit_tool_call(calls, name)
-        {
-            return Ok(LlmResponse::new(Provider::Gemini, LlmOutput::Output(args))
-                .with_usage(result.usage)
-                .with_provider_model(result.provider_model)
-                .with_raw_metadata(result.raw_metadata));
-        }
-
-        Ok(result)
-    }
-}
-
-#[async_trait]
-impl EmbeddingClient for GeminiClient {
-    /// Sends the embedding request to the configured provider and normalizes its result.
-    async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, RathError> {
-        let mut builder = self.client.embed_content().with_text(&request.input);
-        if let Some(task_type) = &request.task_type {
-            let gemini_task = match task_type {
-                EmbedTaskType::RetrievalDocument => TaskType::RetrievalDocument,
-                EmbedTaskType::RetrievalQuery => TaskType::RetrievalQuery,
-                EmbedTaskType::SemanticSimilarity => TaskType::SemanticSimilarity,
-                EmbedTaskType::Classification => TaskType::Classification,
-                EmbedTaskType::Clustering => TaskType::Clustering,
-                EmbedTaskType::QuestionAnswering => TaskType::QuestionAnswering,
-                EmbedTaskType::FactVerification => TaskType::FactVerification,
-                EmbedTaskType::CodeRetrievalQuery => TaskType::CodeRetrievalQuery,
-            };
-            builder = builder.with_task_type(gemini_task);
-        }
-        if let Some(title) = &request.title {
-            builder = builder.with_title(title.clone());
-        }
-        if let Some(dim) = request.output_dimensionality {
-            builder = builder.with_output_dimensionality(dim);
-        }
-        let response = builder
-            .execute()
-            .await
-            .map_err(|e| errors::normalize(&e, "embeddings", self.url.api_key.as_deref()))?;
-        Ok(EmbedResponse {
-            values: response.embedding.values,
-        })
+        crate::llm::output::finish(&self.options, result)
+            .map_err(|error| errors::context(error, "generation", self.url.api_key.as_deref()))
     }
 }
 
 /// Creates a Gemini client.
 /// Fails when the API key cannot be resolved.
-pub fn new_client(
-    url: &ModelUrl,
-    mut options: LlmOptions,
-) -> Result<Box<dyn LlmClient>, RathError> {
+pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<LlmClient, RathError> {
     crate::llm::counting::validate_options(Provider::Gemini, &options)?;
-    let client = build_client(url)?;
-    let exit_tool_name = if url.needs_exit_tool()
-        && !options.output_type_name.is_empty()
-        && !options.tools.is_empty()
-    {
-        let name = options.output_type_name.clone();
-        inject_exit_tool(&mut options);
-        Some(name)
-    } else {
-        None
-    };
-    Ok(Box::new(GeminiClient {
+    let mut url = url.clone();
+    url.api_key = Some(crate::llm::required_api_key(&url, "GEMINI_API_KEY")?);
+    let client = build_client(&url)?;
+    crate::llm::output::prepare(url.provider.clone(), &url.model, &options)?;
+    Ok(LlmClient::from_backend(GeminiClient {
         client,
         options,
         url: url.clone(),
-        exit_tool_name,
-    }))
-}
-
-/// Creates the provider embedding client or returns a configuration error.
-pub fn new_embedding_client(
-    url: &ModelUrl,
-    _options: EmbeddingOptions,
-) -> Result<Box<dyn EmbeddingClient>, RathError> {
-    Ok(Box::new(GeminiClient {
-        client: build_client(url)?,
-        options: LlmOptions::default(),
-        url: url.clone(),
-        exit_tool_name: None,
     }))
 }
 
@@ -512,6 +439,17 @@ mod tests;
 
 fn check_generation_limit(response: &GenerationResponse) -> Result<(), RathError> {
     let raw = serde_json::to_value(response)
-        .map_err(|error| RathError::from_error(crate::core::ErrorKind::Serialize, &error))?;
+        .map_err(|error| RathError::from_native_error(crate::core::ErrorKind::Serialize, &error))?;
     crate::llm::counting::check_output_limit(Provider::Gemini, &raw)
+}
+
+/// Missing provider text is invalid before structured-output decoding.
+fn decode_nonempty(text: &str, wants_json_output: bool) -> Result<Value, RathError> {
+    if text.is_empty() {
+        return Err(RathError::new(
+            crate::core::ErrorKind::InvalidResponse,
+            "missing nonempty candidates[].content.parts[].text or functionCall",
+        ));
+    }
+    decode_output_text(text, wants_json_output)
 }

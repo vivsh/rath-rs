@@ -26,6 +26,7 @@ async fn qwen_json_tool_roundtrip() {
 async fn qwen_small_required_tool_has_explicit_outcome() {
     let client = options(ToolChoice::Required)
         .create(&url("qwen3:0.6b"))
+        .await
         .unwrap();
     let result = tokio::time::timeout(Duration::from_secs(90),client.execute(&[
         Message::user("Use lookup_code with label alpha. After getting its result, reply with the code exactly.")
@@ -49,10 +50,7 @@ async fn qwen_small_required_tool_has_explicit_outcome() {
 /// Supplies one harmless synthetic lookup tool, with no actual external execution.
 fn options(choice: ToolChoice) -> LlmOptions {
     LlmOptions::default().with_temperature(0.0).with_thinking(Some(ThinkingLevel::Off))
-        .with_max_output_tokens(512).with_tool_choice(choice).with_tools(vec![ToolDefinition {
-            name:"lookup_code".into(),description:"Look up the code for a label. Always use this tool to look up codes.".into(),
-            parameters:json!({"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}),
-        }])
+        .with_max_output_tokens(512).with_tool_choice(choice).with_tools(vec![{  ToolDefinition::new("lookup_code".into(), "Look up the code for a label. Always use this tool to look up codes.".into(), json!({"type":"object","properties":{"label":{"type":"string"}},"required":["label"]})) }])
 }
 
 fn url(model: &str) -> String {
@@ -65,6 +63,7 @@ async fn roundtrip(model: &str, final_choice: ToolChoice) {
         .with_preamble("Use lookup_code to look up the label in the user's JSON.")
         .with_input_schema(json!({"type":"object","properties":{"label":{"type":"string"}}}))
         .create(&url(model))
+        .await
         .unwrap();
     let mut history = vec![Message::from_json(Role::User, &json!({"label":"alpha"})).unwrap()];
     let start = Instant::now();
@@ -73,7 +72,11 @@ async fn roundtrip(model: &str, final_choice: ToolChoice) {
         .unwrap()
         .unwrap();
     report(model, "tool_call", &response, start);
-    let LlmOutput::ToolCalls { calls, thought } = response.output else {
+    let LlmOutput::ToolCalls {
+        calls,
+        text: thought,
+    } = response.output
+    else {
         panic!("expected tool calls")
     };
     assert_eq!(calls.len(), 1);
@@ -90,6 +93,7 @@ async fn roundtrip(model: &str, final_choice: ToolChoice) {
             json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}),
         )
         .create(&url(model))
+        .await
         .unwrap();
     let start = Instant::now();
     let response = tokio::time::timeout(Duration::from_secs(90), second.execute(&history))

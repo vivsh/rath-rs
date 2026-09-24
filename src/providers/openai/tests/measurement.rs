@@ -40,8 +40,8 @@ fn measures_whole_request_and_minimal_content() {
 }
 
 /// Token-limit detection takes precedence over malformed JSON or partial tool parsing.
-#[test]
-fn cap_and_truncation_are_explicit() {
+#[tokio::test]
+async fn cap_and_truncation_are_explicit() {
     let payload = build_payload(
         "m",
         &LlmOptions::default().with_max_output_tokens(7),
@@ -195,3 +195,5 @@ fn message_keys_never_enter_provider_payloads() {
         build_payload("model", &options, &keyed, false)
     );
 }
+
+use crate::llm::LlmBackend;

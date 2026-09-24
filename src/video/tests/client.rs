@@ -1,10 +1,11 @@
 use super::*;
+use crate::ErrorKind;
+use crate::video::{VideoBackend, VideoJob, VideoJobStatus, VideoRequest, VideoResponse};
 
 /// A downstream client implementing only the original required methods.
 struct OriginalClient;
 
-#[async_trait]
-impl VideoClient for OriginalClient {
+impl VideoBackend for OriginalClient {
     async fn submit_video(&self, _: &VideoRequest) -> Result<VideoJob, RathError> {
         Err(RathError::new(ErrorKind::UnsupportedCapability, "test"))
     }

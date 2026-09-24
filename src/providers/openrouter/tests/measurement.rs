@@ -115,3 +115,5 @@ fn message_keys_never_enter_provider_payloads() {
         build_payload("model", &options, &keyed, false)
     );
 }
+
+use crate::llm::LlmBackend;

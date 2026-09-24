@@ -1,5 +1,6 @@
 use super::super::errors::normalize;
 use crate::core::ErrorKind;
+use crate::embeddings::{EmbedRequest, EmbeddingOptions};
 use gemini_rust::client::Error;
 
 /// SDK HTTP envelopes retain available status, codes and bytes without exposing body contents.
@@ -24,8 +25,8 @@ fn sdk_http_error_preserves_available_evidence() {
 }
 
 /// SDK parser errors become a stable Rath chain without pretending discarded bodies are available.
-#[test]
-fn sdk_parser_cause_is_preserved() {
+#[tokio::test]
+async fn sdk_parser_cause_is_preserved() {
     let source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
     let message = source.to_string();
     let error = normalize(&Error::Deserialize { source }, "generation", None);
@@ -73,17 +74,16 @@ async fn sdk_dispatch_keeps_failure_without_extra_requests() {
                 .build()
                 .unwrap(),
             options: LlmOptions::default(),
-            url,
-            exit_tool_name: None,
+            url: url.clone(),
         };
         let error = if embedding {
-            client
-                .embed(&EmbedRequest {
-                    input: "hello".into(),
-                    ..Default::default()
-                })
-                .await
-                .unwrap_err()
+            {
+                url.base_url = Some(base);
+                new_embedding_client(&url, EmbeddingOptions::default()).unwrap()
+            }
+            .embed(&EmbedRequest::new("hello"))
+            .await
+            .unwrap_err()
         } else {
             client.execute(&[Message::user("hello")]).await.unwrap_err()
         };

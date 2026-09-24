@@ -100,8 +100,8 @@ async fn invalid_execution_cap_never_dispatches() {
 }
 
 /// A partial JSON or tool response is rejected before decoding and is safely formatted.
-#[test]
-fn limited_output_is_not_success() {
+#[tokio::test]
+async fn limited_output_is_not_success() {
     let response = json!({"stop_reason":"max_tokens", "content":[{"type":"text", "text":"PRIVATE-CONTENT-729{"}]});
     let error = map_response(response, true).unwrap_err();
     assert!(error.kind() == crate::core::ErrorKind::OutputLimitReached);
@@ -173,3 +173,5 @@ fn message_keys_never_enter_provider_payloads() {
         build_payload("model", &options, &keyed, false)
     );
 }
+
+use crate::llm::LlmBackend;

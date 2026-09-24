@@ -125,7 +125,7 @@ fn decode_preview(
         .ok_or_else(|| RathError::invalid("missing preview audio_base_64", raw))?;
     let data = STANDARD.decode(encoded).map_err(|error| {
         RathError::invalid("invalid preview base64", raw)
-            .with_source(RathError::from_error(ErrorKind::Deserialize, &error))
+            .with_source(RathError::from_native_error(ErrorKind::Deserialize, &error))
     })?;
     let sample = VoiceSample {
         mime_type: mime.into(),

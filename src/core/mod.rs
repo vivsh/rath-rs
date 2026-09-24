@@ -1,5 +1,7 @@
 pub(crate) mod error;
 mod provider;
+pub(crate) use provider::builtin;
+/// Model locators and explicit language-model URL controls.
 pub mod url;
 mod usage;
 

@@ -13,7 +13,7 @@ use crate::video::{VideoClient, VideoOptions};
 pub(crate) fn create_voice_design_client(
     url: &ModelUrl,
     options: VoiceDesignOptions,
-) -> Result<Box<dyn VoiceDesignClient>, RathError> {
+) -> Result<VoiceDesignClient, RathError> {
     match url.provider {
         Provider::Fal => fal::new_voice_design_client(url, options),
         Provider::ElevenLabs => elevenlabs::new_design(url, options),
@@ -26,7 +26,7 @@ pub(crate) fn create_voice_design_client(
 pub(crate) fn create_voice_clone_client(
     url: &ModelUrl,
     options: VoiceCloneOptions,
-) -> Result<Box<dyn VoiceCloneClient>, RathError> {
+) -> Result<VoiceCloneClient, RathError> {
     match url.provider {
         Provider::Fal => fal::new_voice_clone_client(url, options),
         Provider::ElevenLabs => elevenlabs::new_clone(url, options),
@@ -42,14 +42,14 @@ pub(crate) fn create_voice_clone_client(
 pub(crate) fn create_llm_client(
     url: &ModelUrl,
     options: LlmOptions,
-) -> Result<Box<dyn LlmClient>, RathError> {
+) -> Result<LlmClient, RathError> {
     match url.provider {
         Provider::Gemini => gemini::new_client(url, options),
         Provider::OpenAi => openai::new_client(url, options),
         Provider::OpenRouter => openrouter::new_client(url, options),
         Provider::Anthropic => anthropic::new_client(url, options),
         Provider::Ollama => ollama::new_client(url, options),
-        Provider::Fal | Provider::ElevenLabs => {
+        Provider::Fal | Provider::ElevenLabs | Provider::FastEmbed | Provider::External(_) => {
             Err(RathError::unsupported(url.provider.clone(), "llm"))
         }
     }
@@ -60,7 +60,7 @@ pub(crate) fn create_llm_client(
 pub(crate) fn create_embedding_client(
     url: &ModelUrl,
     options: EmbeddingOptions,
-) -> Result<Box<dyn EmbeddingClient>, RathError> {
+) -> Result<EmbeddingClient, RathError> {
     match url.provider {
         Provider::Gemini => gemini::new_embedding_client(url, options),
         Provider::OpenAi => openai::new_embedding_client(url, options),
@@ -74,7 +74,7 @@ pub(crate) fn create_embedding_client(
 pub(crate) fn create_image_client(
     url: &ModelUrl,
     options: ImageOptions,
-) -> Result<Box<dyn ImageClient>, RathError> {
+) -> Result<ImageClient, RathError> {
     match url.provider {
         Provider::Fal => fal::new_image_client(url, options),
         _ => Err(RathError::unsupported(url.provider.clone(), "image")),
@@ -86,7 +86,7 @@ pub(crate) fn create_image_client(
 pub(crate) fn create_tts_client(
     url: &ModelUrl,
     options: TtsOptions,
-) -> Result<Box<dyn TtsClient>, RathError> {
+) -> Result<TtsClient, RathError> {
     match url.provider {
         Provider::OpenAi => openai::new_tts_client(url, options),
         Provider::Fal => fal::new_tts_client(url, options),
@@ -103,7 +103,7 @@ pub(crate) fn create_tts_client(
 pub(crate) fn create_stt_client(
     url: &ModelUrl,
     options: SttOptions,
-) -> Result<Box<dyn SttClient>, RathError> {
+) -> Result<SttClient, RathError> {
     match url.provider {
         Provider::OpenAi => openai::new_stt_client(url, options),
         Provider::Fal => fal::new_stt_client(url, options),
@@ -119,7 +119,7 @@ pub(crate) fn create_stt_client(
 pub(crate) fn create_video_client(
     url: &ModelUrl,
     options: VideoOptions,
-) -> Result<Box<dyn VideoClient>, RathError> {
+) -> Result<VideoClient, RathError> {
     match url.provider {
         Provider::Fal => fal::new_video_client(url, options),
         _ => Err(RathError::unsupported(url.provider.clone(), "video")),
@@ -137,6 +137,11 @@ fn construction_error(error: RathError, url: &ModelUrl) -> RathError {
         Provider::Ollama => "OLLAMA_API_KEY",
         Provider::Fal => "FAL_KEY",
         Provider::ElevenLabs => "ELEVENLABS_API_KEY",
+        Provider::FastEmbed | Provider::External(_) => {
+            return error
+                .with_context(url.provider.clone(), "client construction")
+                .sanitized(&url.api_key.as_deref().into_iter().collect::<Vec<_>>());
+        }
     };
     let fallback = std::env::var(env).ok();
     let secrets: Vec<_> = url

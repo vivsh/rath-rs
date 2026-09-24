@@ -47,6 +47,7 @@ async fn extraction(model: &str) {
         .create(&format!(
             "ollama:///{model}?thinking=off&base_url=http://127.0.0.1:11434"
         ))
+        .await
         .unwrap();
     for sample in 1..=3 {
         let start = Instant::now();

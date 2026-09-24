@@ -10,8 +10,9 @@ async fn required_calls_are_enforced_before_output_parsing() {
         let body = response(json!({"content":text}), "stop");
         let (base, requests) = serve(200, body.clone());
         let client = options(ToolChoice::Required)
-            .with_response_format(crate::llm::ResponseFormat::Json)
+            .with_output_schema(json!({"type":"object"}))
             .create(&format!("ollama:///model?base_url={base}"))
+            .await
             .unwrap();
         let error = client
             .execute(&[Message::user("lookup")])
@@ -31,7 +32,7 @@ async fn required_calls_are_enforced_before_output_parsing() {
 #[tokio::test]
 async fn required_without_tools_is_validation_error() {
     let opts = LlmOptions::default().with_tool_choice(ToolChoice::Required);
-    let error = opts.clone().create("ollama:///test").err().unwrap();
+    let error = opts.clone().create("ollama:///test").await.err().unwrap();
     assert_eq!(error.kind(), ErrorKind::Validation);
     assert!(error.message().contains("at least one tool"));
     let mut client = OllamaClient {
@@ -41,7 +42,6 @@ async fn required_without_tools_is_validation_error() {
         model: "test".into(),
         options: LlmOptions::default(),
         url: ModelUrl::parse("ollama:///test").unwrap(),
-        exit_tool_name: None,
     };
     client.options = opts;
     assert_eq!(
@@ -113,8 +113,8 @@ fn incomplete_text_calls_fail_explicitly() {
 }
 
 /// Only offered tools with valid identities and object arguments can be returned to callers.
-#[test]
-fn tool_call_identity_and_arguments_are_checked() {
+#[tokio::test]
+async fn tool_call_identity_and_arguments_are_checked() {
     for (path, value, kind) in [
         ("/id", json!(""), ErrorKind::InvalidResponse),
         (
@@ -157,6 +157,7 @@ async fn unsupported_model_keeps_meaningful_diagnostics() {
     let (base, requests) = serve(400, body.clone());
     let client = options(ToolChoice::Auto)
         .create(&format!("ollama:///model?base_url={base}"))
+        .await
         .unwrap();
     let error = client
         .execute(&[Message::user("lookup")])
@@ -183,6 +184,7 @@ async fn protocol_calls_and_history_are_preserved() {
     );
     let client = options(ToolChoice::Required)
         .create(&format!("ollama:///model?base_url={base}"))
+        .await
         .unwrap();
     let result = client.execute(&[Message::user("lookup")]).await.unwrap();
     let LlmOutput::ToolCalls { calls, .. } = result.output else {
@@ -201,3 +203,5 @@ async fn protocol_calls_and_history_are_preserved() {
     assert_eq!(payload["messages"][1]["tool_call_id"], "call-1");
     assert_eq!(requests.try_iter().count(), 1);
 }
+
+use crate::llm::LlmBackend;

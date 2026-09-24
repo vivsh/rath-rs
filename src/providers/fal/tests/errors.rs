@@ -74,3 +74,5 @@ async fn image_missing_required_output_is_invalid_response() {
     assert!(!error.to_string().contains("PRIVATE-PROSE"));
     assert_eq!(requests.try_iter().count(), 1);
 }
+
+use crate::video::VideoBackend;

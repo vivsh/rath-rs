@@ -3,6 +3,7 @@
 mod body;
 mod format;
 pub(crate) mod http;
+mod metadata;
 mod normalize;
 pub(crate) use normalize::{
     credential_cause, provider_failure, provider_failure_message, sdk_http,
@@ -14,6 +15,7 @@ pub use body::ErrorBody;
 
 /// Stable, provider-independent classification of a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// Caller input or configuration is invalid.
     Validation,
@@ -88,6 +90,10 @@ impl RathError {
 
     /// Adds operation context. Existing distinct context remains in the cause chain.
     pub fn with_context(mut self, provider: Provider, operation: &'static str) -> Self {
+        let provider = match provider {
+            Provider::External(name) => Provider::External(redact::text(&name, &[])),
+            provider => provider,
+        };
         if self.inner.operation.is_some()
             && (self.inner.operation != Some(operation)
                 || self.inner.provider.as_ref() != Some(&provider))

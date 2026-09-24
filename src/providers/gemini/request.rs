@@ -10,6 +10,8 @@ pub(super) fn build_request(
     messages: &[Message],
     minimal: bool,
 ) -> Result<ContentBuilder, RathError> {
+    let prepared = crate::llm::output::prepare(Provider::Gemini, model, options)?;
+    let options = &prepared;
     validate_request(options, messages)?;
     let mut builder = generation_options(client.generate_content(), model, options, minimal);
     let mut system = options.effective_preamble().into_iter().collect::<Vec<_>>();
@@ -38,7 +40,7 @@ pub(super) fn build_request(
     }
     if wants_json_output(options) {
         builder = builder.with_response_mime_type("application/json");
-        if let Some(schema) = response_schema(options) {
+        if let Some(schema) = response_schema(options)? {
             builder = builder.with_response_schema(schema);
         }
     }

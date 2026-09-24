@@ -20,7 +20,8 @@ provider SDKs/APIs.
 - `rath::embeddings`: embedding request/response types and `EmbeddingClient`
 - `rath::images`: image request/response types and `ImageClient`
 - `rath::video`: async video job request/response types and `VideoClient`
-- `rath::audio`: text-to-speech and speech-to-text traits and types
+- `rath::audio`: speech and voice clients, backend traits and types
+- `rath::registry`: application-owned factories for all eight capabilities
 
 Internally, provider adapters live under
 `providers/{openai,openrouter,gemini,anthropic,ollama,fal}.rs`. That module is not
@@ -77,6 +78,86 @@ provider endpoint.
 Capability options parse the same URL format and dispatch to the provider
 implementation that supports that capability.
 
+## Provider factories and external adapters
+
+All eight capabilities use one pattern: an application-owned `ProviderFactory`
+constructs a concrete capability client, which executes through a backend.
+`ProviderRegistry::new()` is external-only; `with_builtins()` also enables Rath's
+built-in adapters. Registration is synchronous and consuming; construction is async.
+
+```rust
+use rath::RathError;
+use rath::audio::tts::{TtsClient, TtsOptions};
+use rath::registry::{ProviderFactory, ProviderRegistry};
+
+async fn speech_client(provider: impl ProviderFactory + 'static) -> Result<TtsClient, RathError> {
+    let providers = ProviderRegistry::with_builtins().register("acme", provider)?;
+    providers
+        .tts("acme:///speech-model", TtsOptions::default())
+        .await
+}
+```
+
+Use `llm`, `embeddings`, `image`, `video`, `tts`, `stt`, `voice_design` or
+`voice_clone`. Factories own construction dependencies; clients survive registry
+disposal. Share either explicitly through `Arc`. Rath retains no application history,
+media, job state or global registrations. There is no discovery, retry or fallback
+introduced by the registry.
+
+Registration names match `[a-z][a-z0-9.-]*`. Duplicates and built-in names/aliases
+(including `fastembed`, even without the Cargo feature) fail. External URLs support
+nested model paths, `api_key_env` and `base_url`; external LLM URLs additionally
+support the same temperature/thinking/cache controls and URL-over-options precedence.
+Other capabilities reject LLM-only controls. Model-path percent sequences retain
+Rath's literal escaping convention. Missing routes/capabilities are
+`UnsupportedCapability`; malformed locators are `InvalidUrl`.
+
+### Writing an extension
+
+Implement a public `…Backend` trait using ordinary async methods and return
+`…Client::from_backend(backend)` from `ProviderFactory`. Public traits use RPITIT
+with `Send` futures, with no `async_trait` annotation or public boxed-future API.
+The private erased bridge boxes once per asynchronous dispatch. Direct generic
+backend calls have no Rath future-boxing requirement. `from_backend` performs no I/O.
+HTTP factories do not probe providers or generate; local inference construction
+may prepare resources as explicitly configured.
+
+Every factory method defaults to unsupported. A transparent decorator must override
+changed methods and explicitly forward all seven others. See the fully forwarding,
+compile-tested [factory decorator](examples/factory_decorator.rs).
+
+Use `ProviderRegistry::with_builtin_factory(factory)` to replace or decorate
+construction for all built-in schemes, including their aliases:
+
+```rust
+use rath::RathError;
+use rath::llm::{LlmClient, LlmOptions};
+use rath::registry::{ProviderFactory, ProviderRegistry};
+
+async fn customized_llm(factory: impl ProviderFactory + 'static) -> Result<LlmClient, RathError> {
+    let providers = ProviderRegistry::with_builtin_factory(factory);
+    providers.llm("ollama:///model", LlmOptions::default()).await
+}
+```
+
+Pass a decorator around `BuiltinProviderFactory` to retain built-in behavior for
+forwarded capabilities. The registry validates URLs and resolves LLM URL-over-options
+precedence before invoking your factory. An unsupported result is returned directly;
+there is no automatic fallback. External registrations still select their own factories,
+and standalone `Options::create()` continues to use Rath's default factory.
+
+Use `ModelUrl` accessors (`provider()`, `model()`, `api_key()`, `base_url()` and LLM
+controls). Its fields are private and Debug redacts credentials and URL query data.
+Use `RathError::from_error(kind, &cause, secrets)` and credential-aware body/metadata
+builders to preserve causes. Construction redacts URL-resolved credentials; extension
+backends remain responsible for their own private credentials and execution errors.
+No wrapper intercepts third-party execution. Ordinary diagnostics never print bodies.
+
+`Provider::External(String)` retains `{"External":"acme"}` Serde representation,
+including video receipts. Built-in representations are unchanged. `as_str()` borrows
+`&str`, not a static lifetime. Extensible enum matches need a wildcard. Older persisted
+readers still need migration before reading unknown identities.
+
 ## Credentials
 
 Rath reads provider API keys from environment variables. The default variables
@@ -112,39 +193,121 @@ Missing required keys return an error before making a provider request. Rath doe
 not accept raw API keys in constructors or inline credentials in model locators;
 keep secrets in environment variables.
 
-## Embedding Usage
+## Embedding usage
+
+Every model is bound at construction. A homogeneous batch produces one nonempty,
+finite vector per input, in input order, or an error for the whole call. Remote
+adapters send one batch request, without implicit fan-out. Usage is aggregate and
+provider-reported. Rath never slices vectors to emulate requested dimensions.
 
 ```rust
 use rath::embeddings::{EmbedRequest, EmbeddingOptions};
-
-# async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let client = EmbeddingOptions::default().create("openai:///text-embedding-3-small")?;
-let response = client.embed(&EmbedRequest {
-    input: "Rust workflows with provider-agnostic AI clients".to_string(),
-    ..EmbedRequest::default()
-}).await?;
-
-println!("{} dimensions", response.values.len());
-# Ok(())
-# }
+async fn run() -> Result<(), rath::RathError> {
+    let client = EmbeddingOptions::default()
+        .create("openai:///text-embedding-3-small")
+        .await?;
+    let response = client
+        .embed(&EmbedRequest::batch([
+            "first document".into(),
+            "second document".into(),
+        ]))
+        .await?;
+    assert_eq!(response.embeddings.len(), 2);
+    Ok(())
+}
 ```
+
+`EmbedRequest::new(text)` builds a single-input batch. Empty batches/strings, zero
+dimensions and blank instructions fail. Supplied titles require RetrievalDocument;
+instructions require a supported RetrievalQuery task. Native configuration is shallow
+client defaults → request settings → supplied typed fields; unknown embedding native
+keys and typed aliases fail locally.
+
+| Control | OpenAI | Gemini | Ollama | FastEmbed |
+| --- | --- | --- | --- | --- |
+| Task hints | rejected | all typed tasks | Qwen3 query/document | BGESmallENV15 query/document |
+| Title | rejected | retrieval document | rejected | rejected |
+| Instructions | rejected | rejected | required for Qwen queries | optional BGE query replacement |
+| Dimensions | forwarded | forwarded | forwarded | native dimension only |
+| Explicit truncation | rejected | autoTruncate | truncate | actual tokenizer; defaults off |
+| Native settings | user | empty only | keep_alive, object options | empty only |
+
+Without task hints, raw input is preserved. Recognized `qwen3-embedding[:tag]`
+queries use `Instruct: {instructions}\nQuery: {text}`. Custom aliases are not guessed;
+callers can submit already prepared raw text. BGE queries receive its documented
+retrieval prefix unless explicitly replaced. Documents remain unchanged.
+
+Gemini uses direct batch HTTP to retain current `embedContentConfig` and usage metadata;
+its generation SDK is unchanged. See [Gemini embeddings](https://ai.google.dev/api/embeddings).
+
+### Optional FastEmbed CPU inference
+
+```rust
+use rath::embeddings::{EmbedRequest, EmbeddingOptions, FastEmbedOptions};
+async fn run() -> Result<(), rath::RathError> {
+    let client = EmbeddingOptions::default()
+        .with_fastembed(FastEmbedOptions::new("./models").with_intra_threads(2))
+        .create("fastembed:///BGESmallENV15")
+        .await?;
+    let response = client.embed(&EmbedRequest::new("hello")).await?;
+    Ok(())
+}
+```
+
+Enable Cargo feature `fastembed` for CPU ONNX inference. The typed setup remains
+available without it, but construction then reports UnsupportedCapability. Defaults
+are downloads off, revision `main`, max length 512, one intra-op thread and batch size
+32. Cache location is mandatory. Other embedding adapters reject FastEmbed setup;
+there is no JSON setup path. Native dimensions cannot be changed locally.
+
+The cache follows hf-hub layout at the explicit directory. Offline construction fails
+on missing files without network requests. `.with_download(true)` explicitly permits
+retrieving missing artifacts and pins them to one revision, with retrieval retries
+disabled. Only explicit `api_key_env` supplies a download credential; ambient HF tokens
+are not read. Optional `base_url` selects a compatible hub endpoint. Files and cleanup
+belong to the application; there is no global model/session cache.
+
+Enabling the feature can acquire ONNX Runtime binaries at **build time** independently
+of runtime model-download permission. FastEmbed and ONNX are absent from the default
+dependency graph; no Candle, GPU, sparse embeddings or reranking features are enabled.
+
+Initialization and inference use Tokio blocking workers. Calls share an authoritative
+async session mutex. Dropping a future stops waiting but cannot interrupt native work
+or downloads; it never permits overlapping session use or resubmission. A Tokio runtime
+is required. hf-hub/FastEmbed may discard native diagnostic details internally; Rath
+retains their exposed cause chains but cannot recover discarded response bodies.
+
+Normal tests use an original tiny ONNX/tokenizer fixture, not downloaded model weights.
+Opt-in real-model probes take explicit arguments and print initialization/inference
+latency, dimensions and batch size:
+
+```sh
+cargo run --features fastembed --example embedding_probe -- fastembed:///BGESmallENV15 ./models main
+cargo run --example embedding_probe -- ollama:///qwen3-embedding:0.6b
+```
+
+Add `--download` as the final FastEmbed argument only when model retrieval is intended.
+The Ollama model must already be installed; Rath does not pull or restart it.
 
 ## Image Usage
 
 ```rust
 use rath::images::{ImageOptions, ImageRequest};
 
-# async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let client = ImageOptions::default().create("fal:///fal-ai/flux/schnell")?;
-let response = client.generate_image(&ImageRequest {
-    prompt: "A walnut desk lamp in warm studio light".to_string(),
-    size: Some("landscape_4_3".to_string()),
-    ..ImageRequest::default()
-}).await?;
+async fn run() -> Result<(), rath::RathError> {
+    let client = ImageOptions::default()
+        .create("fal:///fal-ai/flux/schnell")
+        .await?;
+    let response = client
+        .generate_image(
+            &ImageRequest::new("A walnut desk lamp in warm studio light".to_string())
+                .with_size("landscape_4_3".to_string()),
+        )
+        .await?;
 
-println!("{} image(s)", response.images.len());
-# Ok(())
-# }
+    println!("{} image(s)", response.images.len());
+    Ok(())
+}
 ```
 
 ## Video Usage
@@ -171,24 +334,27 @@ Other Fal queue endpoints require explicit `VideoInput::Native`.
 use rath::images::ImageData;
 use rath::video::{VideoInput, VideoOptions, VideoRequest};
 
-# async fn run() -> Result<(), rath::RathError> {
-let client = VideoOptions::default()
-    .create("fal:///fal-ai/kling-video/v3/pro/image-to-video")?;
-let job = client.submit_video(&VideoRequest {
-    prompt: "The character turns and waves.".into(),
-    input: VideoInput::ImageToVideo {
-        start_image: ImageData::Url {
-            url: "https://assets.example/approved-scene.png".into(),
-        },
-        end_image: None,
-    },
-    ..Default::default()
-}).await?;
+async fn run() -> Result<(), rath::RathError> {
+    let client = VideoOptions::default()
+        .create("fal:///fal-ai/kling-video/v3/pro/image-to-video")
+        .await?;
+    let job = client
+        .submit_video(&VideoRequest::new(
+            "The character turns and waves.".into(),
+            VideoInput::ImageToVideo {
+                start_image: ImageData::Url {
+                    url: "https://assets.example/approved-scene.png".into(),
+                },
+                end_image: None,
+            },
+        ))
+        .await?;
 
-// Persist the receipt and provider/model/account association in your application.
-let status = client.get_video(&job.id).await?;
-let response = client.wait_video(&job.id).await?;
-# Ok(()) }
+    // Persist the receipt and provider/model/account association in your application.
+    let status = client.get_video(&job.id).await?;
+    let response = client.wait_video(&job.id).await?;
+    Ok(())
+}
 ```
 
 For T2V, use `VideoInput::TextToVideo` (the default) and a compatible T2V endpoint.
@@ -206,25 +372,30 @@ not cancel the remote job, and an uncertain submission must not be blindly retri
 use rath::images::ImageData;
 use rath::video::{VideoData, VideoInput, VideoOptions, VideoRequest};
 
-# async fn run() -> Result<(), rath::RathError> {
-let client = VideoOptions::default()
-    .create("fal:///fal-ai/kling-video/v3/pro/motion-control")?;
-let response = client.generate_video(&VideoRequest {
-    input: VideoInput::MotionTransfer {
-        character_image: ImageData::Url {
-            url: "https://assets.example/character.png".into(),
-        },
-        driving_video: VideoData::Url {
-            url: "https://assets.example/performance.mp4".into(),
-        },
-    },
-    provider_config: Some(serde_json::json!({
-        "character_orientation": "video",
-        "keep_original_sound": false
-    })),
-    ..Default::default()
-}).await?;
-# Ok(()) }
+async fn run() -> Result<(), rath::RathError> {
+    let client = VideoOptions::default()
+        .create("fal:///fal-ai/kling-video/v3/pro/motion-control")
+        .await?;
+    let response = client
+        .generate_video(&{
+            let mut value = VideoRequest::default();
+            value.input = VideoInput::MotionTransfer {
+                character_image: ImageData::Url {
+                    url: "https://assets.example/character.png".into(),
+                },
+                driving_video: VideoData::Url {
+                    url: "https://assets.example/performance.mp4".into(),
+                },
+            };
+            value.provider_config = Some(serde_json::json!({
+                "character_orientation": "video",
+                "keep_original_sound": false
+            }));
+            value
+        })
+        .await?;
+    Ok(())
+}
 ```
 
 The motion prompt is optional. Kling requires an explicit `character_orientation`
@@ -241,23 +412,28 @@ actual media dimensions, duration, and content.
 ```rust,no_run
 use rath::video::{VideoInput, VideoOptions, VideoRequest};
 
-# async fn run() -> Result<(), rath::RathError> {
-let client = VideoOptions::default()
-    .create("fal:///fal-ai/kling-video/v3/pro/image-to-video")?;
-let job = client.submit_video(&VideoRequest {
-    input: VideoInput::Native {
-        payload: serde_json::json!({
-            "start_image_url": "https://assets.example/scene.png",
-            "multi_prompt": [
-                { "prompt": "A slow push-in.", "duration": "3" },
-                { "prompt": "The character smiles.", "duration": "3" }
-            ],
-            "duration": "6"
-        }),
-    },
-    ..Default::default()
-}).await?;
-# Ok(()) }
+async fn run() -> Result<(), rath::RathError> {
+    let client = VideoOptions::default()
+        .create("fal:///fal-ai/kling-video/v3/pro/image-to-video")
+        .await?;
+    let job = client
+        .submit_video(&{
+            let mut value = VideoRequest::default();
+            value.input = VideoInput::Native {
+                payload: serde_json::json!({
+                    "start_image_url": "https://assets.example/scene.png",
+                    "multi_prompt": [
+                        { "prompt": "A slow push-in.", "duration": "3" },
+                        { "prompt": "The character smiles.", "duration": "3" }
+                    ],
+                    "duration": "6"
+                }),
+            };
+            value
+        })
+        .await?;
+    Ok(())
+}
 ```
 
 Native mode also accepts arbitrary/custom Fal video endpoint paths. Its payload
@@ -280,7 +456,7 @@ not a model input. Polling is still available for the same job.
 use rath::video::{VideoClient, VideoEvent};
 
 async fn decode_callback(
-    client: &dyn VideoClient,
+    client: &VideoClient,
     headers: &http::HeaderMap,
     original_body: &[u8],
 ) -> Result<VideoEvent, rath::RathError> {
@@ -325,7 +501,7 @@ Serialized requests must include the new tagged `input` field.
 
 Existing job/response types and polling method signatures are unchanged.
 `parse_webhook` has a default unsupported implementation, so existing downstream
-`VideoClient` implementations do not need a new required method.
+`VideoBackend` implementations do not need a new required method.
 
 ## Audio Usage
 
@@ -333,18 +509,19 @@ Existing job/response types and polling method signatures are unchanged.
 use rath::audio::tts::{TtsOptions, TtsRequest};
 use rath::audio::voice::Voice;
 
-# async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let client = TtsOptions::default().create("openai:///tts-1")?;
-let response = client.synthesize_speech(&TtsRequest {
-    input: "Rath is a stable capability layer for AI applications.".to_string(),
-    voice: Some(Voice::id("openai", "alloy")),
-    format: Some("mp3".to_string()),
-    ..TtsRequest::default()
-}).await?;
+async fn run() -> Result<(), rath::RathError> {
+    let client = TtsOptions::default().create("openai:///tts-1").await?;
+    let response = client
+        .synthesize_speech(
+            &TtsRequest::new("Rath is a stable capability layer for AI applications.".to_string())
+                .with_voice(Voice::id("openai", "alloy"))
+                .with_format("mp3".to_string()),
+        )
+        .await?;
 
-println!("{} bytes of {}", response.data.len(), response.mime_type);
-# Ok(())
-# }
+    println!("{} bytes of {}", response.data.len(), response.mime_type);
+    Ok(())
+}
 ```
 
 ### Fal speech
@@ -377,29 +554,34 @@ such as `stability` go in `provider_config`; no settings are added implicitly.
 Audio tags are model-specific and should not be assumed to work with Turbo.
 
 ```rust
-use rath::audio::tts::{TtsOptions, TtsRequest};
 use rath::audio::stt::{SttOptions, SttRequest};
+use rath::audio::tts::{TtsOptions, TtsRequest};
 use rath::audio::voice::Voice;
 
-# async fn run() -> Result<(), rath::core::RathError> {
-let tts = TtsOptions::default().create("fal:///fal-ai/kokoro/american-english")?;
-let speech = tts.synthesize_speech(&TtsRequest {
-    input: "Hello from Rath.".into(),
-    voice: Some(Voice::id("fal/kokoro/american-english", "af_heart")),
-    ..Default::default()
-}).await?;
+async fn run() -> Result<(), rath::core::RathError> {
+    let tts = TtsOptions::default()
+        .create("fal:///fal-ai/kokoro/american-english")
+        .await?;
+    let speech = tts
+        .synthesize_speech(
+            &TtsRequest::new("Hello from Rath.".into())
+                .with_voice(Voice::id("fal/kokoro/american-english", "af_heart")),
+        )
+        .await?;
 
-let stt = SttOptions::default()
-    .create("fal:///fal-ai/elevenlabs/speech-to-text/scribe-v2")?;
-let transcript = stt.transcribe_audio(&SttRequest {
-    mime_type: speech.mime_type,
-    data: speech.data,
-    model: None,
-    provider_config: Some(serde_json::json!({"language_code": "en"})),
-}).await?;
-println!("{}", transcript.text);
-# Ok(())
-# }
+    let stt = SttOptions::default()
+        .create("fal:///fal-ai/elevenlabs/speech-to-text/scribe-v2")
+        .await?;
+    let transcript = stt
+        .transcribe_audio(&{
+            let mut value = SttRequest::new(speech.mime_type, speech.data);
+            value.provider_config = Some(serde_json::json!({"language_code": "en"}));
+            value
+        })
+        .await?;
+    println!("{}", transcript.text);
+    Ok(())
+}
 ```
 
 Both operations submit once to Fal's queue, poll every five seconds and have a
@@ -417,8 +599,8 @@ without parameters. Rath does not transcode files. Fal results are preserved in
 configuration, then typed input/audio and any supplied voice take precedence.
 Other settings retain the endpoint's native names and defaults: for example,
 Wizper uses `language` (default `en`, explicit `null` for detection), while Scribe
-uses `language_code`. `request.model` selects a supported endpoint for that call
-without changing the client. Unknown endpoints fail locally. The supported TTS
+uses `language_code`. The construction URL binds the endpoint for all calls.
+Unknown endpoints fail locally. The supported TTS
 endpoints do not expose format selection, so leave `format` unset.
 
 The default queue is `https://queue.fal.run`; a custom `base_url` is used as the
@@ -433,44 +615,57 @@ content; they are not automatically suitable for public HTTP responses.
 ### Storage-free custom voices
 
 `VoiceDesignClient`, `VoiceCloneClient` and `TtsClient` are independent capabilities.
-Each has an `Options { provider_config }` factory taking a model URL. Factory creation
+Each has an `Options { provider_config }` factory taking a model URL. Factory construction
 does not generate media or register a remote voice. Inputs and results are caller-owned.
 There are no file paths, persistence callbacks, registries, caches or automatic pipelines.
 
 ```rust
 use rath::audio::{
-    voice_design::{VoiceDesignOptions, VoiceDesignRequest},
-    voice_clone::{VoiceCloneOptions, VoiceCloneRequest},
     tts::{TtsOptions, TtsRequest},
+    voice_clone::{VoiceCloneOptions, VoiceCloneRequest},
+    voice_design::{VoiceDesignOptions, VoiceDesignRequest},
 };
 
-# async fn run() -> Result<(), rath::core::RathError> {
-let designer = VoiceDesignOptions::default()
-    .create("fal:///fal-ai/qwen-3-tts/voice-design/1.7b")?;
-let previews = designer.design_voice(&VoiceDesignRequest {
-    description: "A warm adult voice with a natural Indian English accent.".into(),
-    text: "Hello. It is good to hear from you. What would you like to talk about?".into(),
-    language: Some("en".into()),
-    ..Default::default()
-}).await?;
+async fn run() -> Result<(), rath::core::RathError> {
+    let designer = VoiceDesignOptions::default()
+        .create("fal:///fal-ai/qwen-3-tts/voice-design/1.7b")
+        .await?;
+    let previews = designer
+        .design_voice(&{
+            let mut value = VoiceDesignRequest::default();
+            value.description = "A warm adult voice with a natural Indian English accent.".into();
+            value.text =
+                "Hello. It is good to hear from you. What would you like to talk about?".into();
+            value.language = Some("en".into());
+            value
+        })
+        .await?;
 
-// The application selects/auditions a sample. Rath never selects one automatically.
-let sample = previews.previews.into_iter().next().ok_or_else(||
-    rath::core::RathError::new(rath::core::ErrorKind::InvalidResponse, "no previews"))?.sample;
-let cloner = VoiceCloneOptions::default()
-    .create("fal:///fal-ai/qwen-3-tts/clone-voice/1.7b")?;
-let voice = cloner.clone_voice(&VoiceCloneRequest {
-    samples: vec![sample], ..Default::default()
-}).await?;
+    // The application selects/auditions a sample. Rath never selects one automatically.
+    let sample = previews
+        .previews
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            rath::core::RathError::new(rath::core::ErrorKind::InvalidResponse, "no previews")
+        })?
+        .sample;
+    let cloner = VoiceCloneOptions::default()
+        .create("fal:///fal-ai/qwen-3-tts/clone-voice/1.7b")
+        .await?;
+    let voice = cloner
+        .clone_voice(&VoiceCloneRequest::new(vec![sample]))
+        .await?;
 
-// Save voice in the application if desired. It is serializable, not stored by Rath.
-let tts = TtsOptions::default()
-    .create("fal:///fal-ai/qwen-3-tts/text-to-speech/1.7b")?;
-let audio = tts.synthesize_speech(&TtsRequest {
-    input: "Welcome back.".into(), voice: Some(voice), ..Default::default()
-}).await?;
-# Ok(())
-# }
+    // Save voice in the application if desired. It is serializable, not stored by Rath.
+    let tts = TtsOptions::default()
+        .create("fal:///fal-ai/qwen-3-tts/text-to-speech/1.7b")
+        .await?;
+    let audio = tts
+        .synthesize_speech(&TtsRequest::new("Welcome back.".into()).with_voice(voice))
+        .await?;
+    Ok(())
+}
 ```
 
 `Voice { scope, data }` distinguishes an `Id`, an opaque `Embedding { format, data,
@@ -536,16 +731,18 @@ breaking; no automatic conversion or provider fallback is performed.
 ```rust
 use rath::llm::{LlmOptions, LlmOutput, Message};
 
-# async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let client = LlmOptions::default().create("openai:///gpt-4o")?;
-let response = client.execute(&[Message::user("Write one sentence about Rust.")]).await?;
+async fn run() -> Result<(), rath::RathError> {
+    let client = LlmOptions::default().create("openai:///gpt-4o").await?;
+    let response = client
+        .execute(&[Message::user("Write one sentence about Rust.")])
+        .await?;
 
-match response.output {
-    LlmOutput::Output(value) => println!("{value}"),
-    LlmOutput::ToolCalls { .. } => println!("model requested tools"),
+    match response.output {
+        LlmOutput::Output(value) => println!("{value}"),
+        LlmOutput::ToolCalls { .. } => println!("model requested tools"),
+    }
+    Ok(())
 }
-# Ok(())
-# }
 ```
 
 ## Ollama thinking
@@ -610,8 +807,7 @@ Failures remain inspectable through `RathError`:
 - Truncated output: `OutputLimitReached`, before parsing or tool extraction.
 
 Response bodies are explicitly accessible and absent from ordinary error
-formatting. `Message::from_json` retains its existing `serde_json::Error` return
-type for input serialization failures.
+formatting. `Message::from_json` returns `RathError` with a Serialize classification and the original cause.
 
 Run installed-model checks with:
 
@@ -634,26 +830,27 @@ For example, Gemini safety settings can be provided with conservative
 `safetySettings`:
 
 ```rust
-use serde_json::json;
 use rath::llm::LlmOptions;
+use serde_json::json;
 
-# fn run() -> Result<(), Box<dyn std::error::Error>> {
-let client = LlmOptions::default()
-    .with_provider_config(json!({
-        "safetySettings": [
-            {
-                "category": "HARM_CATEGORY_HATE_SPEECH",
-                "threshold": "BLOCK_LOW_AND_ABOVE"
-            },
-            {
-                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-            }
-        ]
-    }))
-    .create("gemini:///gemini-2.5-flash")?;
-# Ok(())
-# }
+async fn run() -> Result<(), rath::RathError> {
+    let client = LlmOptions::default()
+        .with_provider_config(json!({
+            "safetySettings": [
+                {
+                    "category": "HARM_CATEGORY_HATE_SPEECH",
+                    "threshold": "BLOCK_LOW_AND_ABOVE"
+                },
+                {
+                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+                }
+            ]
+        }))
+        .create("gemini:///gemini-2.5-flash")
+        .await?;
+    Ok(())
+}
 ```
 
 ## Structured Output Strategy
@@ -663,7 +860,14 @@ Ollama, and Gemini models before `gemini-3.1`, Rath may convert structured
 output into a required synthetic tool call. This is internal to Rath: callers
 still receive `LlmOutput::Output(...)` when the exit tool is called successfully.
 
-Use `LlmClient::uses_exit_tool()` to check whether a client uses this strategy.
+The strategy is private and operation-local; `options()` remains unchanged. The reserved
+`__rath_final_output` name cannot be used by application tools. Mixed final-output and
+ordinary tool calls are errors. Disabled user-tool policy is preserved.
+
+`ResponseFormat::{Text, Json, JsonSchema { schema }}` is the sole output choice.
+`with_output_schema` selects JsonSchema; setting another format replaces the entire
+choice. JSON parsing does not prove schema conformance. Input schemas are prompt hints.
+Applications supply reminders as ordinary messages.
 
 ## License
 
@@ -677,26 +881,27 @@ local text-request estimates and `LlmOptions::with_max_output_tokens`.
 ```rust,no_run
 use rath::llm::{LlmOptions, Message, RathError};
 
-# async fn example(model_url: &str, retained_messages: &[Message]) -> Result<(), RathError> {
-let client = LlmOptions::default()
-    .with_preamble("Answer using the supplied conversation.")
-    .with_max_output_tokens(1024)
-    .create(model_url)?;
+async fn example(model_url: &str, retained_messages: &[Message]) -> Result<(), RathError> {
+    let client = LlmOptions::default()
+        .with_preamble("Answer using the supplied conversation.")
+        .with_max_output_tokens(1024)
+        .create(model_url)
+        .await?;
 
-// Includes persona, retained history, current input, schemas and enabled tools.
-let estimate = client.estimate_tokens(retained_messages)?;
-println!("estimated input: {}", estimate.input_tokens);
+    // Includes persona, retained history, current input, schemas and enabled tools.
+    let estimate = client.estimate_tokens(retained_messages)?;
+    println!("estimated input: {}", estimate.input_tokens);
 
-// Same selected response model; excludes configured persona, history and schemas.
-// Includes minimal one-message request framing: compare directly to a summary budget.
-let summary_size = client.estimate_content_tokens("A standalone summary.")?;
-println!("summary budget usage: {}", summary_size.input_tokens);
+    // Same selected response model; excludes configured persona, history and schemas.
+    // Includes minimal one-message request framing: compare directly to a summary budget.
+    let summary_size = client.estimate_content_tokens("A standalone summary.")?;
+    println!("summary budget usage: {}", summary_size.input_tokens);
 
-// Explicit network request. Unsupported adapters/endpoints return an error.
-let reported = client.count_tokens(retained_messages).await?;
-println!("provider-reported input: {}", reported.input_tokens);
-# Ok(())
-# }
+    // Explicit network request. Unsupported adapters/endpoints return an error.
+    let reported = client.count_tokens(retained_messages).await?;
+    println!("provider-reported input: {}", reported.input_tokens);
+    Ok(())
+}
 ```
 
 Local estimates support inexpensive monitoring and early compaction. **They do
@@ -755,7 +960,7 @@ or exposing tool calls. Partial output is not successful structured output. The
 sanitized response remains explicitly accessible through `response_body()`, while
 ordinary `Display`, `Debug` and tracing of Rath errors omit body contents.
 
-Measurement methods still default to unsupported for custom `LlmClient` implementations.
+Measurement methods still default to unsupported for custom `LlmBackend` implementations.
 Exhaustive `LlmOptions` literals must add `max_output_tokens: None` or use
 `..Default::default()`. The structured error redesign is a breaking API change;
 custom error construction and enum matches must migrate as described below.
@@ -817,8 +1022,12 @@ fn inspect(error: &RathError) {
         }
     }
     let _metadata = (
-        error.provider(), error.operation(), error.http_status(),
-        error.provider_code(), error.request_id(), error.retry_after(),
+        error.provider(),
+        error.operation(),
+        error.http_status(),
+        error.provider_code(),
+        error.request_id(),
+        error.retry_after(),
     );
     let mut level = Some(error);
     while let Some(cause) = level {
@@ -891,3 +1100,31 @@ credentials Rath uses the current environment value when normalizing errors; if 
 environment changes after construction, the SDK does not expose its previously used
 credential for Rath to redact. Explicit `api_key_env` resolution stays available in
 the existing model URL. No extra credential copy is retained for diagnostics.
+
+## API stabilization migration
+
+Version 0.3.0 introduces these breaking API changes.
+
+- Implement `…Backend` instead of the old `…Client` traits; use native async methods.
+- Replace `Box<dyn …Client>` with concrete client handles and await construction.
+- Replace MediaProvider and LlmClientFactory/Layer with ProviderFactory. Decorators
+  explicitly forward untouched capabilities; unsupported defaults do not delegate.
+- Construct extensible records with their constructors/builders, then assign public
+  fields when needed. Add fallback arms only for extensible enums.
+- Use ModelUrl accessors. Model overrides on image/TTS/STT requests are removed.
+- Replace output_schema/output_type_name with ResponseFormat::JsonSchema. Turn budgets,
+  reminder helpers and exit-tool inspection are removed; applications own those policies.
+- Read ToolCalls.text in place of thought. Embeddings now use ordered input/vector batches.
+- Use typed FastEmbedOptions, with downloads explicitly enabled when intended.
+
+Provider, ErrorKind, EmbedTaskType, ThinkingLevel, CacheControl, Role, Attachment,
+image/video/voice data, VideoInput and VideoJobStatus are extensible. Options, requests,
+responses, Message, ToolCall, ToolDefinition, TokenUsage, Voice, VoicePreview, VideoJob
+and VideoEvent are extensible records. TokenCount and VoiceSample remain fixed records.
+ToolChoice, ResponseFormat, LlmOutput, TokenCountSource and ErrorBody are closed enums.
+
+Serde representations remain compatible except for documented field migrations:
+embedding `input` is now an array; request-level `model` no longer controls routing;
+new optional controls may be absent in older payloads. Non-exhaustiveness does not
+make unknown persisted variants readable by older applications. Review storage migrations
+separately from Rust API changes.

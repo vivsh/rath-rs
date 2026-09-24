@@ -179,7 +179,7 @@ fn build_messages_keeps_tool_response_and_reminder_separate() {
 fn response_mode_uses_explicit_json_setting() {
     let no_schema = LlmOptions::default();
     assert!(!wants_json_output(&no_schema));
-    assert!(response_schema(&no_schema).is_none());
+    assert!(response_schema(&no_schema).unwrap().is_none());
 
     let with_schema = LlmOptions::default()
         .with_response_format(crate::llm::ResponseFormat::Json)
@@ -191,7 +191,7 @@ fn response_mode_uses_explicit_json_setting() {
             "required": ["answer"]
         }));
     assert!(wants_json_output(&with_schema));
-    assert!(response_schema(&with_schema).is_some());
+    assert!(response_schema(&with_schema).unwrap().is_some());
 }
 
 /// Input schema hints do not change Gemini response mode on their own.
@@ -199,7 +199,7 @@ fn response_mode_uses_explicit_json_setting() {
 fn input_schema_alone_does_not_enable_json_output() {
     let with_input_schema = LlmOptions::default().with_input_schema(json!({ "type": "object" }));
     assert!(!wants_json_output(&with_input_schema));
-    assert!(response_schema(&with_input_schema).is_none());
+    assert!(response_schema(&with_input_schema).unwrap().is_none());
 }
 
 /// Verifies provider config parses safety settings.

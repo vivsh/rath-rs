@@ -3,6 +3,32 @@ use serde_json::Value;
 
 /// Validates the typed cap and rejects competing provider configuration locations.
 pub(crate) fn validate_options(provider: Provider, options: &LlmOptions) -> Result<(), RathError> {
+    crate::registry::prepare::native(options.provider_config.as_ref())?;
+    if options
+        .tools
+        .iter()
+        .any(|t| t.name == "__rath_final_output")
+        && options.wants_json_output()
+    {
+        return Err(RathError::new(
+            crate::ErrorKind::Validation,
+            "tool name __rath_final_output is reserved",
+        ));
+    }
+    if options.cache.is_some()
+        && matches!(
+            provider,
+            Provider::OpenAi | Provider::OpenRouter | Provider::Ollama | Provider::Gemini
+        )
+    {
+        return Err(RathError::unsupported(provider, "explicit cache policy"));
+    }
+    if options.thinking.is_some() && provider == Provider::OpenAi {
+        return Err(RathError::unsupported(
+            provider,
+            "typed thinking control on this adapter",
+        ));
+    }
     if let Some(cap) = options.max_output_tokens
         && (cap == 0 || (provider == Provider::Gemini && cap > i32::MAX as u32))
     {
@@ -11,7 +37,12 @@ pub(crate) fn validate_options(provider: Provider, options: &LlmOptions) -> Resu
             "max_output_tokens is zero or outside the provider's representable range",
         ));
     }
-    let Some(config) = &options.provider_config else {
+    validate_cap_aliases(options.provider_config.as_ref())
+}
+
+/// Rejects competing output budgets without scanning arbitrary nested schema property names.
+fn validate_cap_aliases(config: Option<&Value>) -> Result<(), RathError> {
+    let Some(config) = config else {
         return Ok(());
     };
     for path in [

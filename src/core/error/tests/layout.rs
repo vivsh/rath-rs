@@ -34,7 +34,7 @@ fn standard_sources_preserve_rath_identity_and_order() {
 #[test]
 fn cloned_snapshot_owns_its_diagnostics() {
     let original = RathError::new(ErrorKind::Provider, "failed")
-        .with_body(ErrorBody::Complete(b"PRIVATE-PAYLOAD".to_vec()))
+        .with_raw_body(ErrorBody::Complete(b"PRIVATE-PAYLOAD".to_vec()))
         .with_source(RathError::new(ErrorKind::Other, "cause"));
     let cloned = original.clone();
     drop(original.with_source(RathError::new(ErrorKind::Other, "later cause")));

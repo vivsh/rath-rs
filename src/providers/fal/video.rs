@@ -2,19 +2,16 @@
 use super::{FalClient, build_endpoint, video_input, video_media, video_webhook};
 use crate::core::error::{http, provider_failure};
 use crate::core::{ErrorKind, ModelUrl, Provider, RathError};
+use crate::video::VideoBackend;
 use crate::video::{
     VideoClient, VideoData, VideoEvent, VideoJob, VideoJobStatus, VideoOptions, VideoRequest,
     VideoResponse,
 };
-use async_trait::async_trait;
 use serde_json::Value;
 use std::time::Duration;
 
 /// Constructs a video-only transport without changing other Fal clients.
-pub(crate) fn new_client(
-    url: &ModelUrl,
-    options: VideoOptions,
-) -> Result<Box<dyn VideoClient>, RathError> {
+pub(crate) fn new_client(url: &ModelUrl, options: VideoOptions) -> Result<VideoClient, RathError> {
     video_input::validate_config(&options.provider_config)?;
     let mut client = FalClient::new(url, options.provider_config, "video")?;
     if video_media::url(&client.queue_base_url)?.query().is_some() {
@@ -35,7 +32,7 @@ pub(crate) fn new_client(
             )
         })?;
     client.poll_interval = options.poll_interval;
-    Ok(Box::new(client))
+    Ok(VideoClient::from_backend(client))
 }
 
 impl FalClient {
@@ -86,8 +83,7 @@ impl FalClient {
     }
 }
 
-#[async_trait]
-impl VideoClient for FalClient {
+impl VideoBackend for FalClient {
     async fn submit_video(&self, request: &VideoRequest) -> Result<VideoJob, RathError> {
         let payload = video_input::payload(&self.model, &self.provider_config, request)?;
         let endpoint = submission_url(self, request)?;

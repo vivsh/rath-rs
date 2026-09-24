@@ -1,4 +1,5 @@
 use crate::core::error::http;
+use crate::images::ImageBackend;
 mod audio;
 mod queue;
 mod video;
@@ -17,7 +18,6 @@ pub(crate) use voice::{
     new_clone as new_voice_clone_client, new_design as new_voice_design_client,
 };
 
-use async_trait::async_trait;
 use serde_json::{Map, Value};
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use crate::core::RathError;
 use crate::core::{ModelUrl, Provider};
 use crate::images::{ImageClient, ImageData, ImageOptions, ImageRequest, ImageResponse};
 #[cfg(test)]
-use crate::video::{VideoClient, VideoData, VideoJobStatus};
+use crate::video::{VideoData, VideoJobStatus};
 
 const DEFAULT_BASE_URL: &str = "https://fal.run";
 const DEFAULT_QUEUE_BASE_URL: &str = "https://queue.fal.run";
@@ -34,8 +34,8 @@ const DEFAULT_API_KEY_ENV: &str = "FAL_KEY";
 pub(crate) fn new_image_client(
     url: &ModelUrl,
     options: ImageOptions,
-) -> Result<Box<dyn ImageClient>, RathError> {
-    Ok(Box::new(FalClient::new(
+) -> Result<ImageClient, RathError> {
+    Ok(ImageClient::from_backend(FalClient::new(
         url,
         options.provider_config,
         "image",
@@ -105,9 +105,10 @@ impl FalClient {
     }
 }
 
-#[async_trait]
-impl ImageClient for FalClient {
+impl ImageBackend for FalClient {
     async fn generate_image(&self, request: &ImageRequest) -> Result<ImageResponse, RathError> {
+        crate::registry::prepare::native(self.provider_config.as_ref())?;
+        crate::registry::prepare::native(request.provider_config.as_ref())?;
         let payload = image_payload(&self.model, &self.provider_config, request);
         self.post(
             &self.endpoint,
@@ -159,11 +160,7 @@ fn image_payload(
     if let Some(size) = &request.size {
         payload.insert("image_size".to_string(), Value::String(size.clone()));
     }
-    if let Some(model) = request.model.as_ref().filter(|m| !m.is_empty()) {
-        payload.insert("model".to_string(), Value::String(model.clone()));
-    } else {
-        payload.insert("model".to_string(), Value::String(model.to_string()));
-    }
+    payload.insert("model".into(), Value::String(model.into()));
     payload
 }
 

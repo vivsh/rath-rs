@@ -104,7 +104,7 @@ fn stt_data_uri_and_precedence() {
     let request = SttRequest {
         mime_type: "audio/wav".into(),
         data: vec![0, 255, 1, 128],
-        model: None,
+
         provider_config: Some(json!({"audio_url":"untrusted", "language":null})),
     };
     for model in [WIZPER, SCRIBE] {
@@ -120,7 +120,7 @@ fn rejects_invalid_stt_requests() {
     let mut request = SttRequest {
         mime_type: "audio/wav".into(),
         data: vec![1],
-        model: None,
+
         provider_config: None,
     };
     assert!(stt_payload("unknown", &None, &request).is_err());

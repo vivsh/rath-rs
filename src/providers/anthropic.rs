@@ -1,6 +1,6 @@
+use crate::llm::LlmBackend;
 mod measurement;
 
-use async_trait::async_trait;
 use reqwest::Client as HttpClient;
 use serde_json::{Value, json};
 
@@ -22,10 +22,10 @@ struct AnthropicClient {
 }
 
 /// Creates an LLM client after validating output caps and resolving credentials.
-pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, RathError> {
+pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<LlmClient, RathError> {
     crate::llm::counting::validate_options(Provider::Anthropic, &options)?;
     let api_key = required_api_key(url, "ANTHROPIC_API_KEY")?;
-    Ok(Box::new(AnthropicClient {
+    Ok(LlmClient::from_backend(AnthropicClient {
         http: HttpClient::new(),
         api_key,
         base_url: configured_base_url(url, DEFAULT_BASE_URL),
@@ -35,8 +35,7 @@ pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClie
     }))
 }
 
-#[async_trait]
-impl LlmClient for AnthropicClient {
+impl LlmBackend for AnthropicClient {
     fn model_url(&self) -> &ModelUrl {
         &self.url
     }
@@ -172,6 +171,7 @@ fn build_payload(
         "messages": build_messages(messages),
     });
 
+    payload = crate::llm::native_defaults(payload, options.provider_config.as_ref());
     if let Some(t) = options.temperature {
         payload["temperature"] = json!(t);
     }
@@ -203,8 +203,7 @@ fn build_system(options: &LlmOptions, messages: &[Message]) -> Option<Value> {
     }
     if options.wants_json_output() {
         let schema_hint = options
-            .output_schema
-            .as_ref()
+            .output_schema()
             .map(|schema| format!("\n\nReturn only valid JSON matching this JSON Schema: {schema}"))
             .unwrap_or_else(|| "\n\nReturn only valid JSON.".to_string());
         // Append schema hint to last system block (or create one).
@@ -352,16 +351,12 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
 
     let (text, calls) = collect_content(&response)?;
     if !calls.is_empty() {
-        return Ok(LlmResponse::new(
-            Provider::Anthropic,
-            LlmOutput::ToolCalls {
-                thought: text,
-                calls,
-            },
-        )
-        .with_usage(usage)
-        .with_provider_model(provider_model)
-        .with_raw_metadata(metadata));
+        return Ok(
+            LlmResponse::new(Provider::Anthropic, LlmOutput::ToolCalls { text, calls })
+                .with_usage(usage)
+                .with_provider_model(provider_model)
+                .with_raw_metadata(metadata),
+        );
     }
     let text = text.ok_or(RathError::new(
         crate::core::ErrorKind::InvalidResponse,

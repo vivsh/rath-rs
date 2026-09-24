@@ -8,7 +8,12 @@ mod tests;
 
 impl RathError {
     /// Converts each native source level into a separately inspectable Rath diagnostic.
-    pub(crate) fn from_error(kind: ErrorKind, error: &(dyn std::error::Error + 'static)) -> Self {
+    /// Known credentials are removed before storing messages; the native error is not retained.
+    pub fn from_error(
+        kind: ErrorKind,
+        error: &(dyn std::error::Error + 'static),
+        secrets: &[&str],
+    ) -> Self {
         let mut message = error.to_string();
         if let Some(source) = error.source() {
             let suffix = format!(": {source}");
@@ -16,16 +21,29 @@ impl RathError {
                 message = context.to_owned();
             }
         }
-        let mut result = Self::new(kind, message);
+        let mut result = Self::new(kind, redact::text(&message, secrets));
         if let Some(source) = error.source() {
-            result = result.with_source(Self::from_error(ErrorKind::Other, source));
+            result = result.with_source(Self::from_error(ErrorKind::Other, source, secrets));
         }
         result
     }
 
+    /// Normalizes internal causes whose operation supplies credentials at its return boundary.
+    pub(crate) fn from_native_error(
+        kind: ErrorKind,
+        error: &(dyn std::error::Error + 'static),
+    ) -> Self {
+        Self::from_error(kind, error, &[])
+    }
+
     /// Removes operation-local credentials from all retained diagnostic fields.
-    pub(crate) fn sanitized(mut self, secrets: &[&str]) -> Self {
+    /// Includes external provider names, explicit bodies and every cause. Credentials are not stored.
+    /// This covers known values and credential-bearing locations, not arbitrary private prose.
+    pub fn sanitized(mut self, secrets: &[&str]) -> Self {
         self.inner.message = redact::text(&self.inner.message, secrets);
+        if let Some(Provider::External(name)) = &mut self.inner.provider {
+            *name = redact::text(name, secrets);
+        }
         for value in [
             &mut self.inner.provider_code,
             &mut self.inner.request_id,
@@ -48,18 +66,27 @@ impl RathError {
     }
 
     /// Retains explicit body bytes and their transfer completeness without formatting them.
-    pub(crate) fn with_body(mut self, body: ErrorBody) -> Self {
-        self.inner.response_body = Some(body);
-        self.sanitized(&[])
+    /// Replaces any existing body after sanitization and sanitizes the rest of this error too.
+    pub fn with_body(mut self, body: ErrorBody, secrets: &[&str]) -> Self {
+        self.inner.response_body = Some(match body {
+            ErrorBody::Complete(bytes) => ErrorBody::Complete(redact::bytes(&bytes, secrets)),
+            ErrorBody::Incomplete(bytes) => ErrorBody::Incomplete(redact::bytes(&bytes, secrets)),
+        });
+        self.sanitized(secrets)
+    }
+
+    /// Attaches internal response bytes before operation-wide credential sanitization.
+    pub(crate) fn with_raw_body(self, body: ErrorBody) -> Self {
+        self.with_body(body, &[])
     }
 
     /// Attaches a decoded response when no original body is already available.
     pub(crate) fn with_response(mut self, response: &Value) -> Self {
         if self.inner.response_body.is_none() {
             match serde_json::to_vec(response) {
-                Ok(bytes) => self = self.with_body(ErrorBody::Complete(bytes)),
+                Ok(bytes) => self = self.with_raw_body(ErrorBody::Complete(bytes)),
                 Err(error) => {
-                    self = self.with_source(Self::from_error(ErrorKind::Serialize, &error))
+                    self = self.with_source(Self::from_native_error(ErrorKind::Serialize, &error))
                 }
             }
         }
@@ -83,8 +110,8 @@ impl RathError {
 
     /// Preserves parser details and explicitly accessible invalid output.
     pub(crate) fn deserialize(error: &serde_json::Error, raw: impl AsRef<[u8]>) -> Self {
-        Self::from_error(ErrorKind::Deserialize, error)
-            .with_body(ErrorBody::Complete(raw.as_ref().to_vec()))
+        Self::from_native_error(ErrorKind::Deserialize, error)
+            .with_raw_body(ErrorBody::Complete(raw.as_ref().to_vec()))
     }
 
     /// Reports a required response field or shape and retains the available response.
@@ -181,10 +208,11 @@ pub(crate) fn sdk_http(status: u16, body: Option<&str>, secrets: &[&str]) -> Rat
         match serde_json::from_str::<Value>(body) {
             Ok(value) => details(&mut error, &value),
             Err(cause) => {
-                error = error.with_source(RathError::from_error(ErrorKind::Deserialize, &cause))
+                error =
+                    error.with_source(RathError::from_native_error(ErrorKind::Deserialize, &cause))
             }
         }
-        error = error.with_body(ErrorBody::Complete(body.as_bytes().to_vec()));
+        error = error.with_raw_body(ErrorBody::Complete(body.as_bytes().to_vec()));
     }
     error.sanitized(secrets)
 }
@@ -192,7 +220,7 @@ pub(crate) fn sdk_http(status: u16, body: Option<&str>, secrets: &[&str]) -> Rat
 /// Preserves environment failures while treating the contents of malformed credentials as secret.
 pub(crate) fn credential_cause(error: &std::env::VarError) -> RathError {
     match error {
-        std::env::VarError::NotPresent => RathError::from_error(ErrorKind::Other, error),
+        std::env::VarError::NotPresent => RathError::from_native_error(ErrorKind::Other, error),
         std::env::VarError::NotUnicode(_) => RathError::new(
             ErrorKind::Other,
             "credential is not valid Unicode: [REDACTED]",

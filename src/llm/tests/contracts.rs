@@ -1,7 +1,7 @@
+use crate::llm::LlmBackend;
 use serde_json::Value;
 
 use super::super::*;
-use async_trait::async_trait;
 
 struct DummyFactory;
 
@@ -17,15 +17,7 @@ impl DummyClient {
     }
 }
 
-struct MarkerLayer;
-
-struct MarkedFactory<F> {
-    inner: F,
-    marked: bool,
-}
-
-#[async_trait]
-impl LlmClient for DummyClient {
+impl LlmBackend for DummyClient {
     fn model_url(&self) -> &ModelUrl {
         &self.url
     }
@@ -43,34 +35,9 @@ impl LlmClient for DummyClient {
     }
 }
 
-impl LlmClientFactory for DummyFactory {
-    fn create(
-        &self,
-        _model_url: &str,
-        _options: LlmOptions,
-    ) -> Result<Box<dyn LlmClient>, RathError> {
-        Ok(Box::new(DummyClient::new()))
-    }
-}
-
-impl<F: LlmClientFactory> LlmClientFactory for MarkedFactory<F> {
-    fn create(
-        &self,
-        model_url: &str,
-        options: LlmOptions,
-    ) -> Result<Box<dyn LlmClient>, RathError> {
-        self.inner.create(model_url, options)
-    }
-}
-
-impl<F: LlmClientFactory> LlmClientFactoryLayer<F> for MarkerLayer {
-    type Factory = MarkedFactory<F>;
-
-    fn layer(self, inner: F) -> Self::Factory {
-        MarkedFactory {
-            inner,
-            marked: true,
-        }
+impl crate::registry::ProviderFactory for DummyFactory {
+    async fn llm(&self, _: &ModelUrl, _: LlmOptions) -> Result<LlmClient, RathError> {
+        Ok(LlmClient::from_backend(DummyClient::new()))
     }
 }
 
@@ -256,20 +223,16 @@ fn decode_output_text_parses_json_when_json_mode_enabled() {
     );
 }
 
-/// `LlmClientFactory::layer` wraps a concrete factory with the supplied decorator.
+/// A public RPITIT factory returns a concrete independently owned client.
 #[tokio::test]
-async fn layer_wraps_factory() {
-    let factory = DummyFactory.layer(MarkerLayer);
-    assert!(factory.marked);
-
-    let client = factory
-        .create("openai:///test-model", LlmOptions::default())
-        .expect("layered factory should create a client");
-    let response = client
-        .execute(&[Message::user("hi")])
-        .await
-        .expect("layered client should execute");
-    assert!(matches!(response.output, LlmOutput::Output(_)));
+async fn factory_constructs_client() {
+    use crate::registry::ProviderFactory;
+    let url = ModelUrl::parse("openai:///test-model").unwrap();
+    let client = DummyFactory.llm(&url, LlmOptions::default()).await.unwrap();
+    assert!(matches!(
+        client.execute(&[Message::user("hi")]).await.unwrap().output,
+        LlmOutput::Output(_)
+    ));
 }
 
 /// Existing custom implementations retain unsupported defaults for every counting method.

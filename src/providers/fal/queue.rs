@@ -67,7 +67,8 @@ fn queue_url(client: &FalClient, raw: &Value, field: &str) -> Result<Url, RathEr
 /// Allows HTTP(S) only, excluding embedded credentials and URL fragments.
 pub(super) fn parse_url(value: &str, stage: &'static str) -> Result<Url, RathError> {
     let url = Url::parse(value).map_err(|error| {
-        RathError::from_error(ErrorKind::InvalidResponse, &error).with_context(Provider::Fal, stage)
+        RathError::from_native_error(ErrorKind::InvalidResponse, &error)
+            .with_context(Provider::Fal, stage)
     })?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()

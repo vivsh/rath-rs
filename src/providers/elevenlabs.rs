@@ -1,4 +1,7 @@
 //! Native ElevenLabs voice operations; no local persistence or remote-resource cleanup.
+use crate::audio::tts::TtsBackend;
+use crate::audio::voice_clone::VoiceCloneBackend;
+use crate::audio::voice_design::VoiceDesignBackend;
 use crate::audio::{
     tts::{TtsClient, TtsOptions, TtsRequest, TtsResponse},
     voice::{Voice, VoiceData, invalid, validate_config, validate_samples},
@@ -10,7 +13,6 @@ use crate::audio::{
 };
 use crate::core::{ErrorKind, ModelUrl, Provider, RathError, error::http};
 use crate::llm::{configured_base_url, required_api_key};
-use async_trait::async_trait;
 use reqwest::{
     Client,
     multipart::{Form, Part},
@@ -37,34 +39,40 @@ struct ElevenLabsClient {
 pub(crate) fn new_design(
     url: &ModelUrl,
     options: VoiceDesignOptions,
-) -> Result<Box<dyn VoiceDesignClient>, RathError> {
+) -> Result<VoiceDesignClient, RathError> {
     if !matches!(
         url.model.as_str(),
         "eleven_multilingual_ttv_v2" | "eleven_ttv_v3"
     ) {
         return Err(unsupported("voice design model"));
     }
-    Ok(Box::new(build(url, options.provider_config)?))
+    Ok(VoiceDesignClient::from_backend(build(
+        url,
+        options.provider_config,
+    )?))
 }
 
 /// Constructs instant voice cloning; training and verification workflows are not implicit.
 pub(crate) fn new_clone(
     url: &ModelUrl,
     options: VoiceCloneOptions,
-) -> Result<Box<dyn VoiceCloneClient>, RathError> {
+) -> Result<VoiceCloneClient, RathError> {
     if url.model != "ivc" {
         return Err(unsupported("voice cloning model"));
     }
-    Ok(Box::new(build(url, options.provider_config)?))
+    Ok(VoiceCloneClient::from_backend(build(
+        url,
+        options.provider_config,
+    )?))
 }
 
 /// Constructs a verified native speech model adapter.
-pub(crate) fn new_tts(
-    url: &ModelUrl,
-    options: TtsOptions,
-) -> Result<Box<dyn TtsClient>, RathError> {
+pub(crate) fn new_tts(url: &ModelUrl, options: TtsOptions) -> Result<TtsClient, RathError> {
     validate_tts_model(&url.model)?;
-    Ok(Box::new(build(url, options.provider_config)?))
+    Ok(TtsClient::from_backend(build(
+        url,
+        options.provider_config,
+    )?))
 }
 
 /// Builds a redirect-denying bounded client, without performing any I/O or registration.
@@ -72,7 +80,7 @@ fn build(url: &ModelUrl, config: Option<Value>) -> Result<ElevenLabsClient, Rath
     validate_config(config.as_ref())?;
     let base_url = configured_base_url(url, "https://api.elevenlabs.io/v1");
     let base = reqwest::Url::parse(&base_url)
-        .map_err(|error| RathError::from_error(ErrorKind::InvalidUrl, &error))?;
+        .map_err(|error| RathError::from_native_error(ErrorKind::InvalidUrl, &error))?;
     if !matches!(base.scheme(), "https" | "http")
         || base.host_str().is_none()
         || !base.username().is_empty()
@@ -120,8 +128,7 @@ impl ElevenLabsClient {
     }
 }
 
-#[async_trait]
-impl VoiceCloneClient for ElevenLabsClient {
+impl VoiceCloneBackend for ElevenLabsClient {
     async fn clone_voice(&self, request: &VoiceCloneRequest) -> Result<Voice, RathError> {
         let form = clone_form(self, request)?;
         http::mapped(self.post("voices/add").multipart(form), Provider::ElevenLabs,
@@ -176,8 +183,7 @@ fn clone_form(client: &ElevenLabsClient, request: &VoiceCloneRequest) -> Result<
     Ok(form)
 }
 
-#[async_trait]
-impl VoiceDesignClient for ElevenLabsClient {
+impl VoiceDesignBackend for ElevenLabsClient {
     async fn design_voice(
         &self,
         request: &VoiceDesignRequest,
@@ -195,8 +201,7 @@ impl VoiceDesignClient for ElevenLabsClient {
     }
 }
 
-#[async_trait]
-impl TtsClient for ElevenLabsClient {
+impl TtsBackend for ElevenLabsClient {
     async fn synthesize_speech(&self, request: &TtsRequest) -> Result<TtsResponse, RathError> {
         let voice = request
             .voice
@@ -267,7 +272,7 @@ fn speech_payload(
     client: &ElevenLabsClient,
     request: &TtsRequest,
 ) -> Result<Map<String, Value>, RathError> {
-    let model = request.model.as_deref().unwrap_or(&client.model);
+    let model = &client.model;
     validate_tts_model(model)?;
     if request.input.trim().is_empty() {
         return Err(invalid("speech input must not be blank"));

@@ -11,3 +11,6 @@ pub(crate) use factory::*;
 
 #[cfg(test)]
 mod tests;
+
+mod local_embeddings;
+pub(crate) use local_embeddings::create as local_embeddings;

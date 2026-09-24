@@ -1,14 +1,18 @@
+use crate::audio::stt::SttBackend;
+use crate::audio::tts::TtsBackend;
 use crate::core::error::http;
+use crate::llm::LlmBackend;
 mod measurement;
 
-use async_trait::async_trait;
 use reqwest::Client as HttpClient;
 use reqwest::multipart::{Form, Part};
 use serde_json::{Value, json};
 
 use crate::audio::stt::{SttClient, SttOptions, SttRequest, SttResponse};
 use crate::audio::tts::{TtsClient, TtsOptions, TtsRequest, TtsResponse};
-use crate::embeddings::{EmbedRequest, EmbedResponse, EmbeddingClient, EmbeddingOptions};
+use crate::embeddings::{
+    EmbedRequest, EmbedResponse, EmbeddingBackend, EmbeddingClient, EmbeddingOptions,
+};
 
 use crate::llm::{
     Attachment, LlmClient, LlmOptions, LlmOutput, LlmResponse, Message, ModelUrl, Provider,
@@ -28,39 +32,33 @@ struct OpenAiClient {
     provider_config: Option<Value>,
 }
 
-pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<Box<dyn LlmClient>, RathError> {
+pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<LlmClient, RathError> {
     crate::llm::counting::validate_options(Provider::OpenAi, &options)?;
-    let provider_config = options.provider_config.clone();
-    Ok(Box::new(build_client(url, options, provider_config)?))
+    Ok(LlmClient::from_backend(build_client(url, options, None)?))
 }
 
 pub fn new_embedding_client(
     url: &ModelUrl,
     options: EmbeddingOptions,
-) -> Result<Box<dyn EmbeddingClient>, RathError> {
-    Ok(Box::new(build_client(
+) -> Result<EmbeddingClient, RathError> {
+    crate::embeddings::contract::remote_options(&options, &["user"])?;
+    Ok(EmbeddingClient::from_backend(build_client(
         url,
         LlmOptions::default(),
         options.provider_config,
     )?))
 }
 
-pub fn new_tts_client(
-    url: &ModelUrl,
-    options: TtsOptions,
-) -> Result<Box<dyn TtsClient>, RathError> {
-    Ok(Box::new(build_client(
+pub fn new_tts_client(url: &ModelUrl, options: TtsOptions) -> Result<TtsClient, RathError> {
+    Ok(TtsClient::from_backend(build_client(
         url,
         LlmOptions::default(),
         options.provider_config,
     )?))
 }
 
-pub fn new_stt_client(
-    url: &ModelUrl,
-    options: SttOptions,
-) -> Result<Box<dyn SttClient>, RathError> {
-    Ok(Box::new(build_client(
+pub fn new_stt_client(url: &ModelUrl, options: SttOptions) -> Result<SttClient, RathError> {
+    Ok(SttClient::from_backend(build_client(
         url,
         LlmOptions::default(),
         options.provider_config,
@@ -85,8 +83,7 @@ fn build_client(
     })
 }
 
-#[async_trait]
-impl LlmClient for OpenAiClient {
+impl LlmBackend for OpenAiClient {
     fn model_url(&self) -> &ModelUrl {
         &self.url
     }
@@ -178,15 +175,21 @@ impl LlmClient for OpenAiClient {
     }
 }
 
-#[async_trait]
-impl EmbeddingClient for OpenAiClient {
-    /// Sends the embedding request to the configured provider and normalizes its result.
+impl EmbeddingBackend for OpenAiClient {
     async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse, RathError> {
-        let payload = json!({
-            "model": self.model,
-            "input": request.input,
-            "encoding_format": "float",
-        });
+        use crate::embeddings::contract as embedding;
+        embedding::controls(Provider::OpenAi, request, false, false)?;
+        let mut payload = embedding::config(
+            self.provider_config.as_ref(),
+            request.provider_config.as_ref(),
+            &["user"],
+        )?;
+        payload.insert("model".into(), json!(self.model));
+        payload.insert("input".into(), json!(request.input));
+        payload.insert("encoding_format".into(), json!("float"));
+        if let Some(d) = request.output_dimensionality {
+            payload.insert("dimensions".into(), json!(d));
+        }
         http::mapped(
             self.http
                 .post(embeddings_endpoint(&self.base_url))
@@ -195,26 +198,13 @@ impl EmbeddingClient for OpenAiClient {
             Provider::OpenAi,
             "embeddings",
             &[&self.api_key],
-            |response| {
-                let values: Vec<f32> = response["data"][0]["embedding"]
-                    .as_array()
-                    .ok_or_else(|| RathError::invalid("missing data[0].embedding", &response))?
-                    .iter()
-                    .map(|v| {
-                        v.as_f64().map(|v| v as f32).ok_or_else(|| {
-                            RathError::invalid("embedding contains a non-number", &response)
-                        })
-                    })
-                    .collect::<Result<_, _>>()?;
-                Ok(EmbedResponse { values })
-            },
+            |raw| decode_embeddings(raw, request),
         )
         .await
     }
 }
 
-#[async_trait]
-impl TtsClient for OpenAiClient {
+impl TtsBackend for OpenAiClient {
     /// Sends speech synthesis input and returns audio bytes or a provider error.
     async fn synthesize_speech(&self, request: &TtsRequest) -> Result<TtsResponse, RathError> {
         let payload = speech_payload(self, request)?;
@@ -269,10 +259,7 @@ fn speech_payload(
     }
     let mut payload = json_object_from(&client.provider_config);
     merge_json_object(&mut payload, &request.provider_config);
-    payload.insert(
-        "model".into(),
-        json!(request.model.as_deref().unwrap_or(&client.model)),
-    );
+    payload.insert("model".into(), json!(&client.model));
     payload.insert("input".into(), json!(request.input));
     if let Some(voice) = &request.voice {
         voice.validate("openai")?;
@@ -290,22 +277,24 @@ fn speech_payload(
     Ok(payload)
 }
 
-#[async_trait]
-impl SttClient for OpenAiClient {
+impl SttBackend for OpenAiClient {
     /// Uploads audio for transcription and normalizes the returned text and metadata.
     async fn transcribe_audio(&self, request: &SttRequest) -> Result<SttResponse, RathError> {
-        let model = request.model.clone().unwrap_or_else(|| self.model.clone());
+        crate::registry::prepare::native(self.provider_config.as_ref())?;
+        crate::registry::prepare::native(request.provider_config.as_ref())?;
+        let mut native = json_object_from(&self.provider_config);
+        merge_json_object(&mut native, &request.provider_config);
+        let model = self.model.clone();
         let file = Part::bytes(request.data.clone())
             .file_name("audio")
             .mime_str(&request.mime_type)
             .map_err(|e| {
-                RathError::from_error(crate::core::ErrorKind::Validation, &e)
+                RathError::from_native_error(crate::core::ErrorKind::Validation, &e)
                     .with_context(Provider::OpenAi, "transcription input")
                     .sanitized(&[&self.api_key])
             })?;
         let form = Form::new().text("model", model).part("file", file);
-        let form = add_form_fields(form, &self.provider_config);
-        let form = add_form_fields(form, &request.provider_config);
+        let form = add_form_fields(form, &Some(Value::Object(native)));
 
         http::mapped(
             self.http
@@ -408,6 +397,7 @@ fn build_payload(
         "input": build_input(messages),
     });
 
+    payload = crate::llm::native_defaults(payload, options.provider_config.as_ref());
     if let Some(cap) = options.max_output_tokens {
         payload["max_output_tokens"] = json!(cap);
     }
@@ -429,7 +419,7 @@ fn build_payload(
     }
     if options.wants_json_output() {
         payload["text"] = json!({
-            "format": match &options.output_schema {
+            "format": match options.output_schema() {
                 Some(schema) => json!({
                     "type": "json_schema",
                     "name": "agent_output",
@@ -569,7 +559,7 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         return Ok(LlmResponse::new(
             Provider::OpenAi,
             LlmOutput::ToolCalls {
-                thought: collect_text(&response),
+                text: collect_text(&response),
                 calls,
             },
         )
@@ -681,3 +671,38 @@ fn usage_from_value(value: &Value) -> TokenUsage {
 #[cfg(test)]
 #[path = "openai/tests/mod.rs"]
 mod tests;
+
+/// Validates unique indices and restores input order before accepting a batch.
+fn decode_embeddings(raw: Value, request: &EmbedRequest) -> Result<EmbedResponse, RathError> {
+    use crate::embeddings::contract as embedding;
+    let data = raw["data"]
+        .as_array()
+        .ok_or_else(|| RathError::invalid("missing data", &raw))?;
+    let mut vectors = vec![None; request.input.len()];
+    for item in data {
+        let index = item["index"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| RathError::invalid("invalid embedding index", &raw))?;
+        let slot = vectors
+            .get_mut(index)
+            .ok_or_else(|| RathError::invalid("embedding index out of range", &raw))?;
+        if slot.is_some() {
+            return Err(RathError::invalid("duplicate embedding index", &raw));
+        }
+        *slot = Some(embedding::vector(&item["embedding"], &raw)?);
+    }
+    let vectors = vectors
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| RathError::invalid("missing embedding index", &raw))?;
+    let usage = raw
+        .pointer("/usage/prompt_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .map(|input| TokenUsage {
+            input: Some(input),
+            output: None,
+        });
+    embedding::response(Provider::OpenAi, raw, vectors, request, usage)
+}

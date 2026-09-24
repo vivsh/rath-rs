@@ -14,18 +14,24 @@ pub(crate) fn estimate(
 ) -> Result<TokenCount, RathError> {
     let tokenizer = TOKENIZER.get_or_init(|| {
         cl100k_base().map_err(|error| {
-            RathError::from_error(crate::core::ErrorKind::TokenCounting, error.as_ref())
+            RathError::from_native_error(crate::core::ErrorKind::TokenCounting, error.as_ref())
         })
     });
     let tokenizer = tokenizer.as_ref().map_err(Clone::clone)?;
     let text = serde_json::to_string(prompt)
-        .map_err(|error| RathError::from_error(crate::core::ErrorKind::Serialize, &error))?;
+        .map_err(|error| RathError::from_native_error(crate::core::ErrorKind::Serialize, &error))?;
     let tokens = u64::try_from(tokenizer.encode_ordinary(&text).len()).map_err(|error| {
-        overflow().with_source(RathError::from_error(crate::core::ErrorKind::Other, &error))
+        overflow().with_source(RathError::from_native_error(
+            crate::core::ErrorKind::Other,
+            &error,
+        ))
     })?;
     let units = messages.checked_add(tools).ok_or_else(overflow)?;
     let units = u64::try_from(units).map_err(|error| {
-        overflow().with_source(RathError::from_error(crate::core::ErrorKind::Other, &error))
+        overflow().with_source(RathError::from_native_error(
+            crate::core::ErrorKind::Other,
+            &error,
+        ))
     })?;
     Ok(TokenCount {
         input_tokens: padded(tokens, units)?,

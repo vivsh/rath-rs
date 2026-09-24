@@ -56,7 +56,7 @@ async fn embedding_errors_match_across_adapters() {
         let client = crate::providers::create_embedding_client(&url, Default::default()).unwrap();
         let error = client
             .embed(&crate::embeddings::EmbedRequest {
-                input: "hello".into(),
+                input: vec!["hello".into()],
                 ..Default::default()
             })
             .await

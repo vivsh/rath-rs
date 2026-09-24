@@ -12,22 +12,24 @@ pub(super) fn normalize(
         Error::BadResponse { code, description } => {
             crate::core::error::sdk_http(*code, description.as_deref(), &[])
         }
-        Error::OperationTimeout { .. } => RathError::from_error(ErrorKind::Timeout, error),
+        Error::OperationTimeout { .. } => RathError::from_native_error(ErrorKind::Timeout, error),
         Error::PerformRequest { source, .. } | Error::PerformRequestNew { source } => {
             let kind = if source.is_timeout() {
                 ErrorKind::Timeout
             } else {
                 ErrorKind::Transport
             };
-            RathError::from_error(kind, error)
+            RathError::from_native_error(kind, error)
         }
         Error::Deserialize { .. } | Error::DecodeResponse { .. } => {
-            RathError::from_error(ErrorKind::Deserialize, error)
+            RathError::from_native_error(ErrorKind::Deserialize, error)
         }
         Error::InvalidApiKey { .. }
         | Error::ConstructUrl { .. }
         | Error::UrlParse { .. }
-        | Error::InvalidResourceName { .. } => RathError::from_error(ErrorKind::Validation, error),
+        | Error::InvalidResourceName { .. } => {
+            RathError::from_native_error(ErrorKind::Validation, error)
+        }
         Error::MissingResponseHeader { header } => RathError::new(
             ErrorKind::InvalidResponse,
             format!("missing response header {header}"),
@@ -42,7 +44,7 @@ pub(super) fn normalize(
             &serde_json::json!({"name":name, "error":{"code":code, "message":message}}),
             &[],
         ),
-        _ => RathError::from_error(ErrorKind::Provider, error),
+        _ => RathError::from_native_error(ErrorKind::Provider, error),
     };
     context(result, operation, credential)
 }

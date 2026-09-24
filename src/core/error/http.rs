@@ -16,7 +16,7 @@ pub(crate) fn transport(
     } else {
         ErrorKind::Transport
     };
-    RathError::from_error(kind, &error)
+    RathError::from_native_error(kind, &error)
         .with_context(provider, operation)
         .sanitized(secrets)
 }
@@ -52,7 +52,7 @@ pub(crate) async fn read(
                     "response transfer failed; incomplete response details available",
                 )
                 .with_context(provider, operation)
-                .with_source(RathError::from_error(error_kind(&cause), &cause));
+                .with_source(RathError::from_native_error(error_kind(&cause), &cause));
                 return Err(enrich(
                     error,
                     metadata(&response),
@@ -123,7 +123,7 @@ fn attach_details(error: &mut RathError, bytes: &[u8]) {
     match serde_json::from_slice::<Value>(bytes) {
         Ok(value) => details(error, &value),
         Err(cause) => {
-            error.inner.source = Some(RathError::from_error(ErrorKind::Deserialize, &cause))
+            error.inner.source = Some(RathError::from_native_error(ErrorKind::Deserialize, &cause))
         }
     }
 }
@@ -173,7 +173,7 @@ pub(crate) async fn mapped_response<T>(
                 ErrorKind::Deserialize,
                 "invalid JSON response; response details available",
             )
-            .with_source(RathError::from_error(ErrorKind::Deserialize, &cause))
+            .with_source(RathError::from_native_error(ErrorKind::Deserialize, &cause))
         })
         .and_then(decode);
     result.map_err(|error| {
@@ -198,5 +198,5 @@ fn enrich(
         error.inner.request_id = request_id.as_ref().map(header_text);
     }
     error.inner.retry_after = retry_after.as_ref().map(header_text);
-    error.with_body(body).sanitized(secrets)
+    error.with_raw_body(body).sanitized(secrets)
 }

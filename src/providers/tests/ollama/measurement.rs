@@ -8,7 +8,7 @@ fn client(options: LlmOptions) -> OllamaClient {
         base_url: "http://127.0.0.1:1".into(),
         model: "selected-model".into(),
         url: ModelUrl::parse("ollama:///selected-model").unwrap(),
-        exit_tool_name: None,
+
         options,
     }
 }
@@ -121,3 +121,5 @@ fn message_keys_never_enter_provider_payloads() {
         build_payload("model", &options, &keyed, false)
     );
 }
+
+use crate::llm::LlmBackend;
