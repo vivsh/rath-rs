@@ -62,7 +62,7 @@ async fn normalizes_speech_failures_without_retrying() {
     assert_eq!(requests.try_iter().count(), 1);
 }
 
-/// All verified TTS models route through generateContent and return a correct PCM WAV container.
+/// Supported TTS models route through generateContent and wrap controlled PCM in a valid WAV.
 #[tokio::test]
 async fn routes_speech_models_and_wraps_little_endian_pcm() {
     for model in [
@@ -131,7 +131,7 @@ fn assert_payload(payload: &Value, model: &str) {
         );
         assert_eq!(
             payload["generationConfig"]["responseFormat"]["audio"],
-            json!({"mimeType":"AUDIO_L16", "delivery":"INLINE", "sampleRate":24000})
+            json!({"mimeType":"AUDIO_L16", "sampleRate":24000})
         );
     } else {
         assert_eq!(

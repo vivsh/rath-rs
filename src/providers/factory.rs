@@ -124,6 +124,7 @@ pub(crate) fn create_video_client(
     options: VideoOptions,
 ) -> Result<VideoClient, RathError> {
     match url.provider {
+        Provider::Gemini => gemini::new_video_client(url, options),
         Provider::Fal => fal::new_video_client(url, options),
         _ => Err(RathError::unsupported(url.provider.clone(), "video")),
     }

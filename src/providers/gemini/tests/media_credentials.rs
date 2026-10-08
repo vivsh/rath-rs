@@ -5,6 +5,7 @@ use crate::audio::{
 use crate::images::{ImageOptions, ImageRequest};
 use crate::llm::LlmOptions;
 use crate::providers::tests::http::serve;
+use crate::video::{VideoInput, VideoOptions, VideoRequest};
 use crate::{ErrorKind, Provider};
 use serde_json::json;
 use std::process::Command;
@@ -72,6 +73,31 @@ async fn child(case: &str) {
     transcription(suffix, expected).await;
     speech(suffix, expected).await;
     image(suffix, expected).await;
+    video(suffix, expected).await;
+}
+
+/// Confirms video submission resolves the same default/overridden key through the public factory.
+async fn video(suffix: &str, expected: &str) {
+    let (base, requests) = serve(
+        200,
+        json!({"name":"models/veo-3.1-fast-generate-preview/operations/test-job"}),
+    );
+    let client = VideoOptions::default()
+        .create(&format!(
+            "gemini:///veo-3.1-fast-generate-preview?base_url={base}{suffix}"
+        ))
+        .await
+        .unwrap();
+    client
+        .submit_video(&VideoRequest::new("A bird".into(), VideoInput::TextToVideo))
+        .await
+        .unwrap();
+    assert!(
+        requests
+            .try_recv()
+            .unwrap()
+            .contains(&format!("x-goog-api-key: {expected}"))
+    );
 }
 
 /// Confirms public transcription dispatch uses only the selected shared Gemini key.
@@ -167,6 +193,11 @@ async fn missing(case: &str) {
             .unwrap(),
         ImageOptions::default()
             .create(&format!("gemini:///gemini-3-pro-image{suffix}"))
+            .await
+            .err()
+            .unwrap(),
+        VideoOptions::default()
+            .create(&format!("gemini:///veo-3.1-fast-generate-preview{suffix}"))
             .await
             .err()
             .unwrap(),

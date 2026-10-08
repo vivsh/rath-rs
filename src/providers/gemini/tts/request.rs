@@ -229,8 +229,9 @@ pub(super) fn payload(
     effective_speech(&mut generation, request, current)?;
     generation["responseModalities"] = json!(["AUDIO"]);
     if current {
+        // Gemini 3.8 generateContent rejects explicit delivery; audio is inline by default.
         generation["responseFormat"] =
-            json!({"audio":{"mimeType":"AUDIO_L16", "delivery":"INLINE", "sampleRate":24000}});
+            json!({"audio":{"mimeType":"AUDIO_L16", "sampleRate":24000}});
     }
     payload["generationConfig"] = generation;
     payload["contents"] = json!([{"role":"user", "parts":[text(request, current)?]}]);
