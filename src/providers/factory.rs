@@ -76,6 +76,7 @@ pub(crate) fn create_image_client(
     options: ImageOptions,
 ) -> Result<ImageClient, RathError> {
     match url.provider {
+        Provider::Gemini => gemini::new_image_client(url, options),
         Provider::Fal => fal::new_image_client(url, options),
         _ => Err(RathError::unsupported(url.provider.clone(), "image")),
     }
@@ -88,6 +89,7 @@ pub(crate) fn create_tts_client(
     options: TtsOptions,
 ) -> Result<TtsClient, RathError> {
     match url.provider {
+        Provider::Gemini => gemini::new_tts_client(url, options),
         Provider::OpenAi => openai::new_tts_client(url, options),
         Provider::Fal => fal::new_tts_client(url, options),
         Provider::ElevenLabs => elevenlabs::new_tts(url, options),
@@ -105,6 +107,7 @@ pub(crate) fn create_stt_client(
     options: SttOptions,
 ) -> Result<SttClient, RathError> {
     match url.provider {
+        Provider::Gemini => gemini::new_stt_client(url, options),
         Provider::OpenAi => openai::new_stt_client(url, options),
         Provider::Fal => fal::new_stt_client(url, options),
         _ => Err(RathError::unsupported(

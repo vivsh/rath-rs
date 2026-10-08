@@ -49,6 +49,8 @@ openai:///tts-1
 fal:///fal-ai/flux/schnell
 fal:///fal-ai/wan/v2.2-a14b/text-to-video
 gemini:///gemini-2.5-flash
+gemini:///gemini-3.8-flash-tts
+gemini:///gemini-3.1-flash-image
 ollama:///qwen3:8b?base_url=http://localhost:11434
 openai:///gpt-4o?base_url=https://api.example.com/v1
 ```
@@ -310,6 +312,56 @@ async fn run() -> Result<(), rath::RathError> {
 }
 ```
 
+### Gemini images
+
+Gemini image generation reuses `GEMINI_API_KEY`, including when chat, STT and TTS
+already use that key. Select a dedicated image model:
+
+| Model URL | Explicit `size` |
+| --- | --- |
+| `gemini:///gemini-2.5-flash-image` | Omit; provider chooses resolution |
+| `gemini:///gemini-3.1-flash-lite-image` | `1K` |
+| `gemini:///gemini-3.1-flash-image` | `512`, `1K`, `2K`, `4K` |
+| `gemini:///gemini-3-pro-image` | `1K`, `2K`, `4K` |
+| `gemini:///gemini-nano-banana-2.1` | `1K`, `2K`, `4K` |
+
+```rust,no_run
+use rath::images::{ImageOptions, ImageRequest};
+use serde_json::json;
+
+async fn run() -> Result<(), rath::RathError> {
+    let client = ImageOptions::default()
+        .create("gemini:///gemini-3.1-flash-image")
+        .await?;
+    let response = client.generate_image(
+        &ImageRequest::new("A walnut desk lamp in warm studio light".into())
+            .with_size("2K".into())
+            .with_provider_config(json!({
+                "generationConfig": {"imageConfig": {"aspectRatio": "16:9"}}
+            })),
+    ).await?;
+    println!("{} image(s)", response.images.len());
+    Ok(())
+}
+```
+
+Results use `ImageData::Base64` with the provider's PNG, JPEG or WebP MIME type.
+Rath checks base64 and file signatures; it does not fully decode image pixels.
+Native configuration supports `generationConfig.imageConfig` (`aspectRatio`,
+`imageSize`) and `safetySettings`. Client defaults merge shallowly with request
+settings; typed `size` wins. Ordinary aspect ratios are `1:1`, `2:3`, `3:2`,
+`3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9`. Flash Image and Nano Banana 2.1
+also accept `1:4`, `4:1`, `1:8`, `8:1`. Unknown controls, unsupported sizes/models,
+empty prompts and missing/blocked/unfinished images fail without retries.
+Text accompanying images remains in `raw_metadata`; thought images are excluded.
+
+This adapter provides text-to-image generation. The existing `ImageRequest` has
+no typed reference-image input, so reference editing, multi-turn editing and
+grounding tools are not exposed through provider JSON. Model availability and
+visual fidelity require separately authorized live validation. Wire mappings use
+Google's [GenerateContent API](https://ai.google.dev/api/generate-content) and
+[image-generation documentation](https://ai.google.dev/gemini-api/docs/image-generation).
+
 ## Video Usage
 
 `VideoOptions::create(url)` selects the provider and native endpoint just like
@@ -523,6 +575,86 @@ async fn run() -> Result<(), rath::RathError> {
     Ok(())
 }
 ```
+
+### Gemini speech and one shared key
+
+Configure `GEMINI_API_KEY` once in the consumer's environment. All four capability
+clients below resolve that same key without an STT- or TTS-specific credential:
+
+```rust,no_run
+use rath::llm::LlmOptions;
+use rath::audio::stt::{SttOptions, SttRequest};
+use rath::audio::tts::{TtsOptions, TtsRequest};
+use rath::audio::voice::Voice;
+use rath::images::ImageOptions;
+
+async fn run(audio: Vec<u8>) -> Result<(), rath::RathError> {
+    let _chat = LlmOptions::default().create("gemini:///gemini-3.8-flash").await?;
+    let stt = SttOptions::default().create("gemini:///gemini-3.8-flash").await?;
+    let tts = TtsOptions::default().create("gemini:///gemini-3.8-flash-tts").await?;
+    let _images = ImageOptions::default().create("gemini:///gemini-3.1-flash-image").await?;
+    let transcript = stt.transcribe_audio(
+        &SttRequest::new("audio/webm;codecs=opus".into(), audio),
+    ).await?;
+    let speech = tts.synthesize_speech(
+        &TtsRequest::new(transcript.text)
+            .with_voice(Voice::id("gemini", "Kore"))
+            .with_language("en-IN".into())
+            .with_instructions("Speak warmly and clearly".into())
+            .with_format("wav".into()),
+    ).await?;
+    println!("{} bytes of {}", speech.data.len(), speech.mime_type);
+    Ok(())
+}
+```
+
+An explicit `?api_key_env=MY_GEMINI_KEY` works identically for chat, STT, TTS and
+images and overrides the default key. It never silently falls back when that
+variable is missing. Clients resolve credentials at construction and retain their
+bound model independently. Construction performs no generation.
+
+STT uses Gemini audio understanding with a verbatim, original-language, text-only
+transcription prompt. Use an audio-input model such as `gemini-3.8-flash`; ordinary
+chat models are not presumed to support speech output. Encoded inputs support WAV,
+MP3/MPEG, AIFF, AAC, OGG, FLAC, M4A, Opus and WebM. Common MIME aliases are normalized;
+browser `codecs` parameters are stripped from the MIME sent to Gemini. Empty audio,
+other MIME parameters, raw PCM input and nonempty native STT configuration fail
+locally. Inline audio is limited to 14,000,000 bytes to stay below the documented
+20 MB total request boundary after base64 encoding. Files API uploads, streaming,
+diarization and timestamp schemas are not provided. Empty or malformed model text
+is rejected. Prompt-based transcription accuracy needs live evaluation.
+
+Supported TTS models are `gemini-3.8-flash-tts`, `gemini-3.8-flash-lite-tts`,
+`gemini-3.1-flash-tts-preview`, `gemini-2.5-flash-preview-tts` and
+`gemini-2.5-pro-preview-tts`. Current 3.8 models use structured style metadata;
+legacy preview models use prompt-based delivery instructions. Rath supports the
+30 documented preset IDs with scope `gemini` (for example Kore, Puck, Zephyr,
+Charon, Aoede); omission selects Kore. Unsupported voices, cloning/reference
+material, multi-speaker controls and unsupported model URLs fail locally.
+
+Default output and `format="wav"` return complete RIFF/WAVE, 24 kHz mono signed
+16-bit little-endian PCM. Headerless PCM receives one valid WAV header; returned
+WAV containers are validated and preserved. `format="pcm"` returns the same
+sample bytes without a header, with Gemini's `audio/L16;codec=pcm;rate=24000`
+MIME descriptor. Other formats are rejected. Language uses the exact BCP-47 values
+documented by Google's `SpeechConfig`, including `en-IN`, `en-US` and `hi-IN`.
+Instructions are per-utterance style directions; they do not guarantee fidelity.
+
+TTS native configuration supports `safetySettings` and `generationConfig` with
+`temperature`, `topP`, `topK`, `seed`, and single-voice `speechConfig` using
+`voiceConfig.prebuiltVoiceConfig.voiceName` and `languageCode`. Defaults merge
+shallowly with request configuration, then typed fields win. Routing, credentials,
+response modalities, formats, output caps and other unhandled controls are rejected.
+HTTP media calls have a 300-second timeout, reject redirects and do not retry.
+Failures retain redacted provider/HTTP diagnostics and response evidence; no private
+media or response bodies are automatically logged. Cancellation stops local waiting
+and cannot guarantee that Gemini stops remote work.
+
+Mappings were checked against Google's [audio guide](https://ai.google.dev/gemini-api/docs/audio),
+[speech guide](https://ai.google.dev/gemini-api/docs/speech-generation) and
+[GenerateContent API](https://ai.google.dev/api/generate-content). Model/account
+availability, transcription quality and speech quality have not been live-tested.
+See [gemini_media.rs](examples/gemini_media.rs) for a compile-checked example.
 
 ### Fal speech
 

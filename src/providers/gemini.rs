@@ -2,6 +2,13 @@
 use crate::llm::LlmBackend;
 // Keep the existing generateContent wire contract while using the official SDK.
 mod embedding;
+mod image;
+mod media;
+pub(crate) use image::new_image_client;
+mod stt;
+mod tts;
+pub(crate) use stt::new_stt_client;
+pub(crate) use tts::new_tts_client;
 mod errors;
 mod measurement;
 pub(crate) use embedding::new_embedding_client;
