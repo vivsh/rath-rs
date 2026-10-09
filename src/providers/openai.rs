@@ -3,6 +3,7 @@ use crate::audio::tts::TtsBackend;
 use crate::core::error::http;
 use crate::llm::LlmBackend;
 mod measurement;
+mod streaming;
 
 use reqwest::Client as HttpClient;
 use reqwest::multipart::{Form, Part};
@@ -84,6 +85,16 @@ fn build_client(
 }
 
 impl LlmBackend for OpenAiClient {
+    async fn execute_stream<'a>(
+        &'a self,
+        messages: &[Message],
+    ) -> Result<crate::llm::LlmStream<'a>, RathError> {
+        streaming::start(self, messages).await.map_err(|error| {
+            error
+                .with_context(Provider::OpenAi, "streaming generation")
+                .sanitized(&[&self.api_key])
+        })
+    }
     fn model_url(&self) -> &ModelUrl {
         &self.url
     }

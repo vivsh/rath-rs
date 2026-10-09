@@ -15,6 +15,7 @@ mod errors;
 mod measurement;
 pub(crate) use embedding::new_embedding_client;
 mod request;
+mod streaming;
 
 use gemini_rust::{
     Blob, Content, FileData as GeminiFileData, FunctionCall as GeminiFunctionCall,
@@ -273,7 +274,7 @@ fn map_response(
     }));
     let fcs = response.function_calls_with_thoughts();
     if !fcs.is_empty() {
-        let thought_text = response.text();
+        let thought_text = collect_visible_text(&response);
         let thought = (!thought_text.is_empty()).then_some(thought_text);
         let calls: Vec<ToolCall> = fcs
             .iter()
@@ -282,7 +283,9 @@ fn map_response(
                 id: format!("{}_{}", fc.name, idx),
                 name: fc.name.clone(),
                 args: fc.args.clone(),
-                thought_signatures: sig.map(|s| vec![s.to_string()]),
+                thought_signatures: sig
+                    .or(fc.thought_signature.as_ref())
+                    .map(|s| vec![s.to_string()]),
             })
             .collect();
         return Ok(LlmResponse::new(
@@ -296,7 +299,7 @@ fn map_response(
         .with_provider_model(provider_model)
         .with_raw_metadata(raw_metadata));
     }
-    let text = response.text();
+    let text = collect_visible_text(&response);
     Ok(LlmResponse::new(
         Provider::Gemini,
         LlmOutput::Output(decode_nonempty(&text, wants_json_output)?),
@@ -304,6 +307,29 @@ fn map_response(
     .with_usage(usage)
     .with_provider_model(provider_model)
     .with_raw_metadata(raw_metadata))
+}
+
+/// Joins visible answer parts of the selected candidate, excluding provider thought summaries.
+fn collect_visible_text(response: &GenerationResponse) -> String {
+    let mut text = String::new();
+    for part in response
+        .candidates
+        .first()
+        .and_then(|c| c.content.parts.as_ref())
+        .into_iter()
+        .flatten()
+    {
+        if let Part::Text {
+            text: part,
+            thought,
+            ..
+        } = part
+            && *thought != Some(true)
+        {
+            text.push_str(part);
+        }
+    }
+    text
 }
 
 fn wants_json_output(options: &LlmOptions) -> bool {
@@ -358,6 +384,14 @@ fn gemini_safety_settings_from_provider_config(
 }
 
 impl LlmBackend for GeminiClient {
+    async fn execute_stream<'a>(
+        &'a self,
+        messages: &[Message],
+    ) -> Result<crate::llm::LlmStream<'a>, RathError> {
+        streaming::start(self, messages).await.map_err(|error| {
+            errors::context(error, "streaming generation", self.url.api_key.as_deref())
+        })
+    }
     fn model_url(&self) -> &ModelUrl {
         &self.url
     }

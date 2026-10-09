@@ -1,5 +1,5 @@
 use super::api::*;
-use super::{TokenCount, counting};
+use super::{LlmStream, TokenCount, counting};
 use std::{future::Future, pin::Pin};
 
 /// Adapter contract with borrowing, Send futures.
@@ -78,6 +78,22 @@ pub trait LlmBackend: Send + Sync {
         &self,
         messages: &[Message],
     ) -> impl std::future::Future<Output = Result<LlmResponse, RathError>> + Send;
+
+    /// Starts one generation with provisional progress and a final response.
+    ///
+    /// Messages are borrowed only during startup; the returned stream may borrow
+    /// this backend. Unsupported backends fail without falling back to execute.
+    fn execute_stream<'a>(
+        &'a self,
+        _messages: &[Message],
+    ) -> impl Future<Output = Result<LlmStream<'a>, RathError>> + Send {
+        async move {
+            Err(RathError::unsupported(
+                self.provider(),
+                "LLM response streaming",
+            ))
+        }
+    }
 }
 
 type ErasedFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -99,6 +115,12 @@ trait ErasedLlmBackend: Send + Sync {
         &'a self,
         messages: &'a [Message],
     ) -> ErasedFuture<'a, Result<LlmResponse, RathError>>;
+    fn execute_stream<'a, 'm>(
+        &'a self,
+        messages: &'m [Message],
+    ) -> ErasedFuture<'m, Result<LlmStream<'a>, RathError>>
+    where
+        'a: 'm;
 }
 impl<B: LlmBackend> ErasedLlmBackend for B {
     fn model_url(&self) -> &ModelUrl {
@@ -133,6 +155,15 @@ impl<B: LlmBackend> ErasedLlmBackend for B {
         messages: &'a [Message],
     ) -> ErasedFuture<'a, Result<LlmResponse, RathError>> {
         Box::pin(LlmBackend::execute(self, messages))
+    }
+    fn execute_stream<'a, 'm>(
+        &'a self,
+        messages: &'m [Message],
+    ) -> ErasedFuture<'m, Result<LlmStream<'a>, RathError>>
+    where
+        'a: 'm,
+    {
+        Box::pin(LlmBackend::execute_stream(self, messages))
     }
 }
 /// Owned model-bound capability handle; share explicitly using `Arc`.
@@ -178,6 +209,16 @@ impl LlmClient {
     pub async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
         self.inner.execute(messages).await
     }
+    /// Starts a pull-driven generation with text/tool fragments and terminal output.
+    ///
+    /// Startup errors return here; later failures are stream items. Messages
+    /// need not outlive startup. Dropping the stream stops local consumption.
+    pub async fn execute_stream<'a>(
+        &'a self,
+        messages: &[Message],
+    ) -> Result<LlmStream<'a>, RathError> {
+        self.inner.execute_stream(messages).await
+    }
 }
 impl LlmBackend for LlmClient {
     fn model_url(&self) -> &ModelUrl {
@@ -203,5 +244,11 @@ impl LlmBackend for LlmClient {
     }
     async fn execute(&self, messages: &[Message]) -> Result<LlmResponse, RathError> {
         LlmClient::execute(self, messages).await
+    }
+    async fn execute_stream<'a>(
+        &'a self,
+        messages: &[Message],
+    ) -> Result<LlmStream<'a>, RathError> {
+        LlmClient::execute_stream(self, messages).await
     }
 }

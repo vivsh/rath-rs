@@ -8,7 +8,12 @@ pub(super) fn normalize(
     operation: &'static str,
     credential: Option<&str>,
 ) -> RathError {
-    let result = match error {
+    context(classify(error, operation), operation, credential)
+}
+
+/// Maps exposed SDK variants to stable Rath error categories and native causes.
+fn classify(error: &Error, operation: &'static str) -> RathError {
+    match error {
         Error::BadResponse { code, description } => {
             crate::core::error::sdk_http(*code, description.as_deref(), &[])
         }
@@ -24,6 +29,25 @@ pub(super) fn normalize(
         Error::Deserialize { .. } | Error::DecodeResponse { .. } => {
             RathError::from_native_error(ErrorKind::Deserialize, error)
         }
+        Error::BadPart { source } => match source {
+            eventsource_stream::EventStreamError::Transport(cause) => {
+                let kind = if cause.is_timeout() {
+                    ErrorKind::Timeout
+                } else {
+                    ErrorKind::Transport
+                };
+                RathError::from_native_error(kind, error)
+                    .with_source(RathError::from_native_error(kind, cause))
+            }
+            _ => RathError::from_native_error(ErrorKind::Deserialize, error),
+        },
+        _ => local_error(error, operation),
+    }
+}
+
+/// Classifies local validation, protocol and failed-operation SDK diagnostics.
+fn local_error(error: &Error, operation: &'static str) -> RathError {
+    match error {
         Error::InvalidApiKey { .. }
         | Error::ConstructUrl { .. }
         | Error::UrlParse { .. }
@@ -38,15 +62,19 @@ pub(super) fn normalize(
             name,
             code,
             message,
-        } => crate::core::error::provider_failure(
-            Provider::Gemini,
-            operation,
-            &serde_json::json!({"name":name, "error":{"code":code, "message":message}}),
-            &[],
-        ),
+        } => operation_failed(operation, name, *code, message),
         _ => RathError::from_native_error(ErrorKind::Provider, error),
-    };
-    context(result, operation, credential)
+    }
+}
+
+/// Preserves the provider's structured failed-operation diagnostic.
+fn operation_failed(operation: &'static str, name: &str, code: i32, message: &str) -> RathError {
+    crate::core::error::provider_failure(
+        Provider::Gemini,
+        operation,
+        &serde_json::json!({"name":name, "error":{"code":code, "message":message}}),
+        &[],
+    )
 }
 
 /// Sanitizes SDK and local Gemini diagnostics without storing another copy of credentials.

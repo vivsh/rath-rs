@@ -1,6 +1,7 @@
 use crate::core::error::http;
 use crate::llm::LlmBackend;
 mod measurement;
+mod streaming;
 
 use reqwest::Client as HttpClient;
 use serde_json::{Value, json};
@@ -37,6 +38,16 @@ pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<LlmClient, Rath
 }
 
 impl LlmBackend for OpenRouterClient {
+    async fn execute_stream<'a>(
+        &'a self,
+        messages: &[Message],
+    ) -> Result<crate::llm::LlmStream<'a>, RathError> {
+        streaming::start(self, messages).await.map_err(|error| {
+            error
+                .with_context(Provider::OpenRouter, "streaming generation")
+                .sanitized(&[&self.api_key])
+        })
+    }
     fn model_url(&self) -> &ModelUrl {
         &self.url
     }
@@ -301,6 +312,7 @@ fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 /// Rejects token-limited output before normalizing content, calls and usage.
 fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse, RathError> {
     crate::llm::counting::check_output_limit(Provider::OpenRouter, &response)?;
+    check_response_failure(&response, "generation")?;
     let usage = response.get("usage").map(usage_from_value);
     let provider_model = response
         .get("model")
@@ -340,62 +352,121 @@ fn map_response(response: Value, wants_json_output: bool) -> Result<LlmResponse,
         ))?;
     Ok(LlmResponse::new(
         Provider::OpenRouter,
-        LlmOutput::Output(decode_output_text(text, wants_json_output)?),
+        LlmOutput::Output(decode_response_text(text, wants_json_output)?),
     )
     .with_usage(usage)
     .with_provider_model(provider_model)
     .with_raw_metadata(metadata))
 }
 
+/// Distinguishes generated JSON decoding failures from malformed HTTP/SSE envelopes.
+fn decode_response_text(text: &str, wants_json_output: bool) -> Result<Value, RathError> {
+    decode_output_text(text, wants_json_output).map_err(|cause| {
+        RathError::new(
+            crate::ErrorKind::Deserialize,
+            "OpenRouter returned invalid JSON output",
+        )
+        .with_source(cause)
+    })
+}
+
+/// Preserves choice-level failures and refusals before interpreting any generated output.
+pub(super) fn check_response_failure(
+    response: &Value,
+    operation: &'static str,
+) -> Result<(), RathError> {
+    let Some(choice) = response.pointer("/choices/0") else {
+        return Ok(());
+    };
+    if let Some(error) = choice.get("error").filter(|error| !error.is_null()) {
+        return Err(crate::core::error::provider_failure(
+            Provider::OpenRouter,
+            operation,
+            error,
+            &[],
+        ));
+    }
+    let reason = choice.get("finish_reason").and_then(Value::as_str);
+    let refused = choice
+        .get("message")
+        .or_else(|| choice.get("delta"))
+        .and_then(|message| message.get("refusal"))
+        .is_some_and(|refusal| !refusal.is_null() && refusal != "");
+    let message = match reason {
+        Some("error") => "OpenRouter generation failed",
+        Some("content_filter") => "OpenRouter generation was blocked by a content filter",
+        _ if refused => "OpenRouter refused to generate an answer",
+        _ => return Ok(()),
+    };
+    Err(crate::core::error::provider_failure_message(
+        Provider::OpenRouter,
+        operation,
+        response,
+        &[],
+        message,
+    ))
+}
+
 /// Parses provider function calls and rejects malformed arguments or missing identifiers.
 fn collect_tool_calls(message: &Value) -> Result<Vec<ToolCall>, RathError> {
     let mut calls = Vec::new();
-    for call in message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let id = call.get("id").and_then(Value::as_str).ok_or_else(|| {
-            RathError::new(
-                crate::core::ErrorKind::InvalidResponse,
-                "OpenRouter tool call missing id",
-            )
-        })?;
-        let function = call.get("function").ok_or_else(|| {
-            RathError::new(
-                crate::core::ErrorKind::InvalidResponse,
-                "OpenRouter tool call missing function",
-            )
-        })?;
-        let name = function
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                RathError::new(
-                    crate::core::ErrorKind::InvalidResponse,
-                    "OpenRouter tool call missing function name",
-                )
-            })?;
-        let raw_args = function
-            .get("arguments")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                RathError::new(
-                    crate::core::ErrorKind::InvalidResponse,
-                    "function call missing string arguments",
-                )
-            })?;
-        let args =
-            serde_json::from_str(raw_args).map_err(|e| RathError::deserialize(&e, raw_args))?;
-        calls.push(ToolCall {
-            id: id.to_string(),
-            name: name.to_string(),
-            args,
-            thought_signatures: None,
-        });
+    let Some(native_calls) = message.get("tool_calls").filter(|calls| !calls.is_null()) else {
+        return Ok(calls);
+    };
+    let native_calls = native_calls.as_array().ok_or_else(|| {
+        RathError::invalid("OpenRouter message.tool_calls must be an array", message)
+    })?;
+    for call in native_calls {
+        calls.push(parse_tool_call(call)?);
     }
     Ok(calls)
+}
+
+/// Parses one native function call while retaining argument-decoder details.
+fn parse_tool_call(call: &Value) -> Result<ToolCall, RathError> {
+    let id = call.get("id").and_then(Value::as_str).ok_or_else(|| {
+        RathError::new(
+            crate::core::ErrorKind::InvalidResponse,
+            "OpenRouter tool call missing id",
+        )
+    })?;
+    let function = call.get("function").ok_or_else(|| {
+        RathError::new(
+            crate::core::ErrorKind::InvalidResponse,
+            "OpenRouter tool call missing function",
+        )
+    })?;
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            RathError::new(
+                crate::core::ErrorKind::InvalidResponse,
+                "OpenRouter tool call missing function name",
+            )
+        })?;
+    let raw_args = function
+        .get("arguments")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            RathError::new(
+                crate::core::ErrorKind::InvalidResponse,
+                "function call missing string arguments",
+            )
+        })?;
+    let args = serde_json::from_str(raw_args).map_err(|e| {
+        RathError::new(
+            crate::ErrorKind::Deserialize,
+            "OpenRouter returned invalid JSON tool arguments",
+        )
+        .with_source(RathError::deserialize(&e, raw_args))
+    })?;
+    Ok(ToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        args,
+        thought_signatures: None,
+    })
 }
 
 /// Extracts provider-reported input/output usage when present.
@@ -419,3 +490,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/openrouter_thinking.rs"]
 mod thinking_tests;
+
+#[cfg(test)]
+#[path = "tests/openrouter_parsing.rs"]
+mod parsing_tests;

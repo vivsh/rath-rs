@@ -93,7 +93,7 @@ pub(crate) async fn read_checked(
 }
 
 /// Borrows/clones only selected headers; no error snapshot is allocated on successful responses.
-fn metadata(response: &Response) -> (u16, Option<HeaderValue>, Option<HeaderValue>) {
+pub(crate) fn metadata(response: &Response) -> (u16, Option<HeaderValue>, Option<HeaderValue>) {
     let request_id = [
         "request-id",
         "x-request-id",
@@ -187,7 +187,7 @@ pub(crate) async fn mapped_response<T>(
 }
 
 /// Attaches original wire bytes and selected response headers to a decoding/validation error.
-fn enrich(
+pub(crate) fn enrich(
     mut error: RathError,
     (status, request_id, retry_after): (u16, Option<HeaderValue>, Option<HeaderValue>),
     body: ErrorBody,

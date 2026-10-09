@@ -971,6 +971,96 @@ async fn run() -> Result<(), rath::RathError> {
 }
 ```
 
+### Streaming text and tool calls
+
+Use the same client, messages and options with `execute_stream`. Add
+`futures-util = "0.3"` to your application to consume the standard Rust stream.
+
+```rust
+use futures_util::StreamExt;
+use rath::llm::{LlmClient, LlmEvent, LlmResponse, Message};
+
+async fn stream_answer(client: &LlmClient) -> Result<LlmResponse, rath::RathError> {
+    let mut events = client.execute_stream(&[Message::user("Hello")]).await?;
+    while let Some(event) = events.next().await {
+        match event? {
+            LlmEvent::TextDelta { text } => print!("{text}"),
+            LlmEvent::ToolCallDelta { index, name_delta, arguments_delta, .. } => {
+                // Append these provisional fragments to this index's tool preview.
+                println!("Tool {index}: {name_delta:?} {arguments_delta}");
+            }
+            LlmEvent::Completed { response } => return Ok(response),
+            _ => {}
+        }
+    }
+    Err(rath::RathError::new(
+        rath::ErrorKind::InvalidResponse,
+        "stream ended without completion",
+    ))
+}
+```
+
+OpenAI, Anthropic, OpenRouter, Ollama and Gemini support this API through their
+existing endpoints. Tool fragments may interleave: correlate them by the stable
+`index`, which may be sparse and is independent of the final calls vector.
+An available `id` is a complete ID and may repeat unchanged. Names and argument
+strings are append-only; argument fragments need not be valid JSON. The current
+Gemini SDK supplies complete function-call parts, so its tool event can contain
+the entire argument JSON in one fragment. Rath's private final-output tool stays
+hidden from progress events.
+
+Text and tool events are provisional. Use `Completed.response` for validated
+JSON, final tool calls, continuation signatures and reported usage. Execute tools
+only after completion. Built-in streams yield exactly one completion or one
+error, then end. An interrupted or token-limited response returns an error even
+after progress was displayed. Dropping the stream releases Rath's local reads;
+remote generation and billing may continue. Applications own retries and timeouts.
+Existing custom backends inherit an explicit unsupported-capability error until
+they implement `LlmBackend::execute_stream`.
+
+The [streaming example](examples/llm_streaming.rs) offers a weather tool and
+prints its progress and final calls. With no arguments it prints usage without
+making a generation request; supplying a model URL and prompt requests one
+generation using the usual provider credentials.
+
+### OpenRouter structured output
+
+OpenRouter's schema support depends on the provider endpoint serving a model.
+Use its native `require_parameters` setting to restrict routing to endpoints
+that support your requested parameters:
+
+```rust
+use rath::llm::LlmOptions;
+use serde_json::json;
+
+let options = LlmOptions::default()
+    .with_output_schema(json!({
+        "type": "object",
+        "properties": { "answer": { "type": "string" } },
+        "required": ["answer"],
+        "additionalProperties": false
+    }))
+    .with_provider_config(json!({
+        "provider": { "require_parameters": true }
+    }));
+```
+
+Rath parses generated JSON strictly and does not repair malformed JSON, remove
+markdown wrappers or extract JSON from prose. Invalid generated JSON returns
+`Deserialize` with output-specific context and the parser cause. Tool argument
+errors have separate context. The original HTTP response or received SSE prefix
+remains available through `response_body()`, without appearing in error formatting.
+Choice-level provider errors, refusals and `error`/`content_filter` finish reasons
+return `Provider`; token-limit termination returns `OutputLimitReached` before
+partial output is parsed. Partial content from a failed choice is never accepted
+as a completed response.
+
+Schema support and enforcement vary by endpoint, and parsing is not local schema
+validation. See [OpenRouter structured outputs](https://openrouter.ai/docs/guides/features/structured-outputs).
+OpenRouter also offers an optional [response-healing plugin](https://openrouter.ai/docs/guides/features/plugins/response-healing),
+enabled explicitly through `provider_config.plugins`. It applies to non-streaming
+JSON requests only; Rath does not enable it automatically.
+
 ## Ollama thinking
 
 Use either `.with_thinking(Some(ThinkingLevel::Off))` or a model URL such as

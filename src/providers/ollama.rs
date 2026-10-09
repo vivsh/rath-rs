@@ -1,6 +1,7 @@
 use crate::core::error::http;
 use crate::llm::LlmBackend;
 mod measurement;
+mod streaming;
 mod tool_calls;
 
 use tool_calls::{collect_tool_calls, validate_call_policy, validate_tool_request};
@@ -84,6 +85,16 @@ pub fn new_embedding_client(
 }
 
 impl LlmBackend for OllamaClient {
+    async fn execute_stream<'a>(
+        &'a self,
+        messages: &[Message],
+    ) -> Result<crate::llm::LlmStream<'a>, RathError> {
+        streaming::start(self, messages).await.map_err(|error| {
+            error
+                .with_context(Provider::Ollama, "streaming generation")
+                .sanitized(&self.api_key.as_deref().into_iter().collect::<Vec<_>>())
+        })
+    }
     fn model_url(&self) -> &ModelUrl {
         &self.url
     }

@@ -1,6 +1,6 @@
 [package]
 name = "rath-rs"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "Provider-agnostic Rust clients and wire types for agentic AI APIs"
 license = "MIT OR Apache-2.0"
@@ -16,6 +16,10 @@ default = []
 fastembed = ["dep:fastembed", "dep:hf-hub", "dep:tempfile", "tokio/rt", "tokio/sync"]
 
 [dependencies]
+async-stream = "0.3"
+futures-core = "0.3"
+futures-util = "0.3"
+eventsource-stream = "0.2"
 fastembed = { version = "=6.1.0", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls"] }
 hf-hub = { version = "0.5", optional = true, default-features = false, features = ["ureq"] }
 tempfile = { version = "3", optional = true }
