@@ -203,10 +203,11 @@ fn tool_responses_to_message(history: &[Message], start: usize) -> (GeminiMessag
             break;
         };
         let name = resolve_call_name(history, call_id);
-        let val: Value = serde_json::from_str(&history[i].content)
-            .unwrap_or_else(|_| Value::String(history[i].content.clone()));
         parts.push(Part::FunctionResponse {
-            function_response: GeminiFunctionResponse::new(name, val),
+            function_response: GeminiFunctionResponse::new(
+                name,
+                tool_response_object(&history[i].content),
+            ),
         });
         // Append any attachments produced by this tool call as additional parts.
         for part in history[i]
@@ -228,6 +229,18 @@ fn tool_responses_to_message(history: &[Message], start: usize) -> (GeminiMessag
     (msg, i - start)
 }
 
+/// Gemini requires object responses; preserve objects and envelope every other result.
+/// This adapts provider transport only, leaving caller history and tool contracts unchanged.
+fn tool_response_object(content: &str) -> Value {
+    let value =
+        serde_json::from_str::<Value>(content).unwrap_or_else(|_| Value::String(content.into()));
+    if value.is_object() {
+        value
+    } else {
+        serde_json::json!({"output":value})
+    }
+}
+
 /// Resolves a tool call name by walking history backwards.
 fn resolve_call_name<'a>(history: &'a [Message], call_id: &'a str) -> &'a str {
     for msg in history.iter().rev() {
@@ -246,13 +259,13 @@ fn resolve_call_name<'a>(history: &'a [Message], call_id: &'a str) -> &'a str {
     call_id
 }
 
-/// Converts a `ToolDefinition` into a Gemini function declaration.
+/// Uses Gemini's JSON Schema field so non-string enum values retain their types.
 fn build_fn_decl(tool: &ToolDefinition) -> Result<FunctionDeclaration, RathError> {
     let sanitized = schema::sanitize_strict(tool.parameters.clone())?;
     let json = serde_json::json!({
         "name": tool.name,
         "description": tool.description,
-        "parameters": sanitized,
+        "parametersJsonSchema": sanitized,
     });
     serde_json::from_value(json)
         .map_err(|error| RathError::from_native_error(crate::core::ErrorKind::Serialize, &error))
@@ -448,16 +461,15 @@ impl LlmBackend for GeminiClient {
         .map_err(|e| errors::normalize(&e, "generation", self.url.api_key.as_deref()))?;
         let raw = serde_json::to_value(&response)
             .map_err(|e| RathError::from_native_error(crate::core::ErrorKind::Serialize, &e))?;
-        let result = map_response(response, wants_json_output).map_err(|error| {
-            errors::context(
-                error.with_response(&raw),
-                "generation",
-                self.url.api_key.as_deref(),
-            )
-        })?;
-
-        crate::llm::output::finish(&self.options, result)
-            .map_err(|error| errors::context(error, "generation", self.url.api_key.as_deref()))
+        map_response(response, wants_json_output)
+            .and_then(|response| crate::llm::output::finish(&self.options, response))
+            .map_err(|error| {
+                errors::context(
+                    errors::with_response(error, &raw),
+                    "generation",
+                    self.url.api_key.as_deref(),
+                )
+            })
     }
 }
 
@@ -479,6 +491,14 @@ pub fn new_client(url: &ModelUrl, options: LlmOptions) -> Result<LlmClient, Rath
 #[cfg(test)]
 #[path = "gemini/tests/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/gemini_final_output.rs"]
+mod final_output_tests;
+
+#[cfg(test)]
+#[path = "tests/gemini_tool_results.rs"]
+mod tool_result_tests;
 
 fn check_generation_limit(response: &GenerationResponse) -> Result<(), RathError> {
     let raw = serde_json::to_value(response)

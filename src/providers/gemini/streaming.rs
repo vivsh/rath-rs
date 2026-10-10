@@ -45,7 +45,7 @@ fn run<'a>(
             for event in events { yield event; }
         }
         let response = complete(&assembled, options).map_err(|e| {
-            errors::context(e.with_response(&assembled), "streaming generation", credential)
+            errors::context(errors::with_response(e, &assembled), "streaming generation", credential)
         })?;
         yield LlmEvent::Completed { response };
     })

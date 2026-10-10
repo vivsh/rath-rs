@@ -176,3 +176,33 @@ fn input_serialization_failure_is_informative() {
             .contains("synthetic input serialization failure")
     );
 }
+
+/// The shared final-output adapter also transports scalar answers through Ollama object arguments.
+#[tokio::test]
+async fn scalar_exit_tool_output_survives_wire_validation() {
+    let mut tool = call();
+    tool["function"] = json!({"name":"__rath_final_output","arguments":"{\"value\":\"OK\"}"});
+    let (base, requests) = serve(200, response(json!({"tool_calls":[tool]}), "tool_calls"));
+    let client = options(ToolChoice::Auto)
+        .with_output_schema(json!({"type":"string"}))
+        .create(&format!("ollama:///model?base_url={base}"))
+        .await
+        .unwrap();
+    let result = client.execute(&[Message::user("answer")]).await.unwrap();
+    assert!(matches!(result.output, LlmOutput::Output(value) if value == "OK"));
+    let wire = requests.try_recv().unwrap();
+    let payload: Value = serde_json::from_str(wire.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let final_tool = payload["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "__rath_final_output")
+        .unwrap();
+    assert_eq!(
+        final_tool["function"]["parameters"],
+        json!({
+            "type":"object", "properties":{"value":{"type":"string"}},
+            "required":["value"], "additionalProperties":false
+        })
+    );
+}

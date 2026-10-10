@@ -2,6 +2,17 @@
 use crate::core::{ErrorKind, Provider, RathError};
 use gemini_rust::client::Error;
 
+/// Replaces reduced mapping metadata with the available full decoded generation response.
+/// The caller must apply operation-wide credential sanitization before returning this error.
+pub(super) fn with_response(error: RathError, response: &serde_json::Value) -> RathError {
+    match serde_json::to_vec(response) {
+        Ok(bytes) => error.with_raw_body(crate::ErrorBody::Complete(bytes)),
+        Err(source) => {
+            error.with_source(RathError::from_native_error(ErrorKind::Serialize, &source))
+        }
+    }
+}
+
 /// Preserves everything the SDK exposes; it may already have discarded response-read errors.
 pub(super) fn normalize(
     error: &Error,
