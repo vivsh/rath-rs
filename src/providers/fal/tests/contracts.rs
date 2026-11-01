@@ -19,7 +19,7 @@ fn builds_fal_endpoint() {
             "fal-ai/wan/text-to-video",
             "abc123"
         ),
-        "https://queue.fal.run/fal-ai/wan/text-to-video/requests/abc123/status"
+        "https://queue.fal.run/fal-ai/wan/requests/abc123/status"
     );
     assert_eq!(queue_base_url("https://fal.run"), "https://queue.fal.run");
 }

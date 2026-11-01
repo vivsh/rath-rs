@@ -1,4 +1,6 @@
 use super::ProviderFactory;
+use crate::audio::music::{MusicClient, MusicOptions};
+use crate::audio::sound::{SoundClient, SoundOptions};
 use crate::audio::stt::{SttClient, SttOptions};
 use crate::audio::tts::{TtsClient, TtsOptions};
 use crate::audio::voice_clone::{VoiceCloneClient, VoiceCloneOptions};
@@ -37,6 +39,16 @@ pub(super) trait ErasedProviderFactory: Send + Sync {
         url: &'a ModelUrl,
         options: TtsOptions,
     ) -> ErasedFuture<'a, Result<TtsClient, RathError>>;
+    fn sound<'a>(
+        &'a self,
+        url: &'a ModelUrl,
+        options: SoundOptions,
+    ) -> ErasedFuture<'a, Result<SoundClient, RathError>>;
+    fn music<'a>(
+        &'a self,
+        url: &'a ModelUrl,
+        options: MusicOptions,
+    ) -> ErasedFuture<'a, Result<MusicClient, RathError>>;
     fn stt<'a>(
         &'a self,
         url: &'a ModelUrl,
@@ -88,6 +100,20 @@ impl<F: ProviderFactory> ErasedProviderFactory for F {
         options: TtsOptions,
     ) -> ErasedFuture<'a, Result<TtsClient, RathError>> {
         Box::pin(ProviderFactory::tts(self, url, options))
+    }
+    fn sound<'a>(
+        &'a self,
+        url: &'a ModelUrl,
+        options: SoundOptions,
+    ) -> ErasedFuture<'a, Result<SoundClient, RathError>> {
+        Box::pin(ProviderFactory::sound(self, url, options))
+    }
+    fn music<'a>(
+        &'a self,
+        url: &'a ModelUrl,
+        options: MusicOptions,
+    ) -> ErasedFuture<'a, Result<MusicClient, RathError>> {
+        Box::pin(ProviderFactory::music(self, url, options))
     }
     fn stt<'a>(
         &'a self,

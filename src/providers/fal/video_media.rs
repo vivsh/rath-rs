@@ -1,5 +1,6 @@
 //! Operation-local media validation and data-URI encoding.
 use super::video_input::invalid;
+use crate::audio::generation::AudioData;
 use crate::core::RathError;
 use crate::images::ImageData;
 use crate::video::VideoData;
@@ -33,6 +34,14 @@ pub(super) fn video(value: &VideoData) -> Result<String, RathError> {
     match value {
         VideoData::Url { url: value } => Ok(url(value)?.to_string()),
         VideoData::Base64 { mime_type, data } => data_uri(mime_type, data, "video/"),
+    }
+}
+
+/// Validates an audio URL or encodes nonempty audio as a data URI.
+pub(super) fn audio(value: &AudioData) -> Result<String, RathError> {
+    match value {
+        AudioData::Url { url: value } => Ok(url(value)?.to_string()),
+        AudioData::Base64 { mime_type, data } => data_uri(mime_type, data, "audio/"),
     }
 }
 

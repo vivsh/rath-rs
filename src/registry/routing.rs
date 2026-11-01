@@ -1,4 +1,6 @@
 use super::{BuiltinProviderFactory, ProviderFactory, erased::ErasedProviderFactory, url};
+use crate::audio::music::{MusicClient, MusicOptions};
+use crate::audio::sound::{SoundClient, SoundOptions};
 use crate::audio::stt::{SttClient, SttOptions};
 use crate::audio::tts::{TtsClient, TtsOptions};
 use crate::audio::voice_clone::{VoiceCloneClient, VoiceCloneOptions};
@@ -113,6 +115,24 @@ impl ProviderRegistry {
         super::prepare::native(options.provider_config.as_ref())?;
         self.factory(&url)?
             .tts(&url, options)
+            .await
+            .map_err(|e| construction_error(e, &url))
+    }
+    /// Constructs sound using exactly one selected factory.
+    pub async fn sound(&self, raw: &str, options: SoundOptions) -> Result<SoundClient, RathError> {
+        let url = url::parse_for(raw, false)?;
+        super::prepare::native(options.provider_config.as_ref())?;
+        self.factory(&url)?
+            .sound(&url, options)
+            .await
+            .map_err(|e| construction_error(e, &url))
+    }
+    /// Constructs music using exactly one selected factory.
+    pub async fn music(&self, raw: &str, options: MusicOptions) -> Result<MusicClient, RathError> {
+        let url = url::parse_for(raw, false)?;
+        super::prepare::native(options.provider_config.as_ref())?;
+        self.factory(&url)?
+            .music(&url, options)
             .await
             .map_err(|e| construction_error(e, &url))
     }

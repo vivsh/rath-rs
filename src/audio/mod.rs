@@ -8,3 +8,11 @@ pub mod voice;
 pub mod voice_clone;
 /// Independent voice design and explicit registration.
 pub mod voice_design;
+
+/// Durable audio generation results and receipts.
+pub mod generation;
+/// Sound-effects generation.
+pub mod sound;
+
+/// Music generation.
+pub mod music;

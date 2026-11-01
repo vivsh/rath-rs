@@ -5,5 +5,6 @@ pub use client::VideoOptions;
 mod backend;
 pub use backend::{VideoBackend, VideoClient};
 pub use types::{
-    VideoData, VideoEvent, VideoInput, VideoJob, VideoJobStatus, VideoRequest, VideoResponse,
+    LipSyncMode, LipSyncModel, VideoData, VideoEvent, VideoInput, VideoJob, VideoJobStatus,
+    VideoRequest, VideoResponse,
 };

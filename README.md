@@ -20,7 +20,7 @@ provider SDKs/APIs.
 - `rath::embeddings`: embedding request/response types and `EmbeddingClient`
 - `rath::images`: image request/response types and `ImageClient`
 - `rath::video`: async video job request/response types and `VideoClient`
-- `rath::audio`: speech and voice clients, backend traits and types
+- `rath::audio`: speech, sound, music and voice clients, backend traits and types
 - `rath::registry`: application-owned factories for all eight capabilities
 
 Internally, provider adapters live under
@@ -648,6 +648,73 @@ Serialized requests must include the new tagged `input` field.
 Existing job/response types and polling method signatures are unchanged.
 `parse_webhook` has a default unsupported implementation, so existing downstream
 `VideoBackend` implementations do not need a new required method.
+
+## Lip sync
+
+Fal lip sync accepts an existing video and an audio track. The model and duration
+mismatch mode are explicit; Rath does not inspect durations or guarantee output timing.
+Inputs can be HTTP(S) URLs or MIME-labelled base64, and Rath does not download them.
+
+```rust,no_run
+use rath::audio::generation::AudioData;
+use rath::video::{LipSyncMode, LipSyncModel, VideoData, VideoInput, VideoOptions, VideoRequest};
+
+async fn submit() -> Result<(), rath::RathError> {
+    let client = VideoOptions::default().create("fal:///fal-ai/sync-lipsync/v2").await?;
+    let request = VideoRequest::new(String::new(), VideoInput::LipSync {
+        video: VideoData::Url { url: "https://example.com/shot.mp4".into() },
+        audio: AudioData::Url { url: "https://example.com/speech.mp3".into() },
+        model: LipSyncModel::Standard,
+        sync_mode: LipSyncMode::CutOff,
+    });
+    let job = client.submit_video(&request).await?;
+    // Persist and verify the provider, model and account before polling after restart.
+    let status = client.get_video(&job.id).await?;
+    let _ = status;
+    Ok(())
+}
+```
+
+Fal retains results for a limited time; retrieve completed results promptly. See the
+[queue result documentation](https://fal.ai/docs/api-reference/inference-api/queue/result).
+
+## Sound effects and music
+
+Sound and music use model-bound clients and caller-owned receipts. Persist the receipt
+before scheduling later polls; a fresh client for the same provider, model, and queue
+origin can retrieve it. A failed submission can be ambiguous; Rath never automatically
+resubmits. The caller downloads result URLs without provider credentials and owns
+storage and scheduling. URLs and provider metadata may be private or expire.
+
+```rust,no_run
+use rath::audio::sound::{SoundOptions, SoundRequest};
+use rath::audio::music::{MusicOptions, MusicRequest};
+
+async fn submit() -> Result<(), rath::RathError> {
+    let sound = SoundOptions::default()
+        .create("fal:///fal-ai/elevenlabs/sound-effects/v2").await?;
+    let job = sound.submit_sound(&SoundRequest::new("rain on a roof".into())
+        .with_duration_seconds(5.0).with_looped(true)).await?;
+    let status = sound.get_sound(&job).await?;
+    let music = MusicOptions::default()
+        .create("fal:///fal-ai/elevenlabs/music").await?;
+    let music_job = music.submit_music(&MusicRequest::new("quiet jazz".into())
+        .with_duration_seconds(30.0).with_instrumental(true)).await?;
+    let _ = (status, music_job);
+    Ok(())
+}
+```
+
+Sound accepts 0.5–22 seconds; music accepts 3–600 seconds, rounded to the nearest
+millisecond. Omitted typed controls retain native settings. Typed settings override
+native request settings, which override client defaults. Both adapters request MP3.
+`instrumental(false)` allows vocals but does not guarantee them or select a voice.
+An explicit provider-declared failure is an `AudioJobStatus::Failed`; transport,
+authentication, malformed responses, and ambiguous result HTTP failures remain errors.
+If a submit acknowledgement fails receipt validation, Rath returns `InvalidResponse`
+with audio-submit context. Its sanitized original response is available through
+`RathError::response_body()` for reconciliation; remote work may already exist. See the model-specific
+Fal API for native controls.
 
 ## Audio Usage
 

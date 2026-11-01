@@ -264,3 +264,182 @@ async fn waiting_is_locally_cancellable() {
     assert_eq!(calls.len(), 1);
     assert!(calls[0].starts_with("GET "));
 }
+
+/// A serialized lip-sync job resumes in a fresh client using documented queue paths.
+#[tokio::test]
+async fn lip_sync_resumes_after_restart() {
+    use crate::audio::generation::AudioData;
+    use crate::video::{LipSyncMode, LipSyncModel};
+    let (base, calls) = serve(vec![
+        reply(
+            json!({"request_id":"job-1", "status_url":"BASE/fal-ai/sync-lipsync/requests/job-1/status", "response_url":"BASE/fal-ai/sync-lipsync/requests/job-1"}),
+        ),
+        reply(json!({"status":"IN_QUEUE"})),
+        reply(json!({"status":"COMPLETED"})),
+        reply(json!({"video":{"url":"https://assets.example/result.mp4"}})),
+    ]);
+    let request = VideoRequest::new(
+        String::new(),
+        VideoInput::LipSync {
+            video: VideoData::Url {
+                url: "https://assets.example/input.mp4".into(),
+            },
+            audio: AudioData::Url {
+                url: "https://assets.example/speech.mp3".into(),
+            },
+            model: LipSyncModel::Standard,
+            sync_mode: LipSyncMode::Loop,
+        },
+    );
+    let job = local_client(&base, video_input::LIP_SYNC)
+        .submit_video(&request)
+        .await
+        .unwrap();
+    let receipt: VideoJob = serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+    let fresh = local_client(&base, video_input::LIP_SYNC);
+    assert!(matches!(
+        fresh.get_video(&receipt.id).await.unwrap(),
+        VideoJobStatus::Queued { .. }
+    ));
+    assert!(matches!(
+        fresh.get_video(&receipt.id).await.unwrap(),
+        VideoJobStatus::Succeeded { .. }
+    ));
+    let calls: Vec<_> = calls.try_iter().collect();
+    assert_eq!(calls.len(), 4);
+    assert!(calls[0].starts_with("POST /fal-ai/sync-lipsync/v2 "));
+    assert!(calls[1].starts_with("GET /fal-ai/sync-lipsync/requests/job-1/status "));
+    assert!(calls[2].starts_with("GET /fal-ai/sync-lipsync/requests/job-1/status "));
+    assert!(calls[3].starts_with("GET /fal-ai/sync-lipsync/requests/job-1 "));
+    assert_lip_payload(&calls[0]);
+}
+
+/// Verifies the typed request reached the Fal submit endpoint.
+fn assert_lip_payload(call: &str) {
+    let payload: Value = serde_json::from_str(call.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(payload["video_url"], "https://assets.example/input.mp4");
+    assert_eq!(payload["audio_url"], "https://assets.example/speech.mp3");
+    assert_eq!(payload["model"], "lipsync-2");
+    assert_eq!(payload["sync_mode"], "loop");
+}
+
+/// Builds an explicit lip-sync request for transport tests.
+fn lip_request() -> VideoRequest {
+    use crate::audio::generation::AudioData;
+    use crate::video::{LipSyncMode, LipSyncModel};
+    VideoRequest::new(
+        String::new(),
+        VideoInput::LipSync {
+            video: VideoData::Url {
+                url: "https://assets.example/video.mp4".into(),
+            },
+            audio: AudioData::Url {
+                url: "https://assets.example/audio.mp3".into(),
+            },
+            model: LipSyncModel::Standard,
+            sync_mode: LipSyncMode::CutOff,
+        },
+    )
+}
+
+/// Completed lip-sync polling honors a same-origin provider result URL.
+#[tokio::test]
+async fn lip_sync_uses_provider_result_url() {
+    let (base, calls) = serve(vec![
+        reply(json!({"status":"COMPLETED","response_url":"BASE/provider/result"})),
+        reply(json!({"video":{"url":"https://assets.example/result.mp4"}})),
+    ]);
+    let state = local_client(&base, video_input::LIP_SYNC)
+        .get_video("job")
+        .await
+        .unwrap();
+    assert!(matches!(state, VideoJobStatus::Succeeded { .. }));
+    let calls: Vec<_> = calls.try_iter().collect();
+    assert!(calls[0].starts_with("GET /fal-ai/sync-lipsync/requests/job/status "));
+    assert!(calls[1].starts_with("GET /provider/result "));
+}
+
+/// Remote failures stay distinct from polling transport errors and do not resubmit.
+#[tokio::test]
+async fn lip_sync_failures_and_transport() {
+    let (base, calls) = serve(vec![reply(
+        json!({"status":"COMPLETED", "error":"failed FAKE-SECRET"}),
+    )]);
+    let status = local_client(&base, video_input::LIP_SYNC)
+        .get_video("job")
+        .await
+        .unwrap();
+    assert!(matches!(status, VideoJobStatus::Failed { .. }));
+    assert!(!format!("{status:?}").contains("FAKE-SECRET"));
+    assert_eq!(calls.try_iter().count(), 1);
+    let error = local_client("http://127.0.0.1:1", video_input::LIP_SYNC)
+        .get_video("job")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        ErrorKind::Transport | ErrorKind::Timeout
+    ));
+}
+
+/// Invalid lip-sync requests fail locally before the adapter contacts the queue.
+#[tokio::test]
+async fn lip_sync_invalid_before_http() {
+    use crate::audio::generation::AudioData;
+    let (base, calls) = serve(vec![reply(json!({"request_id":"unexpected"}))]);
+    let client = local_client(&base, video_input::LIP_SYNC);
+    let mut request = lip_request();
+    request.prompt = "unexpected".into();
+    assert_eq!(
+        client.submit_video(&request).await.unwrap_err().kind(),
+        ErrorKind::Validation
+    );
+    request.prompt.clear();
+    if let VideoInput::LipSync { audio, .. } = &mut request.input {
+        *audio = AudioData::Base64 {
+            mime_type: "audio/wav".into(),
+            data: "!".into(),
+        };
+    }
+    assert_eq!(
+        client.submit_video(&request).await.unwrap_err().kind(),
+        ErrorKind::Validation
+    );
+    let wrong = local_client(&base, video_input::KLING_MOTION);
+    assert_eq!(
+        wrong.submit_video(&lip_request()).await.unwrap_err().kind(),
+        ErrorKind::UnsupportedCapability
+    );
+    assert_eq!(calls.try_iter().count(), 0);
+}
+
+/// Lip-sync polling rejects foreign result URLs before sending credentials.
+#[tokio::test]
+async fn lip_sync_rejects_foreign_result() {
+    let (sink, sink_calls) = serve(vec![reply(
+        json!({"video":{"url":"https://example.com/out"}}),
+    )]);
+    let (base, calls) = serve(vec![reply(
+        json!({"status":"COMPLETED", "response_url":format!("{sink}/result")}),
+    )]);
+    let err = local_client(&base, video_input::LIP_SYNC)
+        .get_video("job")
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidResponse);
+    assert_eq!(calls.try_iter().count(), 1);
+    assert_eq!(sink_calls.try_iter().count(), 0);
+}
+
+/// Existing motion-transfer polling drops endpoint suffixes from queue status paths.
+#[tokio::test]
+async fn motion_transfer_queue_route() {
+    let (base, calls) = serve(vec![reply(json!({"status":"IN_PROGRESS"}))]);
+    let status = local_client(&base, video_input::KLING_MOTION)
+        .get_video("job")
+        .await
+        .unwrap();
+    assert!(matches!(status, VideoJobStatus::Running { .. }));
+    let call = calls.recv().unwrap();
+    assert!(call.starts_with("GET /fal-ai/kling-video/requests/job/status "));
+}

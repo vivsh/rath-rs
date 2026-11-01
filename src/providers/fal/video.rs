@@ -66,6 +66,12 @@ impl FalClient {
         let endpoint = build_status_endpoint(&self.queue_base_url, &self.model, job_id);
         let raw = self
             .get(&endpoint, "video status", |raw| {
+                if !matches!(
+                    raw.get("status").and_then(Value::as_str),
+                    Some("IN_QUEUE" | "IN_PROGRESS" | "COMPLETED")
+                ) {
+                    return Err(RathError::invalid("invalid video job status", &raw));
+                }
                 if fail_on_job_error && let Some(message) = failed_status_message(&raw) {
                     return Err(crate::core::error::provider_failure_message(
                         Provider::Fal,
@@ -141,18 +147,27 @@ pub(super) fn build_status_endpoint(queue_base_url: &str, model: &str, request_i
     format!(
         "{}/{}/requests/{}/status",
         queue_base_url.trim_end_matches('/'),
-        model.trim_start_matches('/'),
+        queue_model(model),
         request_id
     )
 }
 
 fn build_response_endpoint(queue_base_url: &str, model: &str, request_id: &str) -> String {
     format!(
-        "{}/{}/requests/{}/response",
+        "{}/{}/requests/{}",
         queue_base_url.trim_end_matches('/'),
-        model.trim_start_matches('/'),
+        queue_model(model),
         request_id
     )
+}
+
+/// Fal queue reads use owner/app, excluding the submitted endpoint suffix.
+pub(super) fn queue_model(model: &str) -> &str {
+    let model = model.trim_start_matches('/');
+    match model.match_indices('/').nth(1) {
+        Some((index, _)) => &model[..index],
+        None => model,
+    }
 }
 
 /// Extracts existing supported result shapes without following media URLs.
@@ -222,10 +237,9 @@ async fn video_status_from_status(
             }
             fetch_completed(client, job_id, raw, fail_on_job_error).await
         }
-        other => Ok(VideoJobStatus::Failed {
-            message: format!("Fal video job returned unknown status '{other}'"),
-            raw_metadata: Some(raw),
-        }),
+        _ => Err(RathError::invalid("invalid video job status", &raw)
+            .with_context(Provider::Fal, "video status")
+            .sanitized(&[&client.api_key])),
     }
 }
 
@@ -271,7 +285,7 @@ fn failed_status_message(raw: &Value) -> Option<String> {
             .get("error")
             .filter(|value| !value.is_null())
             .map(|_| "video job failed; response details available".into()),
-        other => Some(format!("Fal video job returned unknown status '{other}'")),
+        _ => None,
     }
 }
 

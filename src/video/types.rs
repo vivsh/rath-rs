@@ -1,3 +1,4 @@
+use crate::audio::generation::AudioData;
 use crate::core::Provider;
 use crate::images::ImageData;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,17 @@ pub enum VideoInput {
         /// Recording supplying movement/performance.
         driving_video: VideoData,
     },
+    /// Synchronize an existing video's visible speech with an audio track.
+    LipSync {
+        /// Source video; Rath does not inspect its duration.
+        video: VideoData,
+        /// Encoded audio or a URL; Rath does not inspect its duration.
+        audio: AudioData,
+        /// Explicit model selection; provider pricing may differ.
+        model: LipSyncModel,
+        /// Explicit provider policy for mismatched durations.
+        sync_mode: LipSyncMode,
+    },
     /// Native input without portable model validation or field mapping.
     Native {
         /// Object payload overriding client defaults and request configuration.
@@ -32,11 +44,40 @@ pub enum VideoInput {
     },
 }
 
+/// Model used by the Fal Sync Lipsync v2 endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LipSyncModel {
+    /// Fal's lipsync-2 model.
+    Standard,
+    /// Fal's lipsync-2-pro model.
+    Pro,
+}
+
+/// Fal's policy for input durations that do not match.
+/// The provider determines exact timing; Rath does not inspect input duration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LipSyncMode {
+    /// Provider cut_off policy.
+    CutOff,
+    /// Provider loop policy.
+    Loop,
+    /// Provider bounce policy.
+    Bounce,
+    /// Provider silence policy.
+    Silence,
+    /// Provider remap policy.
+    Remap,
+}
+
 /// Caller-owned generation request; Rath does not upload files or retain inputs.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[non_exhaustive]
 pub struct VideoRequest {
-    /// Required for typed T2V/I2V, optional for motion, and empty in Native mode.
+    /// Required for typed T2V/I2V, optional for motion, and empty for LipSync and Native.
     pub prompt: String,
     /// Generation operation and its media.
     pub input: VideoInput,

@@ -1,4 +1,6 @@
 use super::{anthropic, elevenlabs, fal, gemini, ollama, openai, openrouter};
+use crate::audio::music::{MusicClient, MusicOptions};
+use crate::audio::sound::{SoundClient, SoundOptions};
 use crate::audio::stt::{SttClient, SttOptions};
 use crate::audio::tts::{TtsClient, TtsOptions};
 use crate::audio::voice_clone::{VoiceCloneClient, VoiceCloneOptions};
@@ -97,6 +99,30 @@ pub(crate) fn create_tts_client(
             url.provider.clone(),
             "text-to-speech",
         )),
+    }
+    .map_err(|error| construction_error(error, url))
+}
+
+/// Constructs a model-bound sound adapter without generating audio.
+pub(crate) fn create_sound_client(
+    url: &ModelUrl,
+    options: SoundOptions,
+) -> Result<SoundClient, RathError> {
+    match url.provider {
+        Provider::Fal => fal::generation::new_sound(url, options),
+        _ => Err(RathError::unsupported(url.provider.clone(), "sound")),
+    }
+    .map_err(|error| construction_error(error, url))
+}
+
+/// Constructs a model-bound music adapter without generating audio.
+pub(crate) fn create_music_client(
+    url: &ModelUrl,
+    options: MusicOptions,
+) -> Result<MusicClient, RathError> {
+    match url.provider {
+        Provider::Fal => fal::generation::new_music(url, options),
+        _ => Err(RathError::unsupported(url.provider.clone(), "music")),
     }
     .map_err(|error| construction_error(error, url))
 }

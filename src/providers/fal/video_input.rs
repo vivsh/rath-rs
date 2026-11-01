@@ -1,12 +1,13 @@
 //! Explicit endpoint mappings; native mode deliberately bypasses model-input translation.
 use super::{merged_config, video_media};
 use crate::core::{ErrorKind, Provider, RathError};
-use crate::video::{VideoInput, VideoRequest};
+use crate::video::{LipSyncMode, LipSyncModel, VideoInput, VideoRequest};
 use serde_json::{Map, Value};
 
 pub(super) const KLING_T2V: &str = "fal-ai/kling-video/v3/pro/text-to-video";
 pub(super) const KLING_I2V: &str = "fal-ai/kling-video/v3/pro/image-to-video";
 pub(super) const KLING_MOTION: &str = "fal-ai/kling-video/v3/pro/motion-control";
+pub(super) const LIP_SYNC: &str = "fal-ai/sync-lipsync/v2";
 pub(super) const WAN_T2V: &str = "fal-ai/wan/v2.2-a14b/text-to-video";
 
 pub(super) fn invalid(message: &str) -> RathError {
@@ -67,6 +68,7 @@ fn validate_operation(
         VideoInput::TextToVideo => matches!(model, KLING_T2V | WAN_T2V),
         VideoInput::ImageToVideo { .. } => model == KLING_I2V,
         VideoInput::MotionTransfer { .. } => model == KLING_MOTION,
+        VideoInput::LipSync { .. } => model == LIP_SYNC,
         VideoInput::Native { .. } => true,
     };
     if !compatible {
@@ -84,6 +86,9 @@ fn validate_operation(
         if payload.contains_key("multi_prompt") {
             return Err(invalid("multi_prompt requires Native input"));
         }
+    }
+    if matches!(request.input, VideoInput::LipSync { .. }) && !request.prompt.is_empty() {
+        return Err(invalid("lip sync requires an empty top-level prompt"));
     }
     if matches!(request.input, VideoInput::MotionTransfer { .. })
         && !matches!(
@@ -129,8 +134,48 @@ fn apply_media(payload: &mut Map<String, Value>, input: &VideoInput) -> Result<(
                 Value::String(video_media::video(driving_video)?),
             );
         }
+        VideoInput::LipSync {
+            video,
+            audio,
+            model,
+            sync_mode,
+        } => {
+            apply_lip_sync(payload, video, audio, model, sync_mode)?;
+        }
         _ => {}
     }
+    Ok(())
+}
+
+/// Maps the typed lip-sync media and explicit provider controls.
+fn apply_lip_sync(
+    payload: &mut Map<String, Value>,
+    video: &crate::video::VideoData,
+    audio: &crate::audio::generation::AudioData,
+    model: &LipSyncModel,
+    sync_mode: &LipSyncMode,
+) -> Result<(), RathError> {
+    payload.insert(
+        "video_url".into(),
+        Value::String(video_media::video(video)?),
+    );
+    payload.insert(
+        "audio_url".into(),
+        Value::String(video_media::audio(audio)?),
+    );
+    let model = match model {
+        LipSyncModel::Standard => "lipsync-2",
+        LipSyncModel::Pro => "lipsync-2-pro",
+    };
+    let mode = match sync_mode {
+        LipSyncMode::CutOff => "cut_off",
+        LipSyncMode::Loop => "loop",
+        LipSyncMode::Bounce => "bounce",
+        LipSyncMode::Silence => "silence",
+        LipSyncMode::Remap => "remap",
+    };
+    payload.insert("model".into(), Value::String(model.into()));
+    payload.insert("sync_mode".into(), Value::String(mode.into()));
     Ok(())
 }
 

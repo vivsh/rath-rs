@@ -1,4 +1,5 @@
 use super::*;
+use crate::audio::generation::AudioData;
 use crate::images::ImageData;
 use crate::video::VideoData;
 use serde_json::json;
@@ -244,4 +245,133 @@ fn input_serialization_roundtrips() {
         let decoded: VideoInput = serde_json::from_value(raw.clone()).unwrap();
         assert_eq!(serde_json::to_value(decoded).unwrap(), raw);
     }
+}
+
+/// Typed lip-sync controls override native aliases and retain unrelated provider settings.
+#[test]
+fn lip_sync_maps_controls_and_media() {
+    use crate::audio::generation::AudioData;
+    let defaults = Some(
+        json!({"sync_mode":"cut_off", "video_url":"wrong", "audio_url":"wrong", "image_url":"wrong", "enable_safety_checker":true}),
+    );
+    for (mode, name) in [
+        (LipSyncMode::CutOff, "cut_off"),
+        (LipSyncMode::Loop, "loop"),
+        (LipSyncMode::Bounce, "bounce"),
+        (LipSyncMode::Silence, "silence"),
+        (LipSyncMode::Remap, "remap"),
+    ] {
+        let req = VideoRequest::new(
+            String::new(),
+            VideoInput::LipSync {
+                video: VideoData::Base64 {
+                    mime_type: "video/mp4".into(),
+                    data: "YWJj".into(),
+                },
+                audio: AudioData::Base64 {
+                    mime_type: "audio/mpeg".into(),
+                    data: "ZGVm".into(),
+                },
+                model: LipSyncModel::Pro,
+                sync_mode: mode,
+            },
+        )
+        .with_provider_config(json!({"sync_mode":"loop", "enable_safety_checker":false}));
+        let result = payload(LIP_SYNC, &defaults, &req).unwrap();
+        assert_eq!(result["video_url"], "data:video/mp4;base64,YWJj");
+        assert_eq!(result["audio_url"], "data:audio/mpeg;base64,ZGVm");
+        assert_eq!(result["model"], "lipsync-2-pro");
+        assert_eq!(result["sync_mode"], name);
+        assert_eq!(result["enable_safety_checker"], false);
+        assert!(!result.contains_key("image_url"));
+    }
+}
+
+/// Typed lip sync rejects incompatible models, prompts and invalid media before submission.
+#[test]
+fn lip_sync_rejects_bad_inputs() {
+    use crate::audio::generation::AudioData;
+    let input = |audio| VideoInput::LipSync {
+        video: video(),
+        audio,
+        model: LipSyncModel::Standard,
+        sync_mode: LipSyncMode::CutOff,
+    };
+    let valid = AudioData::Url {
+        url: "https://assets.example/a.mp3".into(),
+    };
+    let mut req = VideoRequest::new(String::new(), input(valid));
+    assert_eq!(
+        payload(KLING_MOTION, &None, &req).unwrap_err().kind(),
+        ErrorKind::UnsupportedCapability
+    );
+    req.prompt = "not supported".into();
+    assert_eq!(
+        payload(LIP_SYNC, &None, &req).unwrap_err().kind(),
+        ErrorKind::Validation
+    );
+    req.prompt.clear();
+    assert_invalid_audio(&mut req, input);
+    req.provider_config = Some(json!({"model":"lipsync-2-pro"}));
+    assert_eq!(
+        payload(LIP_SYNC, &None, &req).unwrap_err().kind(),
+        ErrorKind::Validation
+    );
+}
+
+/// Rejects malformed and unsafe audio representations.
+fn assert_invalid_audio(req: &mut VideoRequest, input: impl Fn(AudioData) -> VideoInput) {
+    for audio in [
+        AudioData::Url {
+            url: "https://user:secret@example.com/a".into(),
+        },
+        AudioData::Url {
+            url: "https://example.com/a#frag".into(),
+        },
+        AudioData::Base64 {
+            mime_type: "video/mp4".into(),
+            data: "YWJj".into(),
+        },
+        AudioData::Base64 {
+            mime_type: "audio/".into(),
+            data: "YWJj".into(),
+        },
+        AudioData::Base64 {
+            mime_type: "audio/mpeg".into(),
+            data: "!".into(),
+        },
+        AudioData::Base64 {
+            mime_type: "audio/mpeg".into(),
+            data: "".into(),
+        },
+    ] {
+        req.input = input(audio);
+        assert_eq!(
+            payload(LIP_SYNC, &None, req).unwrap_err().kind(),
+            ErrorKind::Validation
+        );
+    }
+}
+
+/// Lip-sync request serialization preserves media, model and explicit duration policy.
+#[test]
+fn lip_sync_serialization() {
+    use crate::audio::generation::AudioData;
+    let req = VideoRequest::new(
+        String::new(),
+        VideoInput::LipSync {
+            video: video(),
+            audio: AudioData::Url {
+                url: "https://assets.example/a".into(),
+            },
+            model: LipSyncModel::Pro,
+            sync_mode: LipSyncMode::CutOff,
+        },
+    );
+    let raw = serde_json::to_value(&req).unwrap();
+    assert_eq!(raw["input"]["type"], "lip_sync");
+    assert_eq!(raw["input"]["model"], "pro");
+    assert_eq!(raw["input"]["sync_mode"], "cut_off");
+    let roundtrip: VideoRequest = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(serde_json::to_value(roundtrip).unwrap(), raw);
 }

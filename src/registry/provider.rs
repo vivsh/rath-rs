@@ -1,3 +1,5 @@
+use crate::audio::music::{MusicClient, MusicOptions};
+use crate::audio::sound::{SoundClient, SoundOptions};
 use crate::audio::stt::{SttClient, SttOptions};
 use crate::audio::tts::{TtsClient, TtsOptions};
 use crate::audio::voice_clone::{VoiceCloneClient, VoiceCloneOptions};
@@ -55,6 +57,22 @@ pub trait ProviderFactory: Send + Sync {
                 "text-to-speech",
             ))
         }
+    }
+    /// Constructs sound generation or reports an unsupported capability.
+    fn sound(
+        &self,
+        url: &ModelUrl,
+        _options: SoundOptions,
+    ) -> impl Future<Output = Result<SoundClient, RathError>> + Send {
+        async move { Err(RathError::unsupported(url.provider.clone(), "sound")) }
+    }
+    /// Constructs music generation or reports an unsupported capability.
+    fn music(
+        &self,
+        url: &ModelUrl,
+        _options: MusicOptions,
+    ) -> impl Future<Output = Result<MusicClient, RathError>> + Send {
+        async move { Err(RathError::unsupported(url.provider.clone(), "music")) }
     }
     /// Constructs stt or reports an unsupported capability.
     fn stt(
@@ -127,6 +145,18 @@ impl ProviderFactory for BuiltinProviderFactory {
         crate::core::url::validate_endpoint(url)?;
         super::prepare::native(options.provider_config.as_ref())?;
         crate::providers::create_tts_client(url, options)
+    }
+    async fn sound(&self, url: &ModelUrl, options: SoundOptions) -> Result<SoundClient, RathError> {
+        super::url::validate_controls(url, false)?;
+        crate::core::url::validate_endpoint(url)?;
+        super::prepare::native(options.provider_config.as_ref())?;
+        crate::providers::create_sound_client(url, options)
+    }
+    async fn music(&self, url: &ModelUrl, options: MusicOptions) -> Result<MusicClient, RathError> {
+        super::url::validate_controls(url, false)?;
+        crate::core::url::validate_endpoint(url)?;
+        super::prepare::native(options.provider_config.as_ref())?;
+        crate::providers::create_music_client(url, options)
     }
     async fn stt(&self, url: &ModelUrl, options: SttOptions) -> Result<SttClient, RathError> {
         super::url::validate_controls(url, false)?;

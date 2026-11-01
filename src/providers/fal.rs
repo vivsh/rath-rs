@@ -1,6 +1,7 @@
 use crate::core::error::http;
 use crate::images::ImageBackend;
 mod audio;
+pub(super) mod generation;
 mod queue;
 mod video;
 mod video_input;

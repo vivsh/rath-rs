@@ -11,12 +11,11 @@ fn client(base: String) -> FalClient {
     FalClient::new(&url, None, "video").unwrap()
 }
 
-/// Failed queue metadata and useful messages survive wait_video, including unknown statuses.
+/// Failed queue metadata and useful messages survive wait_video.
 #[tokio::test]
 async fn video_wait_preserves_failure_and_never_fetches_failed_result() {
     for body in [
         json!({"status":"COMPLETED", "error":{"code":"bad_video", "message":"unsupported duration SECRET-KEY"}, "request_id":"job-42", "private":"PRIVATE-PROSE"}),
-        json!({"status":"ALIEN", "request_id":"job-42", "private":"PRIVATE-PROSE"}),
     ] {
         let (base, requests) = serve(vec![reply(body.clone())]);
         let error = client(base).wait_video("job-42").await.unwrap_err();
@@ -24,11 +23,7 @@ async fn video_wait_preserves_failure_and_never_fetches_failed_result() {
         assert_eq!(error.http_status(), Some(200));
         assert_eq!(error.request_id(), Some("job-42"));
         let text = format!("{error} {error:?}");
-        assert!(text.contains(if body["status"] == "ALIEN" {
-            "ALIEN"
-        } else {
-            "unsupported duration"
-        }));
+        assert!(text.contains("unsupported duration"));
         assert!(!text.contains("SECRET-KEY"));
         assert!(!text.contains("PRIVATE-PROSE"));
         let raw = String::from_utf8_lossy(error.response_body().unwrap().bytes());
@@ -76,3 +71,29 @@ async fn image_missing_required_output_is_invalid_response() {
 }
 
 use crate::video::VideoBackend;
+
+/// Unknown or absent video status is an invalid response for both read and wait.
+#[tokio::test]
+async fn video_unknown_status_is_not_remote_failure() {
+    for body in [
+        json!({"status":"ALIEN","private":"SECRET-KEY"}),
+        json!({"private":"SECRET-KEY"}),
+    ] {
+        for wait in [false, true] {
+            let (base, calls) = serve(vec![reply(body.clone())]);
+            let client = client(base);
+            let error = if wait {
+                client.wait_video("job").await.unwrap_err()
+            } else {
+                client.get_video("job").await.unwrap_err()
+            };
+            assert_eq!(error.kind(), ErrorKind::InvalidResponse);
+            assert_eq!(error.http_status(), Some(200));
+            assert!(
+                !String::from_utf8_lossy(error.response_body().unwrap().bytes())
+                    .contains("SECRET-KEY")
+            );
+            assert_eq!(calls.try_iter().count(), 1);
+        }
+    }
+}
